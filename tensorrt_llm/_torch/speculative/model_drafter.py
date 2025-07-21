@@ -12,6 +12,7 @@ from ..pyexecutor.sampler import Sampler, SampleState
 from ..pyexecutor.scheduler import ScheduledRequests
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from .drafter import Drafter
+from .interface import SpeculationMode
 
 if TYPE_CHECKING:
     from ..pyexecutor.model_engine import ModelEngine
@@ -173,14 +174,14 @@ class ModelDrafter(Drafter):
                     # No space for draft tokens
                     continue
 
-                # Stop drafting when we hit the max seqlen. We still need dummy draft
-                # tokens attached to the requests to make sure everything works properly
-                # with CUDA graph. These dummy tokens are already added by
-                # _prepare_draft_requests to make the KV cache/scheduler aware of the fact
-                # that we want to do spec decoding, so no need to do anything else here.
-                # This makes the perf for this case suboptimal, but that's OK - this is
-                # a corner case for weird models like the llama 3.1 8b EAGLE3 implementation.
-                if request.max_beam_num_tokens - 1 >= self.draft_model_engine.max_seq_len:
+                # Check if speculation should be disabled for this request
+                # This can be due to sequence length limits, system load, etc.
+                if self._should_disable_speculation_for_request(request):
+                    # Mark this request as non-speculative by clearing draft tokens
+                    request.py_draft_tokens = None
+                    request.py_draft_pages_allocated = 0
+                    # Add a flag to indicate speculation is disabled for this request
+                    request.py_speculation_disabled = True
                     continue
 
                 draft_request = self._create_draft_request_for_request(request)
@@ -351,3 +352,47 @@ class ModelDrafter(Drafter):
             error_msg = str(e)
             logger.error(f"Encountered an error in decode: {error_msg}")
             raise e
+
+    def _should_disable_speculation_for_request(self,
+                                                request: LlmRequest) -> bool:
+        """
+        Determine if speculation should be disabled for a specific request.
+
+        This can be based on various factors:
+        - Sequence length approaching model limits
+        - System load (future extension)
+        - Request-specific preferences (future extension)
+
+        Args:
+            request: The request to check
+
+        Returns:
+            True if speculation should be disabled for this request
+        """
+        # Disable speculation when approaching max sequence length
+        if request.max_beam_num_tokens - 1 >= self.draft_model_engine.max_seq_len:
+            return True
+
+        return False
+
+    def get_speculation_mode_for_batch(
+            self, scheduled_requests: ScheduledRequests) -> SpeculationMode:
+        """
+        Determine the overall speculation mode for the batch.
+
+        Args:
+            scheduled_requests: The scheduled requests to analyze
+
+        Returns:
+            SpeculationMode with bitwise flags set based on the modes present in the batch
+        """
+        mode = SpeculationMode(0)  # Start with no modes
+
+        for request in scheduled_requests.generation_requests:
+            if self._should_disable_speculation_for_request(request):
+                mode |= SpeculationMode.NON_SPECULATIVE
+            else:
+                mode |= SpeculationMode.SPECULATIVE
+
+        # Return the combined mode, or NON_SPECULATIVE if no requests
+        return mode if mode else SpeculationMode.NON_SPECULATIVE

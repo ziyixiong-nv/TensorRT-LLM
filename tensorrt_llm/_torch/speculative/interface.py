@@ -1,6 +1,6 @@
 import copy
 from dataclasses import dataclass, field
-from enum import IntEnum, auto
+from enum import Flag, IntEnum, auto
 from typing import List, Optional, Type
 
 import torch
@@ -104,6 +104,32 @@ class SpeculativeDecodingMode(IntEnum):
         if name is None:
             return SpeculativeDecodingMode.NONE
         return SpeculativeDecodingMode[name.upper()]
+
+
+class SpeculationMode(Flag):
+    """
+    Bitfield enum for speculation modes in dynamic speculation toggling.
+    Used to indicate whether a batch uses speculative decoding,
+    non-speculative decoding, or a mix of both modes.
+
+    Values can be combined using bitwise OR to represent mixed modes:
+    - NON_SPECULATIVE (0x1): Non-speculative mode only
+    - SPECULATIVE (0x10): Speculative mode only
+    - MIXED (0x11): Both modes (NON_SPECULATIVE | SPECULATIVE)
+    """
+    NONE = 0x0
+    NON_SPECULATIVE = 0x1
+    SPECULATIVE = 0x10
+
+    @property
+    def has_speculative(self) -> bool:
+        """Check if this mode includes speculative decoding."""
+        return bool(self & SpeculationMode.SPECULATIVE)
+
+    @property
+    def has_non_speculative(self) -> bool:
+        """Check if this mode includes non-speculative decoding."""
+        return bool(self & SpeculationMode.NON_SPECULATIVE)
 
 
 @dataclass

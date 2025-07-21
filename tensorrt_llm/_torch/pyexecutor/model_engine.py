@@ -48,11 +48,12 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, maybe_create_moe_load_balancer)
 from ..speculative import SpecMetadata, get_spec_metadata
+from ..speculative.interface import SpeculationMode
 from ..utils import (get_model_extra_attrs, set_torch_compiling,
                      with_model_extra_attrs)
 from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
-from .cuda_graph_runner import DecodingCUDAGraphRunner
+from .cuda_graph_runner import MultiModeDecodingCUDAGraphRunner
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManager, ResourceManagerType)
@@ -867,7 +868,7 @@ class PyTorchModelEngine(ModelEngine):
         self,
         batch: ScheduledRequests,
         spec_config: Optional["DecodingBaseConfig"] = None
-    ) -> Optional[DecodingCUDAGraphRunner]:
+    ) -> Optional[MultiModeDecodingCUDAGraphRunner]:
         """
         Get a CUDA graph runner or return None (e.g. if CUDA graphs are disabled
         or if the batch size is too big).
@@ -900,19 +901,45 @@ class PyTorchModelEngine(ModelEngine):
         if batch_size not in self._cuda_graph_batch_sizes:
             return None
 
-        attn_metadata = self.attn_metadata.create_cuda_graph_metadata(
-            batch_size, False, spec_max_draft_tokens)
-        assert attn_metadata.is_cuda_graph
-
+        # Always create a multi-mode runner that can support the required modes
         if self.is_spec_decode:
+            # For speculative decoding, create a runner that supports both modes
+            attn_metadata_spec = self.attn_metadata.create_cuda_graph_metadata(
+                batch_size, False, spec_max_draft_tokens)
+            assert attn_metadata_spec.is_cuda_graph
+
+            attn_metadata_non_spec = self.attn_metadata.create_cuda_graph_metadata(
+                batch_size, False, 0)
+            assert attn_metadata_non_spec.is_cuda_graph
+
             spec_metadata = self.spec_metadata.create_cuda_graph_metadata(
                 batch_size)
             spec_metadata.draft_tokens = self.draft_tokens_cuda
-        else:
-            spec_metadata = None
 
-        self._cuda_graphs[batch_size] = DecodingCUDAGraphRunner(
-            batch_size, "cuda", attn_metadata, spec_metadata, self.use_mrope)
+            self._cuda_graphs[batch_size] = MultiModeDecodingCUDAGraphRunner(
+                batch_size=batch_size,
+                device="cuda",
+                attn_metadata_spec=attn_metadata_spec,
+                attn_metadata_non_spec=attn_metadata_non_spec,
+                spec_metadata=spec_metadata,
+                use_mrope=self.use_mrope,
+                supported_modes=SpeculationMode.NON_SPECULATIVE
+                | SpeculationMode.SPECULATIVE)
+        else:
+            # Non-speculative case - create a runner that only supports non-speculative mode
+            attn_metadata = self.attn_metadata.create_cuda_graph_metadata(
+                batch_size, False, spec_max_draft_tokens)
+            assert attn_metadata.is_cuda_graph
+
+            self._cuda_graphs[batch_size] = MultiModeDecodingCUDAGraphRunner(
+                batch_size=batch_size,
+                device="cuda",
+                attn_metadata_spec=None,
+                attn_metadata_non_spec=attn_metadata,
+                spec_metadata=None,
+                use_mrope=self.use_mrope,
+                supported_modes=SpeculationMode.NON_SPECULATIVE)
+
         return self._cuda_graphs[batch_size]
 
     def __del__(self) -> None:
