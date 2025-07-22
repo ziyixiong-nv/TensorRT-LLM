@@ -207,6 +207,7 @@ class MultiModeDecodingCUDAGraphRunner:
         self,
         forward_fn: Callable[[Dict[str, Any]], torch.Tensor],
         pool: Optional[Tuple[int, int]] = None,
+        use_spec_mode: bool = True,
     ) -> Tuple[int, int]:
         """
         Capture graphs for supported modes.
@@ -219,59 +220,28 @@ class MultiModeDecodingCUDAGraphRunner:
         # During initial capture (e.g., warmup), only capture the speculative mode
         # if it's supported, since the forward_fn is typically designed for that mode.
         # The non-speculative mode can be captured later on-demand when actually needed.
-        if (self.supported_modes.has_speculative
-                and self.spec_runner is not None and not self._captured_spec):
+        if use_spec_mode:
+            assert self.spec_runner is not None
             spec_pool = self.spec_runner.capture(forward_fn, pool)
             self._captured_spec = True
             return spec_pool
 
         # If speculative mode is not supported, capture non-speculative
-        if (self.supported_modes.has_non_speculative
-                and self.non_spec_runner is not None
-                and not self._captured_non_spec):
-            non_spec_pool = self.non_spec_runner.capture(forward_fn, pool)
-            self._captured_non_spec = True
-            return non_spec_pool
+        assert self.non_spec_runner is not None
+        non_spec_pool = self.non_spec_runner.capture(forward_fn, pool)
+        self._captured_non_spec = True
+        return non_spec_pool
 
-        # If we get here, both modes are already captured
-        return pool
-
-    def needs_capture(self) -> bool:
+    def needs_capture(self, use_spec_mode: bool) -> bool:
         """Returns True if the primary mode needs capture."""
-        # During initial setup, we only care about capturing the primary mode
-        # (speculative mode if supported, otherwise non-speculative)
-        if self.supported_modes.has_speculative and self.spec_runner is not None:
+        if use_spec_mode:
+            assert self.supported_modes.has_speculative
             return not self._captured_spec
-        if self.supported_modes.has_non_speculative and self.non_spec_runner is not None:
-            return not self._captured_non_spec
-        return False
 
-    def capture_non_speculative_on_demand(
-        self,
-        forward_fn: Callable[[Dict[str, Any]], torch.Tensor],
-        pool: Optional[Tuple[int, int]] = None,
-    ) -> Optional[Tuple[int, int]]:
-        """
-        Capture the non-speculative mode on-demand when it's actually needed.
-        This is called when we need to run in non-speculative mode but it hasn't been captured yet.
-        """
-        if (self.supported_modes.has_non_speculative
-                and self.non_spec_runner is not None
-                and not self._captured_non_spec):
-            # For non-speculative capture, we need a forward function that doesn't use spec metadata
-            def non_spec_forward_fn(inputs: Dict[str, Any]):
-                # Create inputs without spec_metadata for non-speculative mode
-                non_spec_inputs = inputs.copy()
-                non_spec_inputs["spec_metadata"] = None
-                return forward_fn(non_spec_inputs)
+        assert self.supported_modes.has_non_speculative
+        return not self._captured_non_spec
 
-            non_spec_pool = self.non_spec_runner.capture(
-                non_spec_forward_fn, pool)
-            self._captured_non_spec = True
-            return non_spec_pool
-        return None
-
-    def run(self, inputs: Dict[str, Any]) -> torch.Tensor:
+    def run(self, inputs: Dict[str, Any], use_spec_mode: bool) -> torch.Tensor:
         """
         Run the appropriate graph based on the inputs and supported modes.
 
@@ -281,29 +251,20 @@ class MultiModeDecodingCUDAGraphRunner:
         Falls back to eager execution if graphs are not captured.
         """
         # Determine mode based on spec_metadata
-        use_spec_mode = self._should_use_speculative_mode(inputs)
-
         if use_spec_mode and self.supported_modes.has_speculative:
-            if self.spec_runner is None:
-                raise RuntimeError("Speculative mode not supported")
-            if not self._captured_spec:
-                # Fall back to _forward_fn
-                return self._forward_fn(inputs)
+            assert self.spec_runner is not None and self._captured_spec
             return self.spec_runner.run(inputs)
 
         if not use_spec_mode and self.supported_modes.has_non_speculative:
-            if self.non_spec_runner is None:
-                # Fall back to _forward_fn
-                return self._forward_fn(inputs)
+            assert self.non_spec_runner is not None
             if not self._captured_non_spec:
-                # Fall back to _forward_fn instead of throwing error
-                return self._forward_fn(inputs)
+                self.capture_non_speculative_on_demand(self._forward_fn)
             return self.non_spec_runner.run(inputs)
 
         # If no suitable mode is available, fall back to _forward_fn
         return self._forward_fn(inputs)
 
-    def _should_use_speculative_mode(self, inputs: Dict[str, Any]) -> bool:
+    def should_use_speculative_mode(self, inputs: Dict[str, Any]) -> bool:
         """
         Determine whether to use speculative mode based on the inputs.
 
@@ -313,6 +274,10 @@ class MultiModeDecodingCUDAGraphRunner:
         Returns:
             True if speculative mode should be used, False otherwise
         """
+        # Check if the mode is supported
+        if not self.supported_modes.has_speculative:
+            return False
+
         # Check if spec_metadata is present and has draft tokens
         if "spec_metadata" not in inputs or inputs["spec_metadata"] is None:
             return False
@@ -336,16 +301,6 @@ class MultiModeDecodingCUDAGraphRunner:
             return False
 
         return False
-
-    def get_current_mode(self, inputs: Dict[str, Any]) -> SpeculationMode:
-        """
-        Get the current mode being used for debugging/logging.
-
-        Returns:
-            SpeculationMode.SPECULATIVE or SpeculationMode.NON_SPECULATIVE
-        """
-        return SpeculationMode.SPECULATIVE if self._should_use_speculative_mode(
-            inputs) else SpeculationMode.NON_SPECULATIVE
 
     @property
     def attn_metadata(self):

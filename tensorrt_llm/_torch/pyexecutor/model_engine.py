@@ -2100,7 +2100,8 @@ class PyTorchModelEngine(ModelEngine):
                     outputs = self._forward_step(inputs, gather_ids,
                                                  gather_context_logits)
             else:
-                if maybe_graph.needs_capture():
+                use_spec_mode = maybe_graph.should_use_speculative_mode(inputs)
+                if maybe_graph.needs_capture(use_spec_mode):
 
                     def capture_forward_fn(inputs: Dict[str, Any]):
                         with MoeLoadBalancerIterContext(moe_load_balancer):
@@ -2109,18 +2110,17 @@ class PyTorchModelEngine(ModelEngine):
                                 gather_ids=gather_ids,
                                 gather_context_logits=gather_context_logits)
 
-                    pool = maybe_graph.capture(
-                        capture_forward_fn,
-                        self._cuda_graph_mem_pool,
-                    )
+                    pool = maybe_graph.capture(capture_forward_fn,
+                                               self._cuda_graph_mem_pool,
+                                               use_spec_mode)
                     self._cuda_graph_mem_pool = pool
 
                     # here we don't need to use context since cuda graph capture didn't run kernel.
                     # maybe we need a cleaner way to do this.
-                    outputs = maybe_graph.run(inputs)
+                    outputs = maybe_graph.run(inputs, use_spec_mode)
                 else:
                     with MoeLoadBalancerIterContext(moe_load_balancer):
-                        outputs = maybe_graph.run(inputs)
+                        outputs = maybe_graph.run(inputs, use_spec_mode)
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
