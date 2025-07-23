@@ -73,7 +73,8 @@ class DecodingCUDAGraphRunner:
         self.optional_extra_model_inputs = ["mrope_position_deltas"]
 
     def __del__(self):
-        self._graph.reset()
+        if self._graph is not None:
+            self._graph.reset()
 
     def capture(
         self,
@@ -106,10 +107,12 @@ class DecodingCUDAGraphRunner:
         self._output = make_weak_ref(output)
         return self._graph.pool()
 
-    def needs_capture(self) -> bool:
+    def needs_capture(self, use_spec: bool = False) -> bool:
         return self._output is None
 
-    def run(self, inputs: Dict[str, Any]) -> torch.Tensor:
+    def run(self,
+            inputs: Dict[str, Any],
+            use_spec: bool = False) -> torch.Tensor:
         assert "input_ids" in inputs
         assert "position_ids" in inputs
         assert "attn_metadata" in inputs
@@ -137,3 +140,140 @@ class DecodingCUDAGraphRunner:
         assert self._output is not None and self._graph is not None
         self._graph.replay()
         return self._output
+
+
+class MultiModeDecodingCUDAGraphRunner:
+    """
+    A CUDA graph runner that supports both speculative and non-speculative modes.
+    This allows dynamic toggling of speculation without performance penalties.
+    Can also function as a single-mode runner when only one mode is needed.
+    """
+
+    def __init__(
+        self,
+        batch_size: int,
+        device: str,
+        use_spec: bool,
+        attn_metadata_spec: Optional[AttentionMetadata] = None,
+        attn_metadata_non_spec: Optional[AttentionMetadata] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        use_mrope: bool = False,
+    ) -> None:
+        """
+        Initialize multi-mode CUDA graph runner.
+
+        Args:
+            batch_size: Number of requests in the batch
+            device: Device to run on
+            use_spec: Whether this runner supports speculative decoding
+            attn_metadata_spec: Attention metadata for speculative mode (required if SPECULATIVE mode supported)
+            attn_metadata_non_spec: Attention metadata for non-speculative mode (required if NON_SPECULATIVE mode supported)
+            spec_metadata: Speculative decoding metadata
+            use_mrope: Whether to use MRoPE
+        """
+        self.batch_size = batch_size
+        self.device = device
+        self.use_mrope = use_mrope
+        self.use_spec = use_spec  # Store the mode configuration
+
+        # Create graph runners based on supported modes
+        self.spec_runner = None
+        self.non_spec_runner = None
+
+        if use_spec:
+            if attn_metadata_spec is None:
+                raise ValueError(
+                    "attn_metadata_spec is required when SPECULATIVE mode is supported"
+                )
+            self.spec_runner = DecodingCUDAGraphRunner(batch_size, device,
+                                                       attn_metadata_spec,
+                                                       spec_metadata, use_mrope)
+        # CUDA graph runner for non-speculative mode is always created, so that we can dynamically turn on/off speculation.
+        if attn_metadata_non_spec is None:
+            raise ValueError(
+                "attn_metadata_non_spec is required when NON_SPECULATIVE mode is supported"
+            )
+        self.non_spec_runner = DecodingCUDAGraphRunner(batch_size, device,
+                                                       attn_metadata_non_spec,
+                                                       None, use_mrope)
+
+        self._captured_spec = False
+        self._captured_non_spec = False
+
+    def __del__(self):
+        # Cleanup is handled by individual runners
+        pass
+
+    def capture(
+        self,
+        forward_fn: Callable[[Dict[str, Any]], torch.Tensor],
+        pool: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[int, int]:
+        """
+        Capture graphs for the configured mode.
+        During initial capture, only capture the mode that matches the current configuration.
+        """
+
+        # During initial capture (e.g., warmup), only capture the speculative mode
+        # if it's supported, since the forward_fn is typically designed for that mode.
+        # The non-speculative mode can be captured later on-demand when actually needed.
+        if self.use_spec:
+            print(f"DEBUG: Capture speculative mode")
+            assert self.spec_runner is not None
+            spec_pool = self.spec_runner.capture(forward_fn, pool)
+            return spec_pool
+
+        print(f"DEBUG: Capture non-speculative mode")
+        assert self.non_spec_runner is not None
+        non_spec_pool = self.non_spec_runner.capture(forward_fn, pool)
+        return non_spec_pool
+
+    def needs_capture(self, use_spec: bool) -> bool:
+        """Returns True if the mode needs capture."""
+        if use_spec:
+            return self.spec_runner is not None and self.spec_runner.needs_capture(
+            )
+
+        return self.non_spec_runner.needs_capture()
+
+    def run(self, inputs: Dict[str, Any], use_spec: bool) -> torch.Tensor:
+        """
+        Run the appropriate graph based on the inputs and supported modes.
+
+        The mode is determined by examining the spec_metadata in inputs.
+        If spec_metadata is present and contains draft tokens, use speculative mode.
+        Otherwise, use non-speculative mode if available.
+        Falls back to eager execution if graphs are not captured.
+        """
+        if use_spec:
+            print(f"DEBUG: Run speculative mode")
+            assert self.spec_runner is not None
+            return self.spec_runner.run(inputs)
+
+        print(f"DEBUG: Run non-speculative mode")
+        assert self.non_spec_runner is not None
+        return self.non_spec_runner.run(inputs)
+
+    @property
+    def attn_metadata(self):
+        """
+        Get attention metadata. Returns the first available metadata.
+        For compatibility with existing code that expects this property.
+        """
+        if self.spec_runner is not None:
+            return self.spec_runner.attn_metadata
+        elif self.non_spec_runner is not None:
+            return self.non_spec_runner.attn_metadata
+        else:
+            return None
+
+    @property
+    def spec_metadata(self):
+        """
+        Get spec metadata. Returns metadata from speculative runner if available.
+        For compatibility with existing code that expects this property.
+        """
+        if self.spec_runner is not None:
+            return self.spec_runner.spec_metadata
+        else:
+            return None
