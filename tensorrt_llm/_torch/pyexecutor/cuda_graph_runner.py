@@ -142,7 +142,7 @@ class DecodingCUDAGraphRunner:
         return self._output
 
 
-class MultiModeDecodingCUDAGraphRunner:
+class DynamicDecodingCUDAGraphRunner:
     """
     A CUDA graph runner that supports both speculative and non-speculative modes.
     This allows dynamic toggling of speculation without performance penalties.
@@ -153,7 +153,7 @@ class MultiModeDecodingCUDAGraphRunner:
         self,
         batch_size: int,
         device: str,
-        use_spec: bool,
+        max_draft_len: int,
         attn_metadata_spec: Optional[AttentionMetadata] = None,
         attn_metadata_non_spec: Optional[AttentionMetadata] = None,
         spec_metadata: Optional[SpecMetadata] = None,
@@ -174,13 +174,13 @@ class MultiModeDecodingCUDAGraphRunner:
         self.batch_size = batch_size
         self.device = device
         self.use_mrope = use_mrope
-        self.use_spec = use_spec  # Store the mode configuration
+        self.max_draft_len = max_draft_len
 
         # Create graph runners based on supported modes
         self.spec_runner = None
         self.non_spec_runner = None
 
-        if use_spec:
+        if max_draft_len > 0:
             if attn_metadata_spec is None:
                 raise ValueError(
                     "attn_metadata_spec is required when SPECULATIVE mode is supported"
@@ -217,40 +217,41 @@ class MultiModeDecodingCUDAGraphRunner:
         # During initial capture (e.g., warmup), only capture the speculative mode
         # if it's supported, since the forward_fn is typically designed for that mode.
         # The non-speculative mode can be captured later on-demand when actually needed.
-        if self.use_spec:
-            print(f"DEBUG: Capture speculative mode")
+        if self.max_draft_len > 0:
             assert self.spec_runner is not None
             spec_pool = self.spec_runner.capture(forward_fn, pool)
             return spec_pool
 
-        print(f"DEBUG: Capture non-speculative mode")
         assert self.non_spec_runner is not None
         non_spec_pool = self.non_spec_runner.capture(forward_fn, pool)
         return non_spec_pool
 
-    def needs_capture(self, use_spec: bool) -> bool:
+    def needs_capture(self, max_draft_len: int = 0) -> bool:
         """Returns True if the mode needs capture."""
-        if use_spec:
+        if max_draft_len > 0:
             return self.spec_runner is not None and self.spec_runner.needs_capture(
             )
 
         return self.non_spec_runner.needs_capture()
 
-    def run(self, inputs: Dict[str, Any], use_spec: bool) -> torch.Tensor:
+    def run(self,
+            inputs: Dict[str, Any],
+            max_draft_len: int = 0) -> torch.Tensor:
         """
         Run the appropriate graph based on the inputs and supported modes.
 
-        The mode is determined by examining the spec_metadata in inputs.
-        If spec_metadata is present and contains draft tokens, use speculative mode.
-        Otherwise, use non-speculative mode if available.
-        Falls back to eager execution if graphs are not captured.
+        The mode is automatically determined by examining the spec_metadata in inputs
+        and the max_draft_len parameter. If spec_metadata is present and max_draft_len > 0,
+        use speculative mode. Otherwise, use non-speculative mode.
         """
+        # Automatically determine which mode to use based on inputs
+        use_spec = (max_draft_len > 0 and "spec_metadata" in inputs
+                    and inputs["spec_metadata"] is not None)
+
         if use_spec:
-            print(f"DEBUG: Run speculative mode")
             assert self.spec_runner is not None
             return self.spec_runner.run(inputs)
 
-        print(f"DEBUG: Run non-speculative mode")
         assert self.non_spec_runner is not None
         return self.non_spec_runner.run(inputs)
 
