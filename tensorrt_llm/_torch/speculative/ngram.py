@@ -198,3 +198,6 @@ class NGramDrafter(Drafter):
                 pad_length = self.max_draft_len - len(draft_tokens)
                 draft_tokens.extend([request.py_end_id] * pad_length)
             request.py_draft_tokens = draft_tokens
+
+    def should_use_spec_decode(self, requests: List[LlmRequest]) -> bool:
+        return True

@@ -130,8 +130,9 @@ class Eagle3DecoderLayer(DecoderLayer):
         # PyExecutor will extract these from the draft model engine's spec metadata.
         # They will be passed to the draft model engine on the next iteration.
         # TODO: can we support multiple model outputs instead?
-        spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states,
-                                                  residual)
+        if spec_metadata is not None:
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx,
+                                                      hidden_states, residual)
         return hidden_states, residual
 
 

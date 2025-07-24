@@ -189,16 +189,6 @@ class ModelDrafter(Drafter):
                     # No space for draft tokens
                     continue
 
-                # Stop drafting when we hit the max seqlen. We still need dummy draft
-                # tokens attached to the requests to make sure everything works properly
-                # with CUDA graph. These dummy tokens are already added by
-                # _prepare_draft_requests to make the KV cache/scheduler aware of the fact
-                # that we want to do spec decoding, so no need to do anything else here.
-                # This makes the perf for this case suboptimal, but that's OK - this is
-                # a corner case for weird models like the llama 3.1 8b EAGLE3 implementation.
-                if request.max_beam_num_tokens - 1 >= self.draft_model_engine.max_seq_len:
-                    continue
-
                 draft_request = self._create_draft_request_for_request(request)
                 if draft_request is not None:
                     self._add_to_draft_batch(draft_batch, draft_request,
@@ -367,3 +357,21 @@ class ModelDrafter(Drafter):
             error_msg = str(e)
             logger.error(f"Encountered an error in decode: {error_msg}")
             raise e
+
+    def should_use_spec_decode(self, requests: List[LlmRequest]) -> bool:
+        """Check if spec decode should be used for the current iteration."""
+        for request in requests:
+            if request.state not in (LlmRequestState.GENERATION_IN_PROGRESS,
+                                     LlmRequestState.DISAGG_GENERATION_INIT):
+                continue
+            # Stop drafting when we hit the max seqlen. We still need dummy draft
+            # tokens attached to the requests to make sure everything works properly
+            # with CUDA graph. These dummy tokens are already added by
+            # _prepare_draft_requests to make the KV cache/scheduler aware of the fact
+            # that we want to do spec decoding, so no need to do anything else here.
+            # This makes the perf for this case suboptimal, but that's OK - this is
+            # a corner case for weird models like the llama 3.1 8b EAGLE3 implementation.
+            if request.max_beam_num_tokens - 1 >= self.draft_model_engine.max_seq_len:
+                return False
+
+        return True
