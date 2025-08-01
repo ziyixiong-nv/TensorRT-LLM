@@ -55,7 +55,7 @@ class GuidedDecoder:
             if llm_req.guided_decoding_params is None:
                 continue
             slot = llm_req.py_seq_slot
-            if llm_req.is_context_init_state and llm_req.context_current_position == llm_req.prepopulated_prompt_len:
+            if llm_req.is_context_init_state and llm_req.is_first_context_chunk:
                 self.grammar_matchers[
                     slot] = self.grammar_matcher_factory.create(
                         llm_req.guided_decoding_params)

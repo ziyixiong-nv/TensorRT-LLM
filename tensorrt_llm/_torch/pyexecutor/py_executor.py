@@ -1325,10 +1325,13 @@ class PyExecutor:
 
         for request in scheduled_requests.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
-                request.py_last_context_chunk = (
-                    request.context_current_position,
-                    request.context_current_position +
-                    request.context_chunk_size)
+                current_postion = request.context_current_position
+                if self.kv_cache_manager is not None:
+                    current_postion += self.kv_cache_manager.get_num_reused_tokens(
+                        request.py_request_id)
+                request.py_last_context_chunk = (current_postion,
+                                                 current_postion +
+                                                 request.context_chunk_size)
                 request.move_to_next_context_chunk()
             if request.context_remaining_length == 0:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS

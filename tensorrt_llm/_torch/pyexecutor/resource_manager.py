@@ -598,6 +598,9 @@ class KVCacheManager(BaseResourceManager):
     def get_kv_cache_stats(self):
         return self.impl.get_kv_cache_stats()
 
+    def get_num_reused_tokens(self, request_id: int) -> int:
+        return self.impl.get_num_reused_tokens(request_id)
+
     def rewind_kv_cache(self, request: LlmRequest, rewind_len: int):
         self.impl.rewind_kv_cache(request.py_request_id, rewind_len)
 

@@ -548,11 +548,14 @@ public:
     void startScheduling();
 
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
-    void addSequence(
+    //! \return Number of tokens that were cached/reused
+    [[nodiscard]] SizeType32 addSequence(
         GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
-    void addSequence(GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx);
+    //! \return Number of tokens that were cached/reused (always 0 for this method)
+    [[nodiscard]] SizeType32 addSequence(
+        GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx);
 
     //! \brief Allocate new block for each beam of the sequence.
     //! \details Might free cached blocks if no free blocks are available.
@@ -880,10 +883,10 @@ public:
 
     void allocatePools(bool useUvm);
 
-    void addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
-        LlmRequest& llmRequest, SizeType32 windowSize);
+    [[nodiscard]] SizeType32 addSequence(GenerationRequest& sequence, SizeType32 inputLength,
+        SizeType32 numContextBlocks, LlmRequest& llmRequest, SizeType32 windowSize);
 
-    void addSequence(
+    [[nodiscard]] SizeType32 addSequence(
         GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx, SizeType32 windowSize);
 
     void allocateBlock(GenerationRequest& sequence, SizeType32 windowSize);
@@ -1366,6 +1369,11 @@ public:
     /// @return SizeType32 A number of sequences per batch.
     [[nodiscard]] virtual SizeType32 getMaxCapacityBatchSize(SizeType32 inputLength, SizeType32 outputLength) const = 0;
 
+    /// @brief Get number of cached tokens for a request
+    /// @param requestId The request ID
+    /// @return Number of tokens already cached for this request
+    [[nodiscard]] virtual SizeType32 getNumReusedTokens(LlmRequest::RequestIdType requestId) const = 0;
+
     [[nodiscard]] virtual CacheType getCacheType() const = 0;
 };
 
@@ -1605,6 +1613,8 @@ public:
 
     [[nodiscard]] SizeType32 getMaxCapacityBatchSize(SizeType32 inputLength, SizeType32 outputLength) const override;
 
+    [[nodiscard]] SizeType32 getNumReusedTokens(LlmRequest::RequestIdType requestId) const override;
+
     /// @brief Calculates the number of kv-cache blocks that a sequence will require.
     ///
     /// @param inputLength The number of input tokens in the sequence.
@@ -1696,6 +1706,10 @@ private:
     bool mEnableHashKey;
     // Mutex to protect access to mSequences
     mutable std::mutex mSequencesMtx;
+    // Map from requestId to number of cached tokens (for KV cache reuse)
+    std::unordered_map<LlmRequest::RequestIdType, SizeType32> mNumReusedTokensPerRequest;
+    // Mutex to protect access to mNumReusedTokensPerRequest
+    mutable std::mutex mCachedTokensMtx;
     // buffers for static tensors, will be created after allocating pools
     runtime::ITensor::SharedPtr mBlockPoolPointers;
     runtime::ITensor::SharedPtr mLayerToPoolMapping;

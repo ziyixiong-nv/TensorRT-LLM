@@ -181,7 +181,10 @@ class ADEngine(ModelEngine):
         for request in context_requests:
             # store input ids and pos of first token in sequence
             input_ids.append(request.get_tokens(0))
-            input_pos.append(request.context_current_position)
+            current_postion = request.context_current_position
+            if kv_cache_manager is not None:
+                current_postion += kv_cache_manager.get_num_reused_tokens(request.py_request_id)
+            input_pos.append(current_postion)
 
             request.py_batch_idx = request.seq_slot
             last_logit_only.append(True)

@@ -1197,13 +1197,13 @@ void WindowBlockManager::refreshBlocks()
     mTransferManager->syncTransfers();
 }
 
-void BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
+SizeType32 BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
     LlmRequest& llmRequest, SizeType32 windowSize)
 {
-    mWindowBlockManagers.at(windowSize).addSequence(sequence, inputLength, numContextBlocks, llmRequest);
+    return mWindowBlockManagers.at(windowSize).addSequence(sequence, inputLength, numContextBlocks, llmRequest);
 }
 
-void WindowBlockManager::addSequence(
+SizeType32 WindowBlockManager::addSequence(
     GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest)
 {
     auto const requestId = sequence.getRequestId();
@@ -1235,18 +1235,23 @@ void WindowBlockManager::addSequence(
     auto const prepopulatedPromptLen = loadOrAllocateBlocks(blockKeys, numContextBlocks, sequence, perBlockRetentions);
     mReusedTokens += static_cast<double>(prepopulatedPromptLen);
     mTotalInputTokens += static_cast<double>(uniqueTokens.size());
+
+    // Update the pre-populated prompt length.
+    // The chunk size might be updated accordingly.
     llmRequest.setPrepopulatedPromptLen(prepopulatedPromptLen, getTokensPerBlock());
     TLLM_LOG_DEBUG("addSequence: Request %lu, inputLength %d, prepopulatedPromptLen %d", llmRequest.mRequestId,
         inputLength, prepopulatedPromptLen);
+    return prepopulatedPromptLen;
 }
 
-void BlockManager::addSequence(
+SizeType32 BlockManager::addSequence(
     GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx, SizeType32 windowSize)
 {
-    mWindowBlockManagers.at(windowSize).addSequence(sequence, numBlocks, unsharedBlockIdx);
+    return mWindowBlockManagers.at(windowSize).addSequence(sequence, numBlocks, unsharedBlockIdx);
 }
 
-void WindowBlockManager::addSequence(GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx)
+SizeType32 WindowBlockManager::addSequence(
+    GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx)
 {
     auto const requestId = sequence.getRequestId();
     auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
@@ -1258,6 +1263,8 @@ void WindowBlockManager::addSequence(GenerationRequest& sequence, SizeType32 num
         bool shareAmongBeams = bi != unsharedBlockIdx;
         allocateBlock(sequence, shareAmongBeams);
     }
+    // This method doesn't do reuse, so always return 0 cached tokens
+    return 0;
 }
 
 void WindowBlockManager::addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx)
@@ -2069,9 +2076,11 @@ void KVCacheManager::addSequence(
         // Consider the temporaryAttentionWindow when allocating blocks.
         auto const effectiveInputLength = std::min(inputLength, maxTokenNum + temporaryAttentionWindow);
         auto const numContextBlocks = tc::ceilDiv(effectiveInputLength, getTokensPerBlock());
+        SizeType32 numReusedTokens = 0;
         if (!sequence.isCyclic() && mEnableBlockReuse)
         {
-            mBlockManager.addSequence(sequence, effectiveInputLength, numContextBlocks, *llmRequest, windowSize);
+            numReusedTokens
+                = mBlockManager.addSequence(sequence, effectiveInputLength, numContextBlocks, *llmRequest, windowSize);
         }
         else
         {
@@ -2084,7 +2093,7 @@ void KVCacheManager::addSequence(
                     "have no effect.",
                     llmRequest->mRequestId);
             }
-            mBlockManager.addSequence(sequence, numContextBlocks, unsharedBlockIdx, windowSize);
+            numReusedTokens = mBlockManager.addSequence(sequence, numContextBlocks, unsharedBlockIdx, windowSize);
             if (mEnableHashKey && llmRequest.has_value() && beamWidth == 1)
             {
                 constexpr SizeType32 beamIdx = 0;
@@ -2111,6 +2120,7 @@ void KVCacheManager::addSequence(
             }
         }
         cacheBlockOffsets(sequence, windowSize);
+        mNumReusedTokensPerRequest[requestId] = numReusedTokens;
     }
 
     if (llmRequest)
@@ -2163,6 +2173,12 @@ void KVCacheManager::removeSequence(RequestIdType requestId, OptionalRef<LlmRequ
         else
         {
             mBlockManager.releaseBlocks(sequenceNode.mapped(), std::nullopt);
+        }
+
+        // Clean up cached token tracking
+        {
+            std::scoped_lock lock(mCachedTokensMtx);
+            mNumReusedTokensPerRequest.erase(requestId);
         }
     }
     TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
@@ -2575,5 +2591,12 @@ SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength,
     // number of tokens per block.
     auto const leftoverBlockCapacity = blockCapacity - outputBlockRequirements;
     return std::min(outputLength + leftoverBlockCapacity * tokensPerBlock, inputLength + outputLength);
+}
+
+SizeType32 KVCacheManager::getNumReusedTokens(RequestIdType requestId) const
+{
+    std::scoped_lock lock(mCachedTokensMtx);
+    auto it = mNumReusedTokensPerRequest.find(requestId);
+    return it != mNumReusedTokensPerRequest.end() ? it->second : 0;
 }
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

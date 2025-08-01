@@ -1051,6 +1051,13 @@ public:
 
     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
     {
+        if (prepopulatedPromptLen <= mPrepopulatedPromptLen)
+        {
+            TLLM_LOG_DEBUG("Skip setting pre-populated prompt length for request %lu, because it's already set to %i",
+                mRequestId, mPrepopulatedPromptLen);
+            return;
+        }
+
         // Add debug log for prepopulatedPromptLen
         TLLM_LOG_DEBUG("Setting pre-populated prompt length for request %lu to %i (promptLen=%i).", mRequestId,
             prepopulatedPromptLen, getPromptLen());
@@ -1078,12 +1085,11 @@ public:
                 chunkSize = flooredEndPosition - prepopulatedPromptLen;
                 TLLM_CHECK(chunkSize <= getContextChunkSize());
             }
-            setContextCurrentPosition(prepopulatedPromptLen);
             setContextChunkSize(chunkSize);
 
             if (!isLastContextChunk())
             {
-                TLLM_CHECK_WITH_INFO((getContextCurrentPosition() + getContextChunkSize()) % kvTokensPerBlock == 0,
+                TLLM_CHECK_WITH_INFO((prepopulatedPromptLen + getContextChunkSize()) % kvTokensPerBlock == 0,
                     "To prevent cache fragmentation, the context position after current chunk should be divisible "
                     "by the number of tokens per block, except for the last chunk.");
             }
@@ -1565,9 +1571,7 @@ public:
     /// Returns whether the position is at the beginning of the context.
     [[nodiscard]] bool isFirstContextChunk() const noexcept
     {
-        // The number of cached token is encountered in mContextCurrentPosition,
-        // so the start position of the context is mPrepopulatedPromptLen.
-        return mContextCurrentPosition == mPrepopulatedPromptLen;
+        return mContextCurrentPosition == 0;
     }
 
     /// Move the cursor forward one chunk. When not chunked, move forward to the end of the context.

@@ -1199,6 +1199,9 @@ class PyTorchModelEngine(ModelEngine):
             all_prompt_tokens = request.get_tokens(0)
             draft_lens.append(0)
             begin_compute = request.context_current_position
+            if kv_cache_manager is not None:
+                begin_compute += kv_cache_manager.get_num_reused_tokens(
+                    request.py_request_id)
             end_compute = begin_compute + request.context_chunk_size
             prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
             position_ids.extend(
