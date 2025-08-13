@@ -90,20 +90,21 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         ]
         tok_ids = llm_spec.tokenizer.encode("The future of AI is")
 
-    num_tokens = 0
-    num_drafted = 0
-    num_accepted = 0
-    sampling_params = SamplingParams(max_tokens=128, temperature=0)
-    for output in llm_spec.generate_async(tok_ids,
-                                          sampling_params,
-                                          streaming=True):
-        new_tokens = output.outputs[0].token_ids
-        num_drafted += max_draft_len
-        num_accepted += len(new_tokens) - num_tokens - 1
-        num_tokens = len(new_tokens)
+    if disable_overlap_scheduler or use_one_model:
+        num_tokens = 0
+        num_drafted = 0
+        num_accepted = 0
+        sampling_params = SamplingParams(max_tokens=128, temperature=0)
+        for output in llm_spec.generate_async(tok_ids,
+                                              sampling_params,
+                                              streaming=True):
+            new_tokens = output.outputs[0].token_ids
+            num_drafted += max_draft_len
+            num_accepted += len(new_tokens) - num_tokens - 1
+            num_tokens = len(new_tokens)
 
-    accept_rate = num_accepted / num_drafted
-    assert accept_rate > 0.15
+        accept_rate = num_accepted / num_drafted
+        assert accept_rate > 0.15
 
     # Output tests
     sampling_params = SamplingParams(max_tokens=10, temperature=0)

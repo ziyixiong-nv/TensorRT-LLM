@@ -8,7 +8,7 @@ import time
 import traceback
 import weakref
 from contextlib import contextmanager
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -125,6 +125,8 @@ class BatchState:
     iter_start_time: float = 0
     iter_stats: IterationStats = None
     ctx_transmission_reqs: list[LlmRequest] = None
+    draft_preparation_started: bool = False
+    draft_preparation_completed: bool = False
 
 
 @dataclasses.dataclass
@@ -339,6 +341,11 @@ class PyExecutor:
         self.shutdown_event.wait()
         self.worker_thread.join()
         self.worker_started = False
+
+        # Clean up draft preparation threads
+        if self.drafter is not None:
+            self.drafter.cleanup_draft_preparation()
+
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
@@ -1008,6 +1015,19 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     def _executor_loop_overlap(self):
+        """
+        Executor loop with overlap scheduling that processes batches in a pipelined manner.
+
+        This loop implements overlap between:
+        1. Main model forward pass and draft model preparation
+        2. Current batch processing and previous batch post-processing
+
+        Key features:
+        - Draft preparation runs asynchronously in parallel with main model forward pass
+        - Previous batch post-processing overlaps with current batch processing
+        - Tensor reuse between batches for improved memory efficiency
+        - Performance monitoring and logging for overlap benefits
+        """
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
@@ -1057,8 +1077,52 @@ class PyExecutor:
 
                     previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
+                    # Start draft preparation asynchronously if needed
+                    draft_start_time = None
+                    if self.drafter is not None and self.use_spec_decode:
+                        draft_start_time = time.time()
+                        with request_context(
+                                is_draft=True,
+                                scheduled_requests=scheduled_batch):
+                            if self.guided_decoder is not None:
+                                self.guided_decoder.rollback_rejected_tokens(
+                                    scheduled_batch)
+                            # Start async draft preparation
+                            self.drafter.start_prepare_draft_tokens_async(
+                                scheduled_batch, self.resource_manager,
+                                previous_tensors_device)
+
+                    # Forward step for main model (runs in parallel with draft preparation)
+                    forward_start_time = time.time()
                     batch_outputs = self._forward_step(scheduled_batch,
                                                        previous_tensors_device)
+                    forward_end_time = time.time()
+
+                    # Wait for draft preparation to complete
+                    draft_preparation_completed = False
+                    if self.drafter is not None and self.use_spec_decode:
+                        draft_success = self.drafter.wait_for_draft_preparation(
+                        )
+                        draft_preparation_completed = draft_success
+                        draft_end_time = time.time()
+
+                        # Log overlap performance
+                        forward_duration = forward_end_time - forward_start_time
+                        draft_duration = draft_end_time - draft_start_time
+                        total_duration = max(forward_duration, draft_duration)
+                        overlap_savings = forward_duration + draft_duration - total_duration
+
+                        if self.print_log and self.dist.rank == 0:
+                            logger.info(
+                                f"Draft overlap stats - Forward: {forward_duration:.3f}s, "
+                                f"Draft: {draft_duration:.3f}s, Total: {total_duration:.3f}s, "
+                                f"Savings: {overlap_savings:.3f}s ({overlap_savings/(forward_duration + draft_duration)*100:.1f}%)"
+                            )
+
+                        if not draft_success:
+                            logger.warning(
+                                "Draft preparation failed or timed out, continuing without draft tokens"
+                            )
 
                     if self.previous_batch is not None:
                         self._update_requests(self.previous_batch.sample_state)
@@ -1066,6 +1130,7 @@ class PyExecutor:
                     if self.kv_cache_transceiver and self.guided_decoder:
                         self.guided_decoder.init_disagg_gen_requests(
                             scheduled_batch)
+
                     self._execute_guided_decoder(scheduled_batch,
                                                  batch_outputs['logits'])
 
@@ -1091,10 +1156,85 @@ class PyExecutor:
                         sample_state=sample_state,
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
-                        ctx_transmission_reqs=ctx_transmission_reqs)
+                        ctx_transmission_reqs=ctx_transmission_reqs,
+                        draft_preparation_started=self.drafter is not None
+                        and self.use_spec_decode,
+                        draft_preparation_completed=draft_preparation_completed)
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
+
+    def get_comprehensive_overlap_stats(self) -> Dict[str, Any]:
+        """
+        Get comprehensive statistics about all overlap features.
+
+        Returns:
+            Dictionary with comprehensive overlap statistics.
+        """
+        stats = {
+            "draft_overlap_enabled":
+            self.is_draft_overlap_enabled(),
+            "overlap_scheduler_enabled":
+            not self.disable_overlap_scheduler,
+            "pipeline_parallelism":
+            self.dist.pp_size > 1,
+            "speculative_decoding_enabled":
+            self.drafter is not None and self.use_spec_decode,
+        }
+
+        # Add draft preparation stats if available
+        draft_stats = self.get_draft_overlap_stats()
+        if draft_stats is not None:
+            stats["draft_preparation"] = draft_stats
+
+        # Add current batch state if available
+        if self.previous_batch is not None:
+            stats["current_batch"] = {
+                "draft_preparation_started":
+                self.previous_batch.draft_preparation_started,
+                "draft_preparation_completed":
+                self.previous_batch.draft_preparation_completed,
+                "iter_start_time": self.previous_batch.iter_start_time,
+            }
+
+        return stats
+
+    def is_draft_overlap_enabled(self) -> bool:
+        """
+        Check if draft preparation overlap is enabled.
+
+        Returns:
+            True if draft overlap is enabled, False otherwise.
+        """
+        return (self.drafter is not None and self.use_spec_decode
+                and not self.disable_overlap_scheduler
+                and self.dist.pp_size == 1)
+
+    def get_draft_overlap_stats(self) -> Optional[Dict[str, Any]]:
+        """
+        Get statistics about draft preparation overlap performance.
+
+        Returns:
+            Dictionary with overlap statistics or None if no draft preparation was done.
+        """
+        if self.drafter is None:
+            return None
+
+        draft_stats = self.drafter.get_draft_preparation_stats()
+        if draft_stats is None:
+            return None
+
+        # Calculate overlap metrics
+        overlap_stats = {
+            "draft_preparation_duration": draft_stats.get("duration"),
+            "draft_preparation_start_time": draft_stats.get("start_time"),
+            "draft_preparation_completion_time":
+            draft_stats.get("completion_time"),
+            "draft_preparation_success": draft_stats.get("is_completed", False),
+            "draft_preparation_error": draft_stats.get("error"),
+        }
+
+        return overlap_stats
 
     def _process_previous_batch(self):
         if self.kv_cache_transceiver and self.previous_batch.ctx_transmission_reqs:

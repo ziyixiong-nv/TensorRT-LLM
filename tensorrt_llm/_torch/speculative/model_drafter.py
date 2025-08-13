@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import dataclasses
+import threading
+import time
 import traceback
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -12,7 +15,8 @@ from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.llm_request import (LlmRequest, LlmRequestState,
                                       get_draft_token_length)
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
-from ..pyexecutor.sampler import Sampler, SampleState, TorchSampler
+from ..pyexecutor.sampler import (Sampler, SampleState, SampleStateTensors,
+                                  TorchSampler)
 from ..pyexecutor.scheduler import ScheduledRequests
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from .drafter import Drafter
@@ -20,6 +24,16 @@ from .drafter import Drafter
 if TYPE_CHECKING:
     from ..pyexecutor.model_engine import ModelEngine
     from .interface import SpeculativeDecodingMode
+
+
+@dataclasses.dataclass
+class DraftPreparationState:
+    """State for tracking draft preparation progress."""
+    is_completed: bool = False
+    error: Optional[str] = None
+    thread: Optional[threading.Thread] = None
+    start_time: float = 0.0
+    completion_time: float = 0.0
 
 
 # Place the tool function here to avoid circular import
@@ -70,6 +84,10 @@ class ModelDrafter(Drafter):
         if isinstance(sampler, TorchSampler):
             self._request_draft_logits = sampler.enable_mixed_sampler
         self.guided_decoder = guided_decoder
+
+        # Async draft preparation state
+        self._draft_prep_state: Optional[DraftPreparationState] = None
+        self._draft_prep_lock = threading.Lock()
 
     def _create_draft_request(self, request: LlmRequest,
                               input_tokens: Optional[List]) -> LlmRequest:
@@ -130,12 +148,20 @@ class ModelDrafter(Drafter):
         return new_request
 
     def _create_draft_request_for_request(
-            self, request: LlmRequest) -> Optional[LlmRequest]:
+        self,
+        request: LlmRequest,
+        new_tensors_device: Optional[SampleStateTensors] = None
+    ) -> Optional[LlmRequest]:
         """Create a draft request based on the original request state."""
         num_draft_tokens, num_accepted_tokens = self._initialize_draft_tokens(
             request)
+        if new_tensors_device is not None:
+            all_tokens = new_tensors_device.new_tokens.flatten().tolist()
+        else:
+            all_tokens = request.get_tokens(0)
+
         input_tokens = get_draft_model_prompt(self.spec_config.spec_dec_mode,
-                                              request.get_tokens(0))
+                                              all_tokens)
 
         # First time seeing this request - context request
         if request.max_beam_num_tokens - 1 == request.py_prompt_len:
@@ -169,7 +195,10 @@ class ModelDrafter(Drafter):
 
     @nvtx_range("_prepare_draft_batch")
     def _prepare_draft_batch(
-            self, scheduled_requests: ScheduledRequests) -> ScheduledRequests:
+        self,
+        scheduled_requests: ScheduledRequests,
+        new_tensors_device: Optional[SampleStateTensors] = None
+    ) -> ScheduledRequests:
         """
         Prepares a batch for the draft model engine. Draft tokens are only produced
         for generation requests.
@@ -198,6 +227,10 @@ class ModelDrafter(Drafter):
                 # a prefill chunk on the last iteration. Now, we need to fill in the KV cache
                 # for the draft model too.
                 all_tokens = request.get_tokens(0)
+                if new_tensors_device is not None:
+                    all_tokens = new_tensors_device.new_tokens.flatten().tolist(
+                    )
+
                 input_tokens = get_draft_model_prompt(
                     self.spec_config.spec_dec_mode, all_tokens)
 
@@ -219,7 +252,8 @@ class ModelDrafter(Drafter):
                 if request.max_beam_num_tokens - 1 >= self.draft_model_engine.max_seq_len:
                     continue
 
-                draft_request = self._create_draft_request_for_request(request)
+                draft_request = self._create_draft_request_for_request(
+                    request, new_tensors_device)
                 if draft_request is not None:
                     self._add_to_draft_batch(draft_batch, draft_request,
                                              request)
@@ -328,11 +362,241 @@ class ModelDrafter(Drafter):
             self.guided_decoder.build(scheduled_batch)
             self.guided_decoder.execute(scheduled_batch, logits, d2t=d2t)
 
+    def _prepare_draft_tokens_async_worker(
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: ResourceManager,
+        new_tensors_device: Optional[SampleStateTensors] = None,
+    ) -> None:
+        """Worker function for async draft token preparation."""
+        try:
+            draft_batch = self._prepare_draft_batch(scheduled_requests,
+                                                    new_tensors_device)
+
+            if draft_batch.batch_size == 0:
+                return
+
+            self.draft_seq_slot_manager.prepare_resources(draft_batch)
+
+            req_id_to_old_request = {
+                req.py_request_id: req
+                for req in scheduled_requests.all_requests()
+            }
+
+            # Initial forward pass
+            outputs = self._forward_draft_model(draft_batch, resource_manager)
+            self._execute_guided_decoder(draft_batch,
+                                         outputs['logits'],
+                                         d2t=outputs.get('d2t'))
+            sample_state = self._sample_async(draft_batch, outputs)
+            previous_batch = sample_state
+
+            self._update_request_states(draft_batch)
+
+            # Convert context requests to generation requests
+            draft_batch.generation_requests = draft_batch.context_requests + draft_batch.generation_requests
+            draft_batch.context_requests = []
+
+            # Generate remaining draft tokens iteratively
+            for i in range(self.max_draft_tokens - 1):
+                if len(draft_batch.generation_requests) == 0:
+                    break
+
+                outputs = self._forward_draft_model(draft_batch,
+                                                    resource_manager,
+                                                    previous_batch)
+                if previous_batch is not None:
+                    self._update_requests(previous_batch)
+                self._execute_guided_decoder(draft_batch,
+                                             outputs['logits'],
+                                             d2t=outputs.get('d2t'))
+                sample_state = self._sample_async(draft_batch, outputs)
+                self._update_request_states(draft_batch)
+                if previous_batch is not None:
+                    new_requests = self._process_decoded_tokens(
+                        previous_batch.scheduled_requests,
+                        req_id_to_old_request)
+                else:
+                    new_requests = []
+                draft_batch.generation_requests = new_requests
+                previous_batch = sample_state
+
+            # Final cleanup
+            if previous_batch is not None:
+                self._update_requests(previous_batch)
+                self._process_decoded_tokens(previous_batch.scheduled_requests,
+                                             req_id_to_old_request)
+            self._pad_to_max_draft_tokens(scheduled_requests)
+
+            if self.guided_decoder is not None:
+                self.guided_decoder.rollback_draft_tokens(scheduled_requests)
+
+        except Exception as e:
+            with self._draft_prep_lock:
+                if self._draft_prep_state is not None:
+                    self._draft_prep_state.error = str(e)
+            logger.error(f"Error in async draft preparation: {str(e)}")
+            traceback.print_exc()
+        finally:
+            # Ensure resources are cleaned up even on error
+            try:
+                if 'draft_batch' in locals() and draft_batch.batch_size > 0:
+                    for req in draft_batch.all_requests():
+                        self.draft_seq_slot_manager.free_resources(req)
+            except Exception as cleanup_error:
+                logger.error(
+                    f"Error during draft preparation cleanup: {str(cleanup_error)}"
+                )
+
+    def start_prepare_draft_tokens_async(
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: ResourceManager,
+        new_tensors_device: Optional[SampleStateTensors] = None,
+    ) -> None:
+        """
+        Start draft token preparation asynchronously.
+
+        This method starts the draft preparation in a separate thread,
+        allowing it to run in parallel with the main model's forward step.
+        """
+        with self._draft_prep_lock:
+            # Clean up any previous async preparation
+            if self._draft_prep_state is not None and self._draft_prep_state.thread is not None:
+                if self._draft_prep_state.thread.is_alive():
+                    logger.warning(
+                        "Previous async draft preparation is still running, waiting for completion"
+                    )
+                    self._draft_prep_state.thread.join()
+
+            # Initialize new preparation state
+            self._draft_prep_state = DraftPreparationState()
+            self._draft_prep_state.start_time = time.time()
+
+            # Start the worker thread
+            self._draft_prep_state.thread = threading.Thread(
+                target=self._prepare_draft_tokens_async_worker,
+                args=(scheduled_requests, resource_manager, new_tensors_device),
+                daemon=True)
+            self._draft_prep_state.thread.start()
+
+    def wait_for_draft_preparation(self,
+                                   timeout: Optional[float] = None) -> bool:
+        """
+        Wait for the async draft preparation to complete.
+
+        Args:
+            timeout: Maximum time to wait in seconds. None means wait indefinitely.
+
+        Returns:
+            True if preparation completed successfully, False if timed out or failed.
+        """
+        with self._draft_prep_lock:
+            if self._draft_prep_state is None:
+                return True  # No preparation was started
+
+            if self._draft_prep_state.thread is None:
+                return True  # No thread was started
+
+        # Wait for the thread to complete
+        self._draft_prep_state.thread.join(timeout=timeout)
+
+        with self._draft_prep_lock:
+            if self._draft_prep_state.thread.is_alive():
+                logger.warning("Draft preparation timed out")
+                return False
+
+            if self._draft_prep_state.error is not None:
+                logger.error(
+                    f"Draft preparation failed: {self._draft_prep_state.error}")
+                return False
+
+            self._draft_prep_state.completion_time = time.time()
+            self._draft_prep_state.is_completed = True
+            return True
+
+    def is_draft_preparation_running(self) -> bool:
+        """
+        Check if draft preparation is currently running.
+
+        Returns:
+            True if draft preparation is running, False otherwise.
+        """
+        with self._draft_prep_lock:
+            if self._draft_prep_state is None:
+                return False
+            if self._draft_prep_state.thread is None:
+                return False
+            return self._draft_prep_state.thread.is_alive()
+
+    def cancel_draft_preparation(self) -> bool:
+        """
+        Cancel the current draft preparation if it's running.
+
+        Returns:
+            True if preparation was cancelled, False if it wasn't running.
+        """
+        with self._draft_prep_lock:
+            if self._draft_prep_state is None or self._draft_prep_state.thread is None:
+                return False
+
+            if not self._draft_prep_state.thread.is_alive():
+                return False
+
+            # Note: Python threads can't be forcefully cancelled, but we can mark them for cleanup
+            self._draft_prep_state.error = "Cancelled by user"
+            return True
+
+    def cleanup_draft_preparation(self) -> None:
+        """
+        Clean up any running draft preparation threads.
+        This should be called during shutdown.
+        """
+        with self._draft_prep_lock:
+            if self._draft_prep_state is not None and self._draft_prep_state.thread is not None:
+                if self._draft_prep_state.thread.is_alive():
+                    logger.warning(
+                        "Cleaning up running draft preparation thread")
+                    # Wait a short time for the thread to finish naturally
+                    self._draft_prep_state.thread.join(timeout=1.0)
+                    if self._draft_prep_state.thread.is_alive():
+                        logger.warning(
+                            "Draft preparation thread did not finish within timeout"
+                        )
+
+    def get_draft_preparation_stats(self) -> Optional[Dict[str, Any]]:
+        """
+        Get statistics about the draft preparation.
+
+        Returns:
+            Dictionary with preparation statistics or None if no preparation was done.
+        """
+        with self._draft_prep_lock:
+            if self._draft_prep_state is None:
+                return None
+
+            stats = {
+                "is_completed":
+                self._draft_prep_state.is_completed,
+                "start_time":
+                self._draft_prep_state.start_time,
+                "completion_time":
+                self._draft_prep_state.completion_time,
+                "duration":
+                self._draft_prep_state.completion_time -
+                self._draft_prep_state.start_time
+                if self._draft_prep_state.completion_time > 0 else None,
+                "error":
+                self._draft_prep_state.error,
+            }
+            return stats
+
     @nvtx_range("prepare_draft_tokens")
     def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
         resource_manager: Optional[ResourceManager] = None,
+        new_tensors_device: Optional[SampleStateTensors] = None,
     ) -> None:
         """
         Prepare draft tokens for the scheduled requests.
@@ -348,7 +612,8 @@ class ModelDrafter(Drafter):
             raise ValueError("Resource manager is required")
 
         try:
-            draft_batch = self._prepare_draft_batch(scheduled_requests)
+            draft_batch = self._prepare_draft_batch(scheduled_requests,
+                                                    new_tensors_device)
 
             if draft_batch.batch_size == 0:
                 return
