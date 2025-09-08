@@ -274,6 +274,7 @@ def create_py_executor(
                 and not pytorch_backend_config.enable_mixed_sampler
                 and pytorch_backend_config.attn_backend == "TRTLLM")
 
+            #use_chain_drafter = False
             if use_chain_drafter:
 
                 def drafting_loop_wrapper(model):

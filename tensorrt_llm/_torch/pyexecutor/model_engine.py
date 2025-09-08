@@ -1282,11 +1282,15 @@ class PyTorchModelEngine(ModelEngine):
         Prepare inputs for Pytorch Model.
         """
         new_tokens_device, new_tokens_lens_device, next_draft_tokens_device = None, None, None
+        print(f"[DEBUG] [PREPARE INPUTS] is_draft_model: {self.is_draft_model}")
+        print(
+            f"[DEBUG] [PREPARE INPUTS] new_tensors_device: {new_tensors_device}"
+        )
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
             new_tokens_device = new_tensors_device.new_tokens
-            if self.without_logits:
-                assert isinstance(new_tensors_device, SampleStateTensorsMTP)
+            if isinstance(new_tensors_device, SampleStateTensorsMTP):
+                assert self.enable_spec_decode and not self.is_draft_model
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
 
@@ -1309,6 +1313,12 @@ class PyTorchModelEngine(ModelEngine):
         gen_request_seq_slots = []  # per generation request
 
         for request in scheduled_requests.context_requests:
+            print(
+                f"[DEBUG] [_prepare_tp_inputs] Processing context request {request.py_request_id} - "
+                f"Current position: {request.context_current_position}, "
+                f"Chunk size: {request.context_chunk_size}, "
+                f"Multimodal hashes: {request.multimodal_hashes is not None}, "
+                f"is_draft_model: {self.is_draft_model}")
             request_ids.append(request.py_request_id)
             all_prompt_tokens = request.get_tokens(0)
             draft_lens.append(0)
@@ -1409,6 +1419,7 @@ class PyTorchModelEngine(ModelEngine):
                 # get other ids and lengths
                 num_draft_tokens = get_draft_token_length(request)
                 past_seen_token_num = request.max_beam_num_tokens - 1
+
                 draft_lens.append(num_draft_tokens)
 
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
@@ -1504,6 +1515,7 @@ class PyTorchModelEngine(ModelEngine):
             previous_slots.copy_(previous_batch_indices_host, non_blocking=True)
             return previous_slots
 
+        print(f"[DEBUG] [PREPARE INPUTS] position_ids: {position_ids}")
         num_tokens = len(input_ids)
         num_draft_tokens = len(draft_tokens)
         total_num_tokens = len(position_ids)
@@ -1730,6 +1742,10 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['num_ctx_requests'] = num_ctx_requests
         self.iter_states['num_ctx_tokens'] = num_ctx_tokens
         self.iter_states['num_generation_tokens'] = num_generation_tokens
+        if self.enable_spec_decode:
+            print(
+                f"[DEBUG] [PREPARE INPUTS] self.input_ids_cuda: {self.input_ids_cuda}"
+            )
         return inputs, self.gather_ids_cuda[:len(
             gather_ids)] if self.enable_spec_decode else None
 
@@ -2281,6 +2297,9 @@ class PyTorchModelEngine(ModelEngine):
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
                 new_tensors_device, cache_indirection_buffer)
 
+            print(f"[DEBUG] [FORWARD] inputs.input_ids: {inputs['input_ids']}, "
+                  f"inputs.position_ids: {inputs['position_ids']}, "
+                  f"gather_ids: {gather_ids}")
             self.iter_counter += 1
 
             if not maybe_graph:

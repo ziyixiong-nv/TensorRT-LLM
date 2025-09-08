@@ -487,6 +487,10 @@ class TorchSampler(Sampler):
             return 0
         num_accepted = 0
 
+        print(f"[DEBUG] [PROCESS DRAFT TOKENS GREEDY] request: {request}")
+        print(
+            f"[DEBUG] [PROCESS DRAFT TOKENS GREEDY] request.py_draft_tokens: {request.py_draft_tokens}"
+        )
         for draft_token in request.py_draft_tokens:
             if draft_token != new_token:
                 # Reject.
