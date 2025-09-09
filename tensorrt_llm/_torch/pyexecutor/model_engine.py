@@ -1183,13 +1183,26 @@ class PyTorchModelEngine(ModelEngine):
                 num_ctx_requests = inputs['attn_metadata'].num_contexts
                 num_gen_requests = inputs['attn_metadata'].num_generations
                 num_ctx_tokens = inputs['attn_metadata'].num_ctx_tokens
+                num_extended_ctx_requests = inputs[
+                    'attn_metadata'].num_extended_ctx_requests
                 previous_batch_tokens = inputs['input_ids'].shape[
                     0] - num_ctx_tokens
                 inputs['position_ids'][0, num_ctx_tokens:] += (
                     self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
-                inputs['attn_metadata'].kv_lens_cuda[
-                    num_ctx_requests:num_seqs] += (
-                        self.previous_kv_lens_offsets_cuda[:num_gen_requests])
+                if num_extended_ctx_requests > 0:
+                    # The generation requests with draft_tokens are treated as chunked context requests when extend_ctx returns True.
+                    inputs['attn_metadata'].kv_lens_cuda[
+                        num_ctx_requests -
+                        num_extended_ctx_requests:num_ctx_requests] += (
+                            self.
+                            previous_kv_lens_offsets_cuda[:
+                                                          num_extended_ctx_requests]
+                        )
+                else:
+                    inputs['attn_metadata'].kv_lens_cuda[
+                        num_ctx_requests:num_seqs] += (
+                            self.
+                            previous_kv_lens_offsets_cuda[:num_gen_requests])
 
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
@@ -1466,7 +1479,11 @@ class PyTorchModelEngine(ModelEngine):
                                             (1 + self.runtime_draft_len))
                 num_cached_tokens_per_seq.append(past_seen_token_num +
                                                  self.runtime_draft_len + 1)
-                prompt_lengths.append(request.py_prompt_len)
+                if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
+                        self.attn_backend):
+                    prompt_lengths.append(1 + self.runtime_draft_len)
+                else:
+                    prompt_lengths.append(request.py_prompt_len)
 
         for request in generation_requests:
             request_ids.append(request.py_request_id)
@@ -1592,6 +1609,12 @@ class PyTorchModelEngine(ModelEngine):
                     previous_batch_len:num_extend_reqeust_wo_dummy].copy_(
                         kv_len_offsets_device[previous_slots],
                         non_blocking=True)
+                print(
+                    f"[DEBUG] [PREPARE INPUTS] kv_len_offsets_device: {kv_len_offsets_device}"
+                )
+                print(
+                    f"[DEBUG] [PREPARE INPUTS] previous_kv_lens_offsets_cuda: {self.previous_kv_lens_offsets_cuda}"
+                )
 
         elif new_tokens_device is not None:
             seq_slots_device = previous_seq_slots_device()
@@ -1649,9 +1672,11 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
+        attn_metadata.num_extended_ctx_requests = 0
         if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                 self.attn_backend):
             attn_metadata.num_contexts += len(extend_requests)
+            attn_metadata.num_extended_ctx_requests = len(extend_requests)
 
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,

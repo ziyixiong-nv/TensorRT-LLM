@@ -90,12 +90,12 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         tok_ids = llm_spec.tokenizer.encode(prompts[0])
     else:
         prompts = [
-            #"The capital of France is",
+            "The capital of France is",
             "The president of the United States is",
         ]
         tok_ids = llm_spec.tokenizer.encode("The future of AI is")
 
-    run_rate_test = False
+    run_rate_test = True
     if run_rate_test:
         num_tokens = 0
         num_drafted = 0
