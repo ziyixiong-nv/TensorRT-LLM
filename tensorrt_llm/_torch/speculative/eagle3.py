@@ -188,6 +188,7 @@ class Eagle3SpecMetadata(SpecMetadata):
                 hidden_states_read_indices.append(start_idx + old_seq_len - 1)
                 hidden_states_write_indices.append(start_idx + seq_len - 1)
             self.eagle3_resource_manager.seq_lens[slot_id] = seq_len
+
         # Prepare hidden states gather ids
         self.hidden_states_read_indices_host = torch.tensor(
             hidden_states_read_indices, dtype=torch.long, pin_memory=True)

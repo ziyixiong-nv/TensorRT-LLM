@@ -39,6 +39,7 @@ def enforce_single_worker(monkeypatch):
         [True, "TRTLLM", False, False, False, False, True, False, False],
         [False, "TRTLLM", False, False, False, False, True, False, False],
         [True, "TRTLLM", False, False, False, False, False, True, False],
+        [True, "TRTLLM", True, False, False, False, False, True, False],
         [True, "TRTLLM", False, False, False, False, False, True, True],
         [False, "TRTLLM", False, False, False, False, False, True, False],
         [True, "TRTLLM", False, False, False, False, True, True, False],
@@ -122,31 +123,38 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
             tok_ids.append(llm_spec.tokenizer.encode(prompts))
 
     sampling_params = SamplingParams(max_tokens=128, temperature=0)
-    for i in range(len(tok_ids)):
-        num_tokens = 0
-        num_drafted = 0
-        num_accepted = 0
+    run_ar_test = True
+    if run_ar_test:
+        for i in range(len(tok_ids)):
+            num_tokens = 0
+            num_drafted = 0
+            num_accepted = 0
 
-        for output in llm_spec.generate_async(tok_ids[i],
-                                              sampling_params,
-                                              streaming=True):
-            new_tokens = output.outputs[0].token_ids
-            num_drafted += max_draft_len
-            num_accepted += len(new_tokens) - num_tokens - 1
-            num_tokens = len(new_tokens)
+            for output in llm_spec.generate_async(tok_ids[i],
+                                                  sampling_params,
+                                                  streaming=True):
+                new_tokens = output.outputs[0].token_ids
+                num_drafted += max_draft_len
+                num_accepted += len(new_tokens) - num_tokens - 1
+                num_tokens = len(new_tokens)
 
-        accept_rate = num_accepted / num_drafted
-        assert accept_rate > 0.15
+            accept_rate = num_accepted / num_drafted
+            print(f"DEBUG: Accept rate: {accept_rate}")
+            assert accept_rate > 0.15
 
     # Output tests
     sampling_params = SamplingParams(max_tokens=10, temperature=0)
 
+    print(f"DEBUG: Starting spec generate")
     results_spec = llm_spec.generate(prompts, sampling_params)
+    print(f"DEBUG: Spec generate completed")
     generated_text_spec = [result.outputs[0].text for result in results_spec]
     llm_spec.shutdown()
 
     llm_ref = LLM(**llm_common_config)
+    print(f"DEBUG: Starting ref generate")
     results_ref = llm_ref.generate(prompts, sampling_params)
+    print(f"DEBUG: Ref generate completed")
     generated_text_ref = [result.outputs[0].text for result in results_ref]
     llm_ref.shutdown()
 
