@@ -245,7 +245,7 @@ def forward_native(
 
     The logits tensor may be updated in-place.
     """
-    logits = apply_top_k_top_p(logits, k, p)
+    # logits = apply_top_k_top_p(logits, k, p)
     probs = logits.softmax(dim=-1, dtype=torch.float32)
     return random_sample(probs)
 
@@ -333,13 +333,14 @@ def sampling_batch_spec_dec_one_model(
     top_p: torch.Tensor,
     min_p: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    raw_probs = torch.softmax(logits, dim=-1)
+    # raw_probs = torch.softmax(logits, dim=-1)
     logits = apply_temperature(logits, temperatures)
-    logits = apply_min_p(logits, min_p)
+    # logits = apply_min_p(logits, min_p)
     random_sampled = forward_native(logits, top_k, top_p)
-    token_probs = torch.gather(raw_probs, dim=1, index=random_sampled.unsqueeze(1)).squeeze(-1)
-    log_probs = torch.log(token_probs)
-    return random_sampled, log_probs
+    # token_probs = torch.gather(raw_probs, dim=1, index=random_sampled.unsqueeze(1)).squeeze(-1)
+    # log_probs = torch.log(token_probs)
+    # return random_sampled, log_probs
+    return random_sampled, None
 
 
 # Due to tensorrt_llm::runtime::SamplingConfig using vectors, params
