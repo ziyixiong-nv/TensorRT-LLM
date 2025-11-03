@@ -209,6 +209,59 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     assert generated_text_spec[0] == generated_text_ref[0]
 
 
+def test_gpt_oss_eagle3():
+    use_cuda_graph = True
+    attn_backend = "TRTLLM"
+    disable_overlap_scheduler = False
+    enable_block_reuse = False
+    enable_chunked_prefill = False
+
+    # Eagle3 one model works with overlap scheduler and block reuse.
+    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if total_mem_gb < 150:
+        pytest.skip("Not enough memory to load target + draft model")
+
+    models_path = llm_models_root()
+    eagle_model_dir = f"{models_path}/gpt_oss/gpt-oss-120b-Eagle3"
+    target_model_dir = f"{models_path}/gpt_oss/gpt-oss-120b"
+
+    max_batch_size = 1
+    max_draft_len = 3
+    kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
+                                    max_tokens=8192)
+    cuda_graph_config = CudaGraphConfig(
+        batch_sizes=[1]) if use_cuda_graph else None
+
+    llm_common_config = dict(
+        model=target_model_dir,
+        attn_backend=attn_backend,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        cuda_graph_config=cuda_graph_config,
+        max_batch_size=max_batch_size,
+        max_num_tokens=131072,
+        max_seq_len=131072,
+        kv_cache_config=kv_cache_config,
+        enable_chunked_prefill=enable_chunked_prefill,
+    )
+
+    spec_config = EagleDecodingConfig(max_draft_len=max_draft_len,
+                                      speculative_model_dir=eagle_model_dir,
+                                      eagle3_one_model=True,
+                                      load_format="dummy")
+
+    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
+
+    tok_ids = llm_spec.tokenizer.encode(
+        "Planet #1 was detected from the up to 5 miliangstrom periodic shift of a spectral line at a given wavelength. The periodic wavelength shift of the same spectral line in the spectrum of the host of planet #2 was 7 miliangstrom. The question is: How many times is the orbital period of planet #2 longer than that of planet #1? (A) ~ 0.85 (B) ~ 1.96 (C) ~ 0.36 (D) ~ 1.40 Express your final answer as the corresponding option 'A', 'B', 'C', or 'D'."
+    )
+
+    sampling_params = SamplingParams(max_tokens=8192, temperature=0)
+    for output in llm_spec.generate_async(tok_ids,
+                                          sampling_params,
+                                          streaming=True):
+        print(output.outputs[0].text)
+
+
 def test_deepseek_eagle3():
     use_cuda_graph = True
     attn_backend = "TRTLLM"
