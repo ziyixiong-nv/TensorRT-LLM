@@ -1090,13 +1090,13 @@ class AutoTuner:
         self.stats = AutoTunerStatistics()
 
     def print_profiling_cache(self):
-        logger.debug(f"[Autotuner] The profiling_cache entries:")
-        logger.debug(
+        logger.info(f"[Autotuner] The profiling_cache entries:")
+        logger.info(
             f"[Autotuner] Cache contents: (custom_op, runner, hash(attributes), shape_profiles) -> (runner_id, tactic, shape_profile(ignored))"
         )
         for key, value in self.profiling_cache.cache.items():
             runner_id, tactic, min_time = value
-            logger.debug(
+            logger.info(
                 f"[Autotuner] {key}: (runner_id={runner_id}, tactic={tactic}, min_time={min_time})"
             )
 

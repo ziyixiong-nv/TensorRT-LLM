@@ -106,7 +106,94 @@ class MoERunner(TunableRunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
-        return range(self.fused_moe_runner.get_tactic_num(kwargs["gemm_idx"]))
+        gemm_idx = kwargs.get("gemm_idx", 0)
+        if gemm_idx == 1:  # gemm_1
+            match inputs[0].shape[0]:
+                case 1:
+                    tactic = [37]
+                case 2:
+                    tactic = [37]
+                case 4:
+                    tactic = [37]
+                case 8:
+                    tactic = [37]
+                case 16:
+                    tactic = [37]
+                case 32:
+                    tactic = [37]
+                case 64:
+                    tactic = [37]
+                case 128:
+                    tactic = [37]
+                case 256:
+                    tactic = [37]
+                case 512:
+                    tactic = [37]
+                case 1024:
+                    tactic = [37]
+                case 2048:
+                    tactic = [40]
+                case 4096:
+                    tactic = [40]
+                case 8192:
+                    tactic = [40]
+                case 16384:
+                    tactic = [40]
+                case 32768:
+                    tactic = [20]
+                case 65536:
+                    tactic = [20]
+                case 131072:
+                    tactic = [20]
+                case _:
+                    tactic = [-1]
+        elif gemm_idx == 2:  # gemm_2
+            match inputs[0].shape[0]:
+                case 1:
+                    tactic = [66]
+                case 2:
+                    tactic = [79]
+                case 4:
+                    tactic = [79]
+                case 8:
+                    tactic = [79]
+                case 16:
+                    tactic = [79]
+                case 32:
+                    tactic = [79]
+                case 64:
+                    tactic = [79]
+                case 128:
+                    tactic = [79]
+                case 256:
+                    tactic = [79]
+                case 512:
+                    tactic = [67]
+                case 1024:
+                    tactic = [79]
+                case 2048:
+                    tactic = [70]
+                case 4096:
+                    tactic = [70]
+                case 8192:
+                    tactic = [70]
+                case 16384:
+                    tactic = [82]
+                case 32768:
+                    tactic = [40]
+                case 65536:
+                    tactic = [40]
+                case 131072:
+                    tactic = [34]
+                case _:
+                    tactic = [-1]
+        else:
+            tactic = range(
+                self.fused_moe_runner.get_tactic_num(kwargs["gemm_idx"]))
+        print(
+            f"DEBUG: kwargs: {kwargs}, inputs[0].shape[0]: {inputs[0].shape[0]}, tactic: {tactic}"
+        )
+        return tactic
 
     def forward(
         self,

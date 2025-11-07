@@ -209,10 +209,11 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     assert generated_text_spec[0] == generated_text_ref[0]
 
 
-def test_gpt_oss_eagle3():
-    use_cuda_graph = True
+@pytest.mark.parametrize("use_spec_dec", [True, False])
+def test_gpt_oss_eagle3(use_spec_dec: bool):
+    use_cuda_graph = False
     attn_backend = "TRTLLM"
-    disable_overlap_scheduler = False
+    disable_overlap_scheduler = True
     enable_block_reuse = False
     enable_chunked_prefill = False
 
@@ -242,12 +243,13 @@ def test_gpt_oss_eagle3():
         max_seq_len=131072,
         kv_cache_config=kv_cache_config,
         enable_chunked_prefill=enable_chunked_prefill,
-    )
+        enable_autotuner=True)
 
-    spec_config = EagleDecodingConfig(max_draft_len=max_draft_len,
-                                      speculative_model_dir=eagle_model_dir,
-                                      eagle3_one_model=True,
-                                      load_format="dummy")
+    spec_config = EagleDecodingConfig(
+        max_draft_len=max_draft_len,
+        speculative_model_dir=eagle_model_dir,
+        eagle3_one_model=True,
+        load_format="dummy") if use_spec_dec else None
 
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
