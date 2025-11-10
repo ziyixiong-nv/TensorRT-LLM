@@ -11,7 +11,7 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
-                                 KvCacheConfig)
+                                 KvCacheConfig, MoeConfig)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -209,8 +209,11 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     assert generated_text_spec[0] == generated_text_ref[0]
 
 
-@pytest.mark.parametrize("use_spec_dec", [True, False])
-def test_gpt_oss_eagle3(use_spec_dec: bool):
+@pytest.mark.parametrize("use_spec_dec, moe_backend", [(True, "TRTLLM"),
+                                                       (False, "TRTLLM"),
+                                                       (True, "CUTLASS"),
+                                                       (False, "CUTLASS")])
+def test_gpt_oss_eagle3(use_spec_dec: bool, moe_backend: str):
     use_cuda_graph = False
     attn_backend = "TRTLLM"
     disable_overlap_scheduler = True
@@ -243,7 +246,8 @@ def test_gpt_oss_eagle3(use_spec_dec: bool):
         max_seq_len=131072,
         kv_cache_config=kv_cache_config,
         enable_chunked_prefill=enable_chunked_prefill,
-        enable_autotuner=True)
+        enable_autotuner=True,
+        moe_config=MoeConfig(backend=moe_backend))
 
     spec_config = EagleDecodingConfig(
         max_draft_len=max_draft_len,
@@ -257,11 +261,9 @@ def test_gpt_oss_eagle3(use_spec_dec: bool):
         "Planet #1 was detected from the up to 5 miliangstrom periodic shift of a spectral line at a given wavelength. The periodic wavelength shift of the same spectral line in the spectrum of the host of planet #2 was 7 miliangstrom. The question is: How many times is the orbital period of planet #2 longer than that of planet #1? (A) ~ 0.85 (B) ~ 1.96 (C) ~ 0.36 (D) ~ 1.40 Express your final answer as the corresponding option 'A', 'B', 'C', or 'D'."
     )
 
-    sampling_params = SamplingParams(max_tokens=8192, temperature=0)
-    for output in llm_spec.generate_async(tok_ids,
-                                          sampling_params,
-                                          streaming=True):
-        print(output.outputs[0].text)
+    sampling_params = SamplingParams(max_tokens=131072, temperature=0)
+    result = llm_spec.generate(tok_ids, sampling_params)
+    print(result.outputs[0].text)
 
 
 def test_deepseek_eagle3():

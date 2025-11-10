@@ -234,6 +234,19 @@ public:
         mProfiler = std::make_shared<kernels::GemmProfilerBackend>();
         mGemm1Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_1);
         mGemm2Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_2);
+
+        // Debug: Print tactic IDs and configurations
+        std::cout << "=== GEMM_1 Tactics (Total: " << mGemm1Profiles.size() << ") ===" << std::endl;
+        for (size_t i = 0; i < mGemm1Profiles.size(); ++i)
+        {
+            std::cout << "Tactic ID " << i << ": " << mGemm1Profiles[i] << std::endl;
+        }
+        std::cout << "=== GEMM_2 Tactics (Total: " << mGemm2Profiles.size() << ") ===" << std::endl;
+        for (size_t i = 0; i < mGemm2Profiles.size(); ++i)
+        {
+            std::cout << "Tactic ID " << i << ": " << mGemm2Profiles[i] << std::endl;
+        }
+        std::cout << "=== End of Tactics ===" << std::endl;
     }
 
     ~FusedMoeRunner()

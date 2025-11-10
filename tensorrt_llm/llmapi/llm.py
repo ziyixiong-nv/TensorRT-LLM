@@ -481,6 +481,9 @@ class BaseLLM:
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
             )
 
+        print(
+            f"DEBUG: len(prompt): {len(prompt_token_ids)} prompt_token_ids: {prompt_token_ids}"
+        )
         self._check_arguments(
             len(prompt_token_ids),
             len(query_token_ids) if query_token_ids is not None else 0,
