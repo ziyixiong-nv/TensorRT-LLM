@@ -107,30 +107,93 @@ class MoERunner(TunableRunner):
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
         gemm_idx = kwargs.get("gemm_idx", 0)
-
-        num_tactics = self.fused_moe_runner.get_tactic_num(gemm_idx)
-
-        # Disable split-k-like tactics (cluster_shape=2001001, i.e., 2 SMs)
-        # For SM100, within each 21-tactic group, tactics with 2 SMs are: 4, 7, 8, 10, 13, 14, 16, 19, 20
-        # Keep only single SM tactics (cluster_shape=1001001): 0-3, 5-6, 9, 11-12, 15, 17-18 (12 per group)
-
-        #single_sm_offsets = [0, 1, 2, 3, 5, 6, 9, 11, 12, 15, 17, 18]
-        #
-        #if gemm_idx == 1:
-        #    # GEMM_1: 2 groups of 21 tactics (swap_ab=false, swap_ab=true)
-        #    tactics = [offset for group_start in [0, 21]
-        #              for offset in [group_start + i for i in single_sm_offsets]
-        #              if offset < num_tactics]
-        #elif gemm_idx == 2:
-        #    # GEMM_2: 4 groups of 21 tactics
-        #    tactics = [offset for group_start in [0, 21, 42, 63]
-        #              for offset in [group_start + i for i in single_sm_offsets]
-        #              if offset < num_tactics]
-        #else:
-        #    tactics = list(range(num_tactics))
-
-        tactics = list(range(num_tactics))
-        return tactics
+        if gemm_idx == 1:  # gemm_1
+            match inputs[0].shape[0]:
+            #case 1:
+            #    tactic = [37]
+            #case 2:
+            #    tactic = [37]
+            #case 4:
+            #    tactic = [37]
+            #case 8:
+            #    tactic = [37]
+            #case 16:
+            #    tactic = [37]
+            #case 32:
+            #    tactic = [37]
+            #case 64:
+            #    tactic = [37]
+            #case 128:
+            #    tactic = [37]
+            #case 256:
+            #    tactic = [37]
+            #case 512:
+            #    tactic = [37]
+            #case 1024:
+            #    tactic = [37]
+            #case 2048:
+            #    tactic = [40]
+            #case 4096:
+            #    tactic = [40]
+            #case 8192:
+            #    tactic = [40]
+            #case 16384:
+            #    tactic = [40]
+            #case 32768:
+            #    tactic = [20]
+            #case 65536:
+            #    tactic = [20]
+            #case 131072:
+            #    tactic = [20]
+                case _:
+                    tactic = [-1]
+        elif gemm_idx == 2:  # gemm_2
+            match inputs[0].shape[0]:
+            #case 1:
+            #    tactic = [66]
+            #case 2:
+            #    tactic = [79]
+            #case 4:
+            #    tactic = [79]
+            #case 8:
+            #    tactic = [79]
+            #case 16:
+            #    tactic = [79]
+            #case 32:
+            #    tactic = [79]
+                case 64:
+                    # If tuning this tactic, the output would become indeterministic.
+                    tactic = [79]
+                #case 128:
+                #    tactic = [79]
+                #case 256:
+                #    tactic = [79]
+                #case 512:
+                #    tactic = [67]
+                #case 1024:
+                #    tactic = [79]
+                #case 2048:
+                #    tactic = [70]
+                #case 4096:
+                #    tactic = [70]
+                #case 8192:
+                #    tactic = [70]
+                #case 16384:
+                #    tactic = [82]
+                #case 32768:
+                #    tactic = [40]
+                #case 65536:
+                #    tactic = [40]
+                #case 131072:
+                #    tactic = [34]
+                case _:
+                    tactic = [-1]
+        else:
+            tactic = [-1]
+        print(
+            f"DEBUG: kwargs: {kwargs}, inputs[0].shape[0]: {inputs[0].shape[0]}, tactic: {tactic}"
+        )
+        return tactic
 
     def forward(
         self,
@@ -139,6 +202,7 @@ class MoERunner(TunableRunner):
         tactic: int = -1,
         do_preparation: bool = False,
     ):
+        print(f"DEBUG: forward gemm_idx: {gemm_idx}, tactic: {tactic}")
         x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
         self.fused_moe_runner.run_gemm_profile(
             x,
@@ -199,7 +263,7 @@ def fused_moe(
     unpadded_hidden_size: Optional[int] = None,
     out_tensor: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
-    use_fused_finalize = False
+
     tuner = AutoTuner.get()
     # Only the non-alltoall case is considered for profiling in the warmup phase.
     # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
