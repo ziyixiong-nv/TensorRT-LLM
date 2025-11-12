@@ -209,12 +209,18 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     assert generated_text_spec[0] == generated_text_ref[0]
 
 
-@pytest.mark.parametrize("use_spec_dec, moe_backend", [(True, "TRTLLM"),
-                                                       (False, "TRTLLM"),
-                                                       (True, "CUTLASS"),
-                                                       (False, "CUTLASS")])
-def test_gpt_oss_eagle3(use_spec_dec: bool, moe_backend: str):
-    use_cuda_graph = False
+@pytest.mark.parametrize(
+    "use_spec_dec, use_cuda_graph, moe_backend",
+    [
+        (True, True, "TRTLLM"),
+        (False, True, "TRTLLM"),
+        (True, True, "CUTLASS"),
+        (False, True, "CUTLASS"),
+        (True, False, "CUTLASS"),  # Added: Test with spec_dec but no CUDA graph
+        [False, False, "CUTLASS"],
+    ])
+def test_gpt_oss_eagle3(use_spec_dec: bool, use_cuda_graph: bool,
+                        moe_backend: str):
     attn_backend = "TRTLLM"
     disable_overlap_scheduler = True
     enable_block_reuse = False
@@ -261,9 +267,11 @@ def test_gpt_oss_eagle3(use_spec_dec: bool, moe_backend: str):
         "Planet #1 was detected from the up to 5 miliangstrom periodic shift of a spectral line at a given wavelength. The periodic wavelength shift of the same spectral line in the spectrum of the host of planet #2 was 7 miliangstrom. The question is: How many times is the orbital period of planet #2 longer than that of planet #1? (A) ~ 0.85 (B) ~ 1.96 (C) ~ 0.36 (D) ~ 1.40 Express your final answer as the corresponding option 'A', 'B', 'C', or 'D'."
     )
 
-    sampling_params = SamplingParams(max_tokens=131072, temperature=0)
-    result = llm_spec.generate(tok_ids, sampling_params)
-    print(result.outputs[0].text)
+    #tok_ids = [200006, 17360, 200008, 3575, 553, 17554, 162016, 11, 261, 4410, 6439, 2359, 22203, 656, 7788, 17527, 558, 87447, 100594, 25, 220, 1323, 19, 12, 3218, 198, 6576, 3521, 25, 220, 1323, 20, 12, 994, 12, 899, 279, 30377, 289, 25, 1932, 279, 2, 13888, 18403, 25, 8450, 11, 49159, 11, 1721, 13, 21030, 2804, 413, 7360, 395, 1753, 3176, 13, 200007, 200006, 77944, 200008, 200007, 200006, 1428, 200008, 13866, 66223, 679, 1339, 28357, 61353, 289, 261, 8253, 2360, 2973, 290, 40320, 326, 85692, 30061, 350, 65171, 8, 7933, 13, 623, 8253, 853, 261, 4842, 328, 220, 16, 13, 20, 4238, 484, 328, 290, 11628, 11, 261, 21090, 220, 16, 13, 17, 4238, 484, 328, 290, 11628, 11, 326, 448, 8488, 12088, 350, 6352, 608, 8, 328, 220, 31316, 15, 658, 13, 40880, 16, 853, 261, 4842, 23458, 316, 220, 22, 16464, 57556, 326, 261, 21090, 220, 16, 13, 22, 4238, 484, 328, 16464, 11, 2049, 40880, 17, 853, 261, 4842, 23458, 316, 220, 20, 16464, 57556, 326, 261, 21090, 220, 16, 13, 18, 4238, 484, 328, 16464, 13, 114411, 11, 2973, 66223, 553, 306, 37626, 503, 24043, 13, 40880, 16, 177800, 261, 60546, 12847, 328, 869, 316, 220, 15, 13, 3659, 49805, 306, 290, 74435, 2543, 723, 109980, 60, 540, 220, 31316, 15, 49805, 11, 2049, 290, 152581, 6232, 328, 40880, 17, 402, 290, 2684, 2543, 4376, 306, 261, 60546, 112871, 23938, 12847, 328, 869, 316, 220, 15, 13, 3000, 49805, 13, 134644, 484, 2973, 66223, 21349, 290, 2684, 434, 137684, 11, 1412, 382, 290, 18051, 328, 290, 87639, 28295, 2870, 40880, 16, 326, 40880, 17, 1715, 10706, 8, 6574, 220, 16, 13, 2922, 198, 8409, 8, 6574, 220, 15, 13, 6798, 198, 5559, 8, 6574, 220, 16, 13, 1130, 198, 9908, 8, 6574, 220, 15, 13, 5080, 279, 17258, 634, 1721, 6052, 472, 290, 21824, 5317, 461, 32, 787, 461, 33, 787, 461, 34, 787, 503, 461, 35, 6120, 200007, 200006, 173781]
+    sampling_params = SamplingParams(max_tokens=4096, temperature=0)
+    # Run 2 same requests in one batch since max_batch_size is 2
+    results = llm_spec.generate(tok_ids, sampling_params)
+    print("Request 1 output:", results.outputs[0].text)
 
 
 def test_deepseek_eagle3():

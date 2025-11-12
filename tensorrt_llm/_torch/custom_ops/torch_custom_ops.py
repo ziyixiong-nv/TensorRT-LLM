@@ -162,8 +162,7 @@ class MoERunner(TunableRunner):
             #case 32:
             #    tactic = [79]
                 case 64:
-                    # If tuning this tactic, the output would become indeterministic.
-                    tactic = [79]
+                    tactic = [0]
                 #case 128:
                 #    tactic = [79]
                 #case 256:

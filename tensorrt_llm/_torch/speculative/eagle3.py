@@ -396,6 +396,7 @@ class Eagle3OneModelWorker(nn.Module):
             # update inputs
             hidden_states = hidden_states_to_save[gather_ids]
             position_ids = inputs["position_ids"][gather_ids] + 1
+
             # update attn_metadata
             if i == 0:
                 attn_metadata._seq_lens[:batch_size].fill_(1)
