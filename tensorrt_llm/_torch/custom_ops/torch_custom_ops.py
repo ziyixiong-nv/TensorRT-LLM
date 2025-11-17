@@ -106,6 +106,7 @@ class MoERunner(TunableRunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
+        return range(self.fused_moe_runner.get_tactic_num(kwargs["gemm_idx"]))
         gemm_idx = kwargs.get("gemm_idx", 0)
         if gemm_idx == 1:  # gemm_1
             match inputs[0].shape[0]:
@@ -201,7 +202,7 @@ class MoERunner(TunableRunner):
         tactic: int = -1,
         do_preparation: bool = False,
     ):
-        print(f"DEBUG: forward gemm_idx: {gemm_idx}, tactic: {tactic}")
+        #print(f"DEBUG: forward gemm_idx: {gemm_idx}, tactic: {tactic}")
         x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
         self.fused_moe_runner.run_gemm_profile(
             x,
