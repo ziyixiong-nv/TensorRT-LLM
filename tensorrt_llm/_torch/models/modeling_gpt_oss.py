@@ -325,9 +325,14 @@ class TransformerBlock(DecoderLayer):
         config: ModelConfig[GptOssConfig],
         layer_idx: int,
         use_custom_cublas_mm: bool = False,
+        num_hidden_layers: int = 0,
+        is_draft_model: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
+        self.num_hidden_layers = num_hidden_layers
+        self.is_draft_model = is_draft_model
+        self.is_last_layer = (layer_idx == num_hidden_layers - 1)
 
         mapping = config.mapping
         self.enable_attn_dp = mapping.enable_attention_dp
@@ -405,6 +410,10 @@ class TransformerBlock(DecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
+        # Determine if this is the last allreduce of the last layer of a draft model
+        # If so, we need to trigger completion to properly chain with target model via PDL
+        should_trigger_completion = self.is_last_layer and self.is_draft_model
+
         x, residual = self.attn(
             position_ids,
             hidden_states,
@@ -440,6 +449,8 @@ class TransformerBlock(DecoderLayer):
                                                       residual)
             x, residual = self.next_layer_layernorm(x, residual)
         else:
+            # This is the final allreduce for this layer
+            # Trigger completion only for the last layer of draft model
             x, residual = self.allreduce(
                 x,
                 all_reduce_params=AllReduceParams(
@@ -447,7 +458,7 @@ class TransformerBlock(DecoderLayer):
                     residual=residual,
                     norm_weight=self.next_layer_layernorm.weight,
                     eps=self.next_layer_layernorm.variance_epsilon,
-                    trigger_completion_at_end=False,
+                    trigger_completion_at_end=should_trigger_completion,
                 ))
 
         return x, residual
@@ -478,6 +489,9 @@ class Transformer(DecoderModel):
     def __init__(self, model_config: ModelConfig[GptOssConfig]):
         super().__init__(model_config)
         config = self.model_config
+        # is_draft_model will be set by PyTorchModelEngine after model creation
+        # This is needed for proper PDL (Programmatic Dependent Launch) chaining
+        self.is_draft_model = False
 
         # Triton MoE kernels require installing Triton main branch,
         # which may be incompatible with torch.compile due to version mismatch.
@@ -512,12 +526,15 @@ class Transformer(DecoderModel):
             )
         # For modeling_speculative, different name expected
         self.embed_tokens = self.embedding
+        num_hidden_layers = config.pretrained_config.num_hidden_layers
         self.block = nn.ModuleList([
             TransformerBlock(
                 model_config,
                 layer_idx,
                 use_custom_cublas_mm=self.use_custom_cublas_mm,
-            ) for layer_idx in range(config.pretrained_config.num_hidden_layers)
+                num_hidden_layers=num_hidden_layers,
+                is_draft_model=self.is_draft_model,
+            ) for layer_idx in range(num_hidden_layers)
         ])
         self.norm = RMSNorm(
             hidden_size=config.pretrained_config.hidden_size,

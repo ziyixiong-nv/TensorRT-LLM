@@ -202,6 +202,13 @@ class PyTorchModelEngine(ModelEngine):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
         else:
             self.model = model
+
+        # Set is_draft_model flag on the model so layers can adjust their behavior
+        # This is needed for proper PDL (Programmatic Dependent Launch) chaining
+        if hasattr(self.model, 'model') and hasattr(self.model.model,
+                                                    '__dict__'):
+            self.model.model.is_draft_model = is_draft_model
+
         if drafting_loop_wrapper is not None:
             self.model = drafting_loop_wrapper(self.model)
             self.model_is_wrapped = True

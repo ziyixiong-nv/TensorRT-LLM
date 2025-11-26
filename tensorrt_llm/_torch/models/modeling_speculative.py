@@ -77,12 +77,18 @@ class Eagle3DecoderLayer(DecoderLayer):
         model_config: LlamaConfig,
         layer_idx: int = 0,
         is_first_layer: bool = True,
+        num_hidden_layers: int = 0,
+        is_draft_model: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         super().__init__()
         config = model_config.pretrained_config
         eagle_config = config.eagle_config if hasattr(config,
                                                       "eagle_config") else {}
         self.layer_idx = layer_idx
+        self.num_hidden_layers = num_hidden_layers
+        self.is_draft_model = is_draft_model
+        self.is_last_layer = (layer_idx == num_hidden_layers -
+                              1) if num_hidden_layers > 0 else False
         self._next_layer_regular = (eagle_config.get("next_layer_regular", True)
                                     and not is_first_layer) or eagle_config.get(
                                         "eh_proj_before_attn", False)
@@ -124,6 +130,8 @@ class Eagle3DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         spec_metadata: SpecMetadata,
     ) -> torch.Tensor:
+        from ..distributed import AllReduceParams
+
         residual = hidden_states
 
         hidden_states = self.hidden_norm(hidden_states)
@@ -131,15 +139,24 @@ class Eagle3DecoderLayer(DecoderLayer):
             embeds = self.input_layernorm(embeds)
             hidden_states = torch.cat([embeds, hidden_states], dim=-1)
 
+        # For draft models, the last layer's MLP should trigger completion to chain with target model
+        # Attention AllReduce can trigger early (not at end) for better overlap
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            all_reduce_params=AllReduceParams(trigger_completion_at_end=False),
         )
 
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+
+        # MLP is the final operation in the layer - only trigger completion for last layer of draft model
+        should_trigger_completion = self.is_last_layer and self.is_draft_model
+        hidden_states = self.mlp(
+            hidden_states,
+            final_all_reduce_params=AllReduceParams(
+                trigger_completion_at_end=should_trigger_completion))
 
         # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
         # PyExecutor will extract these from the draft model engine's spec metadata.
@@ -167,6 +184,9 @@ class Eagle3DraftModel(DecoderModel):
         self.hidden_size = config.hidden_size
         self.mapping = model_config.mapping
         self.num_layers = model_config.pretrained_config.num_hidden_layers
+        # is_draft_model will be set by PyTorchModelEngine after model creation
+        # We use a property to automatically update layers when this flag changes
+        self._is_draft_model = False
         self._eh_proj_before_attn = eagle_config.get("eh_proj_before_attn",
                                                      False)
 
@@ -189,11 +209,17 @@ class Eagle3DraftModel(DecoderModel):
             self.midlayer = nn.ModuleList([
                 Eagle3DecoderLayer(model_config,
                                    start_layer_idx + i,
-                                   is_first_layer=(i == 0))
+                                   is_first_layer=(i == 0),
+                                   num_hidden_layers=self.num_layers,
+                                   is_draft_model=self._is_draft_model)
                 for i in range(self.num_layers)
             ])
         else:
-            self.midlayer = Eagle3DecoderLayer(model_config, start_layer_idx)
+            self.midlayer = Eagle3DecoderLayer(
+                model_config,
+                start_layer_idx,
+                num_hidden_layers=self.num_layers,
+                is_draft_model=self._is_draft_model)
 
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
@@ -232,6 +258,23 @@ class Eagle3DraftModel(DecoderModel):
         else:
             # Shared with target model.
             self.embed_tokens = None
+
+    @property
+    def is_draft_model(self):
+        return self._is_draft_model
+
+    @is_draft_model.setter
+    def is_draft_model(self, value):
+        """Update is_draft_model and propagate to all layers"""
+        self._is_draft_model = value
+        # Update all layers
+        if self.num_layers > 1:
+            for i, layer in enumerate(self.midlayer):
+                layer.is_draft_model = value
+                layer.is_last_layer = (i == self.num_layers - 1)
+        else:
+            self.midlayer.is_draft_model = value
+            self.midlayer.is_last_layer = True
 
     def forward(
         self,
