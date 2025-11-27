@@ -61,6 +61,14 @@ class Drafter(ABC):
         if token_cap <= 0:
             return False
 
+        # When there's a draft model, turn off spec decode if exceeding draft model's capacity,
+        # so that we don't need to pad draft tokens or prepare resources for draft tokens.
+        if hasattr(self, 'draft_model_engine') and all(
+                request.max_beam_num_tokens -
+                1 >= self.draft_model_engine.max_seq_len
+                for request in requests):
+            return False
+
         num_effective_requests = min(len(requests), max_batch_size, token_cap)
         return num_effective_requests <= self.max_concurrency
 
