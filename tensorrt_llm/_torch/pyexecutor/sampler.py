@@ -882,6 +882,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         disable_overlap_scheduler: bool = False
         disable_flashinfer_sampling: bool = False
         enable_async_worker: bool = False
+        is_eagle3_two_model: bool = False
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -890,6 +891,10 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
         if args.max_total_draft_tokens > 0 and args.max_beam_width > 1:
             raise ValueError("TorchSampler does not support beam search with speculative decoding")
         self.max_num_sequences = args.max_num_sequences
+
+        # Store flags for fast greedy sampling path in eagle3 two-model with overlap scheduler
+        self._is_eagle3_two_model = args.is_eagle3_two_model
+        self._is_overlap_scheduler_enabled = not args.disable_overlap_scheduler
 
         self.NEW_TOKENS_SHAPE = (self.max_tokens, self.max_num_sequences, self.max_beam_width)
         self.CACHE_INDIRECTION_SHAPE = (
@@ -967,6 +972,31 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
     @property
     def _use_beam_search(self) -> bool:
         return self.max_beam_width > 1
+
+    def _can_use_fast_greedy_path(self, requests: list[LlmRequest]) -> bool:
+        """Check if we can use the fast argmax path for greedy sampling.
+
+        The fast path is available when:
+        - eagle3 two-model mode is enabled
+        - overlap scheduler is enabled
+        - not using beam search
+        - all requests use greedy sampling
+        """
+        if not (self._is_eagle3_two_model and self._is_overlap_scheduler_enabled):
+            return False
+        if self._use_beam_search:
+            return False
+        # Check if all requests use greedy sampling
+        for req in requests:
+            params = _request_get_sampling_params(req)
+            if not SamplingParams.params_imply_greedy_decoding(
+                temperature=params.temperature,
+                top_p=params.top_p,
+                top_k=params.top_k,
+                use_beam_search=False,
+            ):
+                return False
+        return True
 
     @staticmethod
     def _meet_max_token_stop_criteria(
@@ -1883,6 +1913,34 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             tokens += d2t
 
     @staticmethod
+    @nvtx_range("fast_greedy_sample_kernel")
+    def _fast_greedy_sample_kernel(
+        logits_cuda: torch.Tensor,
+        new_tokens_cuda: torch.Tensor,
+        batch_dest_indices: torch.Tensor,
+        max_beam_width: int,
+        d2t: torch.Tensor | None,
+    ) -> None:
+        """Compiled kernel for fast greedy sampling.
+
+        Performs argmax, applies d2t translation if present, and scatters
+        tokens into the output buffer. All operations are in-place.
+        """
+        # Simple argmax for greedy sampling
+        next_tokens = torch.argmax(logits_cuda, dim=-1).to(dtype=new_tokens_cuda.dtype)
+
+        # Apply draft-to-target token translation if present (for Eagle3)
+        if d2t is not None:
+            next_tokens += d2t[next_tokens]
+
+        # Scatter tokens into output buffer
+        batch_dest_indices_expanded = batch_dest_indices.unsqueeze(1).expand(-1, max_beam_width)
+        next_tokens_expanded = next_tokens.unsqueeze(1).expand(-1, max_beam_width)
+        new_tokens_cuda.view(-1, *new_tokens_cuda.shape[2:]).scatter_(
+            0, batch_dest_indices_expanded, next_tokens_expanded
+        )
+
+    @staticmethod
     def _apply_embedding_bias(
         logits: torch.Tensor,
         requests: list[LlmRequest],
@@ -2367,6 +2425,7 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             if (r.py_stop_words_list is not None and len(r.py_stop_words_list[0]) > 0)
         ]
 
+    @nvtx_range("_write_finish_reasons")
     def _write_finish_reasons(
         self,
         requests: list[LlmRequest],
@@ -2621,6 +2680,37 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             raw_logits_cuda,
             num_context_logits_prefix_sum=num_context_logits_prefix_sum,
         )
+
+        # Fast path for greedy sampling with eagle3 two-model and overlap scheduler
+        # Check early to skip embedding bias, min length penalty, logprobs handling
+        if self._can_use_fast_greedy_path(requests):
+            # Compute destination indices on CPU (same pattern as _unbatch_sampling_results)
+            batch_destination_indexer = _UnpackedStepIndexer(
+                seq_slots=seq_slots,
+                num_steps=sampling_requests_metadata.req_num_generated_tokens,
+                steps_dim_size=new_tokens_cuda.size(0),
+                slots_dim_size=new_tokens_cuda.size(1),
+                dim_order=_UnpackedStepIndexer.DimOrder.STEP_MAJOR,
+                index_dtype=torch.int64,
+            )
+            batch_dest_indices_cuda = batch_destination_indexer[:].to(
+                new_tokens_cuda.device, non_blocking=True
+            )
+
+            # Get d2t tensor if present
+            d2t = model_outputs.get("d2t", None)
+
+            # Run compiled kernel for argmax, d2t application, and scatter
+            self._fast_greedy_sample_kernel(
+                logits_cuda,
+                new_tokens_cuda,
+                batch_dest_indices_cuda,
+                self.max_beam_width,
+                d2t,
+            )
+
+            new_tokens_host = self._copy_to_host(new_tokens_cuda)
+            return new_tokens_host
 
         # Handle embedding bias
         self._apply_embedding_bias(logits_cuda, requests, sampling_requests_metadata.req_num_steps)

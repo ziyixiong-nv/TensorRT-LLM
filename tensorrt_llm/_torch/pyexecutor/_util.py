@@ -864,6 +864,10 @@ def create_torch_sampler_args(
     max_total_draft_tokens = (0 if speculative_config is None else
                               speculative_config.max_total_draft_tokens)
 
+    # Check if we're using eagle3 two-model mode
+    is_eagle3_two_model = (isinstance(speculative_config, EagleDecodingConfig)
+                           and not speculative_config.eagle3_one_model)
+
     return TorchSampler.Args(
         max_seq_len=max_seq_len,
         max_draft_len=max_draft_len,
@@ -872,7 +876,8 @@ def create_torch_sampler_args(
         max_beam_width=max_beam_width,
         disable_flashinfer_sampling=disable_flashinfer_sampling,
         disable_overlap_scheduler=disable_overlap_scheduler,
-        enable_async_worker=enable_async_worker)
+        enable_async_worker=enable_async_worker,
+        is_eagle3_two_model=is_eagle3_two_model)
 
 
 def instantiate_sampler(
