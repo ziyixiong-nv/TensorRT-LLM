@@ -1477,7 +1477,6 @@ class PyTorchModelEngine(ModelEngine):
 
         return lora_params
 
-    @torch.compile(options={"max-autotune": True})
     def _update_draft_input_tensors(self,
                                     num_accepted_tokens_device: torch.Tensor,
                                     new_tokens_device: torch.Tensor,
@@ -1602,7 +1601,6 @@ class PyTorchModelEngine(ModelEngine):
 
         return inputs, self.gather_ids_cuda[:num_generation_tokens]
 
-    @torch.compile(options={"max-autotune": True})
     def _update_target_input_tensors(
             self, num_accepted_tokens_device: torch.Tensor,
             new_tokens_device: torch.Tensor,
