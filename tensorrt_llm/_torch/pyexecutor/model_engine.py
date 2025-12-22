@@ -846,10 +846,6 @@ class PyTorchModelEngine(ModelEngine):
         if num_tokens > self.max_num_tokens or num_tokens > available_tokens:
             return None
 
-        num_extra_decoding_steps = self._get_num_extra_decoding_steps()
-        if num_extra_decoding_steps > 0:
-            return None  # Disable autotuning for fused drafting loops for now.
-
         num_ctx_tokens = num_tokens - num_gen_tokens
         num_ctx_requests = 0
         ctx_requests = []
@@ -868,10 +864,16 @@ class PyTorchModelEngine(ModelEngine):
         if num_ctx_requests + num_gen_tokens > self.batch_size:
             return None  # Not enough batch size to fill the request
 
+        # For fused drafting loops, each generation request needs extra blocks
+        # for the tokens that will be generated during the loop
+        num_extra_decoding_steps = self._get_num_extra_decoding_steps()
+        tokens_per_gen = 1 + num_extra_decoding_steps
+        blocks_per_gen = math.ceil(tokens_per_gen /
+                                   kv_cache_manager.tokens_per_block)
         blocks_to_use = num_full_seqs * math.ceil(
             max_seq_len / kv_cache_manager.tokens_per_block) + math.ceil(
-                num_left_over_tokens /
-                kv_cache_manager.tokens_per_block) + num_gen_tokens
+                num_left_over_tokens / kv_cache_manager.tokens_per_block
+            ) + num_gen_tokens * blocks_per_gen
 
         if blocks_to_use > available_blocks:
             return None
@@ -899,7 +901,8 @@ class PyTorchModelEngine(ModelEngine):
                 token_nums=[1] * num_gen_tokens,
                 is_gen=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
-                use_mrope=self.use_mrope)
+                use_mrope=self.use_mrope,
+                num_extra_decoding_steps=num_extra_decoding_steps)
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests(request_ids=list(
                     range(num_ctx_requests, num_ctx_requests + num_gen_tokens)))
