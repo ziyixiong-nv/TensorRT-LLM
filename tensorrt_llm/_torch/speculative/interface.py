@@ -452,3 +452,67 @@ class SpecWorkerBase(nn.Module, ABC):
             sampled_tokens = torch.argmax(logits, dim=-1)
 
         return sampled_tokens
+
+    def _strict_sample_and_accept_draft_tokens(
+        self,
+        logits: torch.Tensor,
+        spec_metadata: SpecMetadata,
+        num_contexts: int,
+        batch_size: int,
+        draft_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Common strict acceptance logic for sampling and accepting draft tokens.
+        Uses token equality for acceptance - a draft token is accepted if it
+        exactly matches the target model's sampled token.
+
+        Args:
+            logits: [num_tokens, vocab_size] - Logits from target model
+            spec_metadata: Metadata containing draft tokens and sampling parameters
+            num_contexts: Number of context requests in the batch
+            batch_size: Total number of requests in the batch
+            draft_len: The draft length (number of draft tokens per request)
+
+        Returns:
+            accepted_tokens: [batch_size, draft_len + 1] - Accepted token ids
+            num_accepted_tokens: [batch_size] - Number of accepted tokens per request
+        """
+        num_gens = batch_size - num_contexts
+
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+
+        # Initialize return buffers
+        accepted_tokens = torch.empty((batch_size, draft_len + 1),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        num_accepted_tokens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+
+        # Sample tokens using per-request sampling parameters
+        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
+                                                      num_contexts, batch_size)
+
+        # Context requests: accept the single sampled token
+        accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
+
+        # Generation requests: verify draft tokens against target samples
+        if num_gens > 0:
+            gen_target_tokens = target_tokens[num_contexts:].reshape(
+                num_gens, draft_len + 1)
+            accepted_tokens[num_contexts:, :] = gen_target_tokens
+            draft_tokens = spec_metadata.draft_tokens.reshape(
+                num_gens, draft_len)
+            # Count consecutive matches from the start using cumulative product
+            num_accepted_tokens[num_contexts:] += torch.cumprod(
+                (draft_tokens == gen_target_tokens[:, :draft_len]).int(),
+                dim=-1).sum(1)
+
+        # Check for environment variable override
+        if self.force_num_accepted_tokens != 0:
+            force_total_tokens = min(self.force_num_accepted_tokens + 1,
+                                     draft_len + 1)
+            num_accepted_tokens[num_contexts:] = force_total_tokens
+
+        return accepted_tokens, num_accepted_tokens

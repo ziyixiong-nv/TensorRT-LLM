@@ -727,12 +727,11 @@ class MTPWorker(SpecWorkerBase):
         Takes input logits and samples golden token + predictions from draft tokens.
         Runs acceptance algorithm to accept draft tokens.
         Currently only support greedy sampling. All decoding is done using Top1 and token equality is used
-        for acceptance.
 
         Args:
             input_ids: torch.IntTensor
                 [num_tokens]
-                The input ids of all requests. Flatten.
+                The input ids of all requests. Flatten. Required for relaxed acceptance.
 
             logits: torch.Tensor
                 [num_tokens, vocab_size]
@@ -791,92 +790,123 @@ class MTPWorker(SpecWorkerBase):
 
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
+        mtp_num_modules = self.spec_config.num_nextn_predict_layers
+
+        # Relaxed acceptance for thinking models
+        if self.spec_config.use_relaxed_acceptance_for_thinking:
+            return self._relaxed_sample_and_accept_draft_tokens(
+                input_ids, logits, spec_metadata, attn_metadata)
+
+        # Strict acceptance with THOP optimization
+        if self.is_thop:
+            return self._thop_sample_and_accept_draft_tokens(
+                logits, spec_metadata, batch_size, num_contexts,
+                mtp_num_modules)
+
+        # Strict acceptance using base class implementation
+        return self._strict_sample_and_accept_draft_tokens(
+            logits=logits,
+            spec_metadata=spec_metadata,
+            num_contexts=num_contexts,
+            batch_size=batch_size,
+            draft_len=mtp_num_modules,
+        )
+
+    def _relaxed_sample_and_accept_draft_tokens(
+        self,
+        input_ids: torch.IntTensor,
+        logits: torch.Tensor,
+        spec_metadata: MTPSpecMetadata,
+        attn_metadata: AttentionMetadata,
+    ):
+        """
+        Relaxed acceptance for thinking models. Allows more flexible token matching
+        based on thinking phase detection and configurable delta thresholds.
+        """
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
         mtp_num_modules = self.spec_config.num_nextn_predict_layers
 
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
 
-        # The return buffer
-        if self.spec_config.use_relaxed_acceptance_for_thinking or not self.is_thop:
-            accepted_tokens = torch.ones((batch_size, (mtp_num_modules + 1)),
+        # Initialize return buffers
+        accepted_tokens = torch.ones((batch_size, (mtp_num_modules + 1)),
+                                     dtype=torch.int,
+                                     device=logits.device)
+        num_accepted_tokens = torch.ones(batch_size,
                                          dtype=torch.int,
                                          device=logits.device)
-            num_accepted_tokens = torch.ones(batch_size,
-                                             dtype=torch.int,
-                                             device=logits.device)
-        if self.spec_config.use_relaxed_acceptance_for_thinking:
-            mtp_relaxed_delta_pool = spec_metadata.mtp_hidden_states_manager.mtp_relaxed_delta_pool
 
-            # context
-            con_logits = logits[:num_contexts]
-            con_target_tokens = torch.argmax(con_logits, dim=-1)
-            accepted_tokens[:num_contexts, 0] = con_target_tokens[:num_contexts]
-            last_tokens_idx = torch.cumsum(
-                attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-            ctx_input_ids = input_ids[:attn_metadata.num_ctx_tokens]
-            ctx_is_think = (ctx_input_ids ==
-                            self.spec_config.begin_thinking_phase_token).int()
-            ctx_is_think_cumsum = torch.cumsum(ctx_is_think, dim=0)
-            ctx_last_cumsum = ctx_is_think_cumsum[
-                last_tokens_idx[:num_contexts]]
-            ctx_think_tokens_num = torch.diff(
-                ctx_last_cumsum,
-                dim=0,
-                prepend=torch.zeros(1,
-                                    dtype=torch.int,
-                                    device=ctx_last_cumsum.device))
+        mtp_relaxed_delta_pool = spec_metadata.mtp_hidden_states_manager.mtp_relaxed_delta_pool
 
-            ctx_delta = (ctx_think_tokens_num
-                         >= 1).int() * self.spec_config.relaxed_delta
-            ctx_slot_ids = spec_metadata.slot_ids[:num_contexts]
-            mtp_relaxed_delta_pool.index_copy_(0, ctx_slot_ids, ctx_delta)
+        # Context: detect thinking phase and update delta pool
+        con_logits = logits[:num_contexts]
+        con_target_tokens = torch.argmax(con_logits, dim=-1)
+        accepted_tokens[:num_contexts, 0] = con_target_tokens[:num_contexts]
+        last_tokens_idx = torch.cumsum(
+            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+        ctx_input_ids = input_ids[:attn_metadata.num_ctx_tokens]
+        ctx_is_think = (
+            ctx_input_ids == self.spec_config.begin_thinking_phase_token).int()
+        ctx_is_think_cumsum = torch.cumsum(ctx_is_think, dim=0)
+        ctx_last_cumsum = ctx_is_think_cumsum[last_tokens_idx[:num_contexts]]
+        ctx_think_tokens_num = torch.diff(ctx_last_cumsum,
+                                          dim=0,
+                                          prepend=torch.zeros(
+                                              1,
+                                              dtype=torch.int,
+                                              device=ctx_last_cumsum.device))
 
-            # generation
-            gen_logprobs = self.process_generation_logits(logits, num_contexts)
-            topk_value, topk_indices, draft_tokens = self.topk_kernel(
-                gen_logprobs, num_gens, mtp_num_modules, spec_metadata)
+        ctx_delta = (ctx_think_tokens_num
+                     >= 1).int() * self.spec_config.relaxed_delta
+        ctx_slot_ids = spec_metadata.slot_ids[:num_contexts]
+        mtp_relaxed_delta_pool.index_copy_(0, ctx_slot_ids, ctx_delta)
 
-            accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_relaxed_acceptance_op(
-                spec_metadata.slot_ids, topk_value, topk_indices, draft_tokens,
-                mtp_relaxed_delta_pool, num_accepted_tokens, accepted_tokens,
-                mtp_num_modules, batch_size, num_contexts,
-                self.spec_config.relaxed_topk, self.spec_config.relaxed_delta,
-                self.spec_config.begin_thinking_phase_token,
-                self.spec_config.end_thinking_phase_token)
+        # Generation: use relaxed acceptance op
+        gen_logprobs = self.process_generation_logits(logits, num_contexts)
+        topk_value, topk_indices, draft_tokens = self.topk_kernel(
+            gen_logprobs, num_gens, mtp_num_modules, spec_metadata)
 
-        # Strict acceptance
-        else:
-            if self.is_thop:
-                # Temporary buffer
-                target_tokens_cache = torch.zeros(batch_size *
-                                                  (mtp_num_modules + 1),
-                                                  dtype=torch.int,
-                                                  device=logits.device)
-                accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_sampling_and_accepted_draft_tokens_op(
-                    logits, spec_metadata.draft_tokens, target_tokens_cache,
-                    mtp_num_modules, batch_size, num_contexts, logits.shape[-1])
-            else:
-                target_tokens = self._sample_tokens_for_batch(
-                    logits, spec_metadata, num_contexts, batch_size)
-
-                # context
-                accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
-
-                # generation
-                gen_target_tokens = target_tokens[num_contexts:].reshape(
-                    num_gens, mtp_num_modules + 1)
-                accepted_tokens[num_contexts:, :] = gen_target_tokens
-                draft_tokens = spec_metadata.draft_tokens.reshape(
-                    num_gens, mtp_num_modules)
-                num_accepted_tokens[num_contexts:] += torch.cumprod(
-                    (draft_tokens == gen_target_tokens[:, :mtp_num_modules]
-                     ).int(),
-                    dim=-1).sum(1)
+        accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_relaxed_acceptance_op(
+            spec_metadata.slot_ids, topk_value, topk_indices, draft_tokens,
+            mtp_relaxed_delta_pool, num_accepted_tokens, accepted_tokens,
+            mtp_num_modules, batch_size, num_contexts,
+            self.spec_config.relaxed_topk, self.spec_config.relaxed_delta,
+            self.spec_config.begin_thinking_phase_token,
+            self.spec_config.end_thinking_phase_token)
 
         # Check for environment variable override
         if self.force_num_accepted_tokens != 0:
             # total tokens per iteration = accepted draft tokens + 1 target token
+            force_total_tokens = min(self.force_num_accepted_tokens + 1,
+                                     mtp_num_modules + 1)
+            num_accepted_tokens[num_contexts:] = force_total_tokens
+
+        return accepted_tokens, num_accepted_tokens
+
+    def _thop_sample_and_accept_draft_tokens(
+        self,
+        logits: torch.Tensor,
+        spec_metadata: MTPSpecMetadata,
+        batch_size: int,
+        num_contexts: int,
+        mtp_num_modules: int,
+    ):
+        """
+        Strict acceptance using optimized TensorRT-LLM custom op (THOP).
+        """
+        # Temporary buffer for target tokens
+        target_tokens_cache = torch.zeros(batch_size * (mtp_num_modules + 1),
+                                          dtype=torch.int,
+                                          device=logits.device)
+        accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_sampling_and_accepted_draft_tokens_op(
+            logits, spec_metadata.draft_tokens, target_tokens_cache,
+            mtp_num_modules, batch_size, num_contexts, logits.shape[-1])
+
+        # Check for environment variable override
+        if self.force_num_accepted_tokens != 0:
             force_total_tokens = min(self.force_num_accepted_tokens + 1,
                                      mtp_num_modules + 1)
             num_accepted_tokens[num_contexts:] = force_total_tokens

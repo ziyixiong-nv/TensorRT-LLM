@@ -508,43 +508,17 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         attn_metadata: AttentionMetadata,
         spec_metadata: Eagle3OneModelSpecMetadata,
     ):
-        batch_size = attn_metadata.num_seqs
-        num_contexts = attn_metadata.num_contexts
-        num_gens = batch_size - num_contexts
-
-        if logits.dim() == 1:
-            logits = logits.unsqueeze(0)
-
-        # The return buffer
-        accepted_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
-                                      dtype=torch.int,
-                                      device=logits.device)
-        num_accepted_tokens = torch.ones(batch_size,
-                                         dtype=torch.int,
-                                         device=logits.device)
-
-        # Sample tokens using per-request sampling parameters
-        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
-                                                      num_contexts, batch_size)
-        # context
-        accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
-
-        # generation
-        gen_target_tokens = target_tokens[num_contexts:].reshape(
-            num_gens, self.max_draft_len + 1)
-        accepted_tokens[num_contexts:, :] = gen_target_tokens
-        draft_tokens = spec_metadata.draft_tokens.reshape(
-            num_gens, self.max_draft_len)
-        num_accepted_tokens[num_contexts:] += torch.cumprod(
-            (draft_tokens == gen_target_tokens[:, :self.max_draft_len]).int(),
-            dim=-1).sum(1)
-        # Check for environment variable override
-        if self.force_num_accepted_tokens != 0:
-            # total tokens per iteration = accepted draft tokens + 1 target token
-            force_total_tokens = min(self.force_num_accepted_tokens + 1,
-                                     self.max_draft_len + 1)
-            num_accepted_tokens[num_contexts:] = force_total_tokens
-        return accepted_tokens, num_accepted_tokens
+        """
+        Sample and accept draft tokens using strict acceptance.
+        Delegates to the base class implementation.
+        """
+        return self._strict_sample_and_accept_draft_tokens(
+            logits=logits,
+            spec_metadata=spec_metadata,
+            num_contexts=attn_metadata.num_contexts,
+            batch_size=attn_metadata.num_seqs,
+            draft_len=self.max_draft_len,
+        )
 
     def draft_decoder(
         self,
