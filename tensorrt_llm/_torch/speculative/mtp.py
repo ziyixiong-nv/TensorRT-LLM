@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 class SampleStateTensorsMTP(SampleStateTensors):
     new_tokens_lens: torch.Tensor
     next_draft_tokens: torch.Tensor
+    next_draft_logits: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
@@ -267,6 +268,14 @@ class MTPSampler(TorchSampler):
         new_tokens = state.host.new_tokens.tolist()
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
+        next_draft_logits = getattr(state.device, "next_draft_logits", None)
+        req_to_batch_idx = None
+        if next_draft_logits is not None:
+            req_to_batch_idx = {
+                req.py_request_id: idx
+                for idx, req in enumerate(
+                    state.scheduled_requests.all_requests())
+            }
         beam_idx = DEFAULT_BEAM_IDX
         for req in state.scheduled_requests.context_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
@@ -277,6 +286,12 @@ class MTPSampler(TorchSampler):
                                                max_seq_len=self.max_seq_len,
                                                beam_idx=beam_idx)
             self._request_common_handling(req, next_draft_tokens_list)
+            # Store next_draft_logits for rejection sampling in the next iteration
+            if next_draft_logits is not None and req_to_batch_idx is not None:
+                req.py_draft_logits = next_draft_logits[req_to_batch_idx[
+                    req.py_request_id]]
+            else:
+                req.py_draft_logits = None
 
         for req in state.scheduled_requests.generation_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
@@ -296,6 +311,11 @@ class MTPSampler(TorchSampler):
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
             req.py_rewind_len = self.draft_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list)
+            if next_draft_logits is not None and req_to_batch_idx is not None:
+                req.py_draft_logits = next_draft_logits[req_to_batch_idx[
+                    req.py_request_id]]
+            else:
+                req.py_draft_logits = None
 
     def sample_async(
             self, scheduled_requests: ScheduledRequests,
@@ -313,6 +333,9 @@ class MTPSampler(TorchSampler):
         o_new_tokens = outputs['new_tokens'][:len(requests)]
         o_new_tokens_lens = outputs['new_tokens_lens'][:len(requests)]
         o_next_draft_tokens = outputs['next_draft_tokens'][:len(requests)]
+        o_next_draft_logits = outputs.get('next_draft_logits')
+        if o_next_draft_logits is not None:
+            o_next_draft_logits = o_next_draft_logits[:len(requests)]
         o_next_new_tokens = outputs['next_new_tokens'][:len(requests)]
 
         new_tokens = self.store.new_tokens
@@ -329,11 +352,13 @@ class MTPSampler(TorchSampler):
             new_tokens=next_new_tokens,
             new_tokens_lens=new_tokens_lens,
             next_draft_tokens=next_draft_tokens,
+            next_draft_logits=o_next_draft_logits,
         )
         host = SampleStateTensorsMTP(
             new_tokens=new_tokens.to('cpu', non_blocking=True),
             new_tokens_lens=new_tokens_lens.to('cpu', non_blocking=True),
             next_draft_tokens=next_draft_tokens.to('cpu', non_blocking=True),
+            next_draft_logits=None,
         )
         sampler_event = torch.cuda.Event()
         sampler_event.record()
@@ -505,6 +530,7 @@ class MTPWorker(SpecWorkerBase):
 
         # Run MTP layers to predict draft tokens
         next_draft_tokens = []
+        next_draft_logits = []
         last_tokens_idx = torch.cumsum(
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         for i, mtp_layer in enumerate(draft_model.mtp_layers):
@@ -518,6 +544,7 @@ class MTPWorker(SpecWorkerBase):
                                       **draft_inputs)
             logits = mtp_layer.shared_head(hidden_states, draft_model.lm_head,
                                            attn_metadata).float()
+            next_draft_logits.append(logits)
             if self.guided_decoder is not None:
                 self.guided_decoder.execute_draft_batch(logits, draft_step=i)
 
@@ -538,6 +565,7 @@ class MTPWorker(SpecWorkerBase):
                 "attn_metadata": draft_inputs["attn_metadata"],
             }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+        next_draft_logits = torch.stack(next_draft_logits, dim=1)
 
         # restore attn metadata
         if attn_metadata is not None:
@@ -555,6 +583,7 @@ class MTPWorker(SpecWorkerBase):
             'new_tokens': accepted_tokens,
             'new_tokens_lens': num_accepted_tokens,
             'next_draft_tokens': next_draft_tokens,
+            'next_draft_logits': next_draft_logits,
             'next_new_tokens': next_new_tokens
         }
 

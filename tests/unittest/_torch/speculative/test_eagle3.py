@@ -771,8 +771,9 @@ def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
     """Test CDL sampling with 2 requests and max_batch_size=2."""
     attn_backend = "TRTLLM"
     enable_block_reuse = False
-    use_one_model = False
+    use_one_model = True
     enable_chunked_prefill = False
+    use_cuda_graph = False
 
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -793,7 +794,7 @@ def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
         model=target_model_dir,
         attn_backend=attn_backend,
         disable_overlap_scheduler=disable_overlap_scheduler,
-        cuda_graph_config=cuda_graph_config,
+        cuda_graph_config=cuda_graph_config if use_cuda_graph else None,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
         max_seq_len=8192,

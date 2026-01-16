@@ -400,6 +400,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         # Predict draft tokens
         next_draft_tokens = []
+        next_draft_logits = []
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         for i in range(self.max_draft_len):
             if i == 0:
@@ -446,6 +447,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                         d2t,
                                                         draft_step=i)
 
+            next_draft_logits.append(logits)
             new_draft_token = self.draft_decoder(logits, draft_model)
             next_draft_tokens.append(new_draft_token)
             # update inputs
@@ -477,6 +479,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 "spec_metadata": spec_metadata,
             }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+        next_draft_logits = torch.stack(next_draft_logits, dim=1)
 
         # restore attn_metadata to support cuda graph
         attn_metadata.restore_from_spec_dec()
@@ -499,6 +502,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             'new_tokens': accepted_tokens,
             'new_tokens_lens': num_accepted_tokens,
             'next_draft_tokens': next_draft_tokens,
+            'next_draft_logits': next_draft_logits,
             'next_new_tokens': next_new_tokens,
         }
 

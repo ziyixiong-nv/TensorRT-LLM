@@ -1830,6 +1830,18 @@ class PyTorchModelEngine(ModelEngine):
             total_draft_lens = self.max_total_draft_tokens * num_extend_requests
             spec_metadata.draft_tokens = self.draft_tokens_cuda[:
                                                                 total_draft_lens]
+            draft_logits_list = []
+            has_draft_logits = True
+            for request in extend_requests:
+                if request.py_draft_logits is not None:
+                    draft_logits_list.append(request.py_draft_logits)
+                else:
+                    has_draft_logits = False
+            if has_draft_logits and draft_logits_list:
+                draft_logits = torch.stack(draft_logits_list, dim=0)
+                if draft_logits.device.type != 'cuda':
+                    draft_logits = draft_logits.to('cuda', non_blocking=True)
+                spec_metadata.draft_logits = draft_logits
             spec_metadata.gather_ids = self.gather_ids_cuda[:total_num_tokens]
             spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[:
                                                                                           num_extend_requests]
@@ -1931,6 +1943,8 @@ class PyTorchModelEngine(ModelEngine):
         position_ids = []  # per sequence
         num_cached_tokens_per_seq = []  # per sequence
         draft_tokens = []
+        draft_logits_list = []
+        has_draft_logits = True
         draft_lens = []
         gen_request_seq_slots = []  # per generation request
         multimodal_params_list = []
@@ -2086,6 +2100,11 @@ class PyTorchModelEngine(ModelEngine):
                     draft_tokens.extend(request.py_draft_tokens)
                 # get other ids and lengths
                 num_draft_tokens = get_draft_token_length(request)
+                if num_draft_tokens > 0:
+                    if request.py_draft_logits is not None:
+                        draft_logits_list.append(request.py_draft_logits)
+                    else:
+                        has_draft_logits = False
                 past_seen_token_num = request.max_beam_num_tokens - 1
                 draft_lens.append(num_draft_tokens)
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
@@ -2163,6 +2182,11 @@ class PyTorchModelEngine(ModelEngine):
                     prompt_lengths.append(1 + self.runtime_draft_len)
                 else:
                     prompt_lengths.append(request.py_prompt_len)
+                if self.runtime_draft_len > 0:
+                    if request.py_draft_logits is not None:
+                        draft_logits_list.append(request.py_draft_logits)
+                    else:
+                        has_draft_logits = False
 
         for request in first_draft_requests:
             request_ids.append(request.py_request_id)
@@ -2674,6 +2698,11 @@ class PyTorchModelEngine(ModelEngine):
             total_draft_lens = sum(draft_lens)
             spec_metadata.draft_tokens = self.draft_tokens_cuda[:
                                                                 total_draft_lens]
+            if has_draft_logits and draft_logits_list:
+                draft_logits = torch.stack(draft_logits_list, dim=0)
+                if draft_logits.device.type != 'cuda':
+                    draft_logits = draft_logits.to('cuda', non_blocking=True)
+                spec_metadata.draft_logits = draft_logits
             spec_metadata.request_ids = request_ids
             spec_metadata.gather_ids = self.gather_ids_cuda[:len(gather_ids)]
             spec_metadata.num_generations = len(

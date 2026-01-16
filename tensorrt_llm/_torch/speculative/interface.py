@@ -201,6 +201,8 @@ class SpecMetadata:
     spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
     # Draft tokens.
     draft_tokens: Optional[torch.Tensor] = None
+    # Draft logits aligned with draft_tokens (num_gens, draft_len, vocab).
+    draft_logits: Optional[torch.Tensor] = None
     # The length of the draft tokens.
     draft_lens: Optional[torch.Tensor] = None
     # The request ID of each sequence in the batch.
@@ -499,15 +501,60 @@ class SpecWorkerBase(nn.Module, ABC):
 
         # Generation requests: verify draft tokens against target samples
         if num_gens > 0:
-            gen_target_tokens = target_tokens[num_contexts:].reshape(
-                num_gens, draft_len + 1)
-            accepted_tokens[num_contexts:, :] = gen_target_tokens
-            draft_tokens = spec_metadata.draft_tokens.reshape(
-                num_gens, draft_len)
-            # Count consecutive matches from the start using cumulative product
-            num_accepted_tokens[num_contexts:] += torch.cumprod(
-                (draft_tokens == gen_target_tokens[:, :draft_len]).int(),
-                dim=-1).sum(1)
+            gen_logits = logits[num_contexts:].reshape(num_gens, draft_len + 1,
+                                                       -1)
+            draft_logits = spec_metadata.draft_logits
+
+            # Check if we can use rejection sampling (draft_logits must be available)
+            can_use_rejection_sampling = draft_logits is not None
+
+            if can_use_rejection_sampling:
+                from .one_model_sampler import rejection_sample_from_logits
+
+                if draft_logits.dim() == 2:
+                    draft_logits = draft_logits.reshape(num_gens, draft_len, -1)
+
+                draft_vocab_size = draft_logits.shape[-1]
+                target_vocab_size = gen_logits.shape[-1]
+
+                # If vocab sizes differ, pad draft logits to match target vocab size.
+                # Tokens outside draft vocab get -inf logits (zero probability),
+                # which is correct since the draft model couldn't generate them.
+                if draft_vocab_size < target_vocab_size:
+                    padding = torch.full(
+                        (num_gens, draft_len,
+                         target_vocab_size - draft_vocab_size),
+                        float('-inf'),
+                        dtype=draft_logits.dtype,
+                        device=draft_logits.device,
+                    )
+                    draft_logits = torch.cat([draft_logits, padding], dim=-1)
+                elif draft_vocab_size > target_vocab_size:
+                    # Truncate draft logits if draft vocab is larger (unlikely)
+                    draft_logits = draft_logits[:, :, :target_vocab_size]
+
+                draft_tokens = spec_metadata.draft_tokens.reshape(
+                    num_gens, draft_len).to(torch.int32)
+
+                output_tokens, _, emitted_draft_tokens = (
+                    rejection_sample_from_logits(
+                        draft_logits=draft_logits,
+                        draft_token_ids=draft_tokens,
+                        target_logits=gen_logits,
+                        deterministic=True,
+                    ))
+                accepted_tokens[num_contexts:, :] = output_tokens
+                num_accepted_tokens[num_contexts:] = emitted_draft_tokens + 1
+            else:
+                gen_target_tokens = target_tokens[num_contexts:].reshape(
+                    num_gens, draft_len + 1)
+                accepted_tokens[num_contexts:, :] = gen_target_tokens
+                draft_tokens = spec_metadata.draft_tokens.reshape(
+                    num_gens, draft_len)
+                # Count consecutive matches from the start using cumulative product
+                num_accepted_tokens[num_contexts:] += torch.cumprod(
+                    (draft_tokens == gen_target_tokens[:, :draft_len]).int(),
+                    dim=-1).sum(1)
 
         # Check for environment variable override
         if self.force_num_accepted_tokens != 0:
