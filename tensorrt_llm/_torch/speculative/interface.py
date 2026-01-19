@@ -505,21 +505,24 @@ class SpecWorkerBase(nn.Module, ABC):
                                                        -1)
             draft_logits = spec_metadata.draft_logits
 
-            # Check if we can use rejection sampling (draft_logits must be available)
-            can_use_rejection_sampling = draft_logits is not None
+            # Check if we can use rejection sampling:
+            # 1. draft_logits must be available
+            # 2. batch size must match num_gens (all gen requests must have draft_logits)
+            can_use_rejection_sampling = False
+            if draft_logits is not None:
+                if draft_logits.dim() == 2:
+                    draft_logits = draft_logits.reshape(-1, draft_len,
+                                                        draft_logits.shape[-1])
+                # Verify batch size matches - if not, fall back to strict acceptance
+                can_use_rejection_sampling = (draft_logits.shape[0] == num_gens)
 
+            can_use_rejection_sampling = False
             if can_use_rejection_sampling:
                 from .one_model_sampler import rejection_sample_from_logits
 
-                if draft_logits.dim() == 2:
-                    draft_logits = draft_logits.reshape(num_gens, draft_len, -1)
-
+                # Pad draft logits to match target vocab size if needed
                 draft_vocab_size = draft_logits.shape[-1]
                 target_vocab_size = gen_logits.shape[-1]
-
-                # If vocab sizes differ, pad draft logits to match target vocab size.
-                # Tokens outside draft vocab get -inf logits (zero probability),
-                # which is correct since the draft model couldn't generate them.
                 if draft_vocab_size < target_vocab_size:
                     padding = torch.full(
                         (num_gens, draft_len,
@@ -530,7 +533,6 @@ class SpecWorkerBase(nn.Module, ABC):
                     )
                     draft_logits = torch.cat([draft_logits, padding], dim=-1)
                 elif draft_vocab_size > target_vocab_size:
-                    # Truncate draft logits if draft vocab is larger (unlikely)
                     draft_logits = draft_logits[:, :, :target_vocab_size]
 
                 draft_tokens = spec_metadata.draft_tokens.reshape(

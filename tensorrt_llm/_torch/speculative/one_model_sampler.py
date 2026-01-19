@@ -73,7 +73,6 @@ def apply_temperature(
     return logits.div_(temp.unsqueeze(dim=1))
 
 
-@torch.compile(options={"max-autotune": True})
 def sampling_batch_spec_dec_one_model(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -86,6 +85,9 @@ def sampling_batch_spec_dec_one_model(
     We can't do dynamic kernel selection inside graphs, so this might
     be slower than a torch.argmax for greedy requests. This is why advanced
     sampling is opt-in for now.
+
+    Note: @torch.compile is removed because torch.inductor's Triton codegen
+    fails on cumsum with very large vocab sizes (e.g., 200k+).
     """
     logits = apply_temperature(logits, temperatures)
     random_sampled = forward_native(logits, top_k, top_p)
