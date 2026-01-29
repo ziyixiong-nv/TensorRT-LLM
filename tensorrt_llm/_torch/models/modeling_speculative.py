@@ -684,6 +684,24 @@ class MistralLarge3EagleForCausalLM(DecoderModelForCausalLM):
         return hidden_states
 
 
+class PARDForCausalLM(nn.Module):
+    """
+    Draft model wrapper for PARD (Parallel Draft) speculative decoding.
+
+    PARD uses the target model itself for drafting by running it with special
+    PARD placeholder tokens to generate multiple draft tokens in parallel.
+    This wrapper provides the expected interface for draft models while
+    reusing the target model's weights.
+    """
+
+    def __init__(self, target_model: nn.Module, lm_head: nn.Module):
+        super().__init__()
+        self.model = target_model
+        self.lm_head = lm_head
+        # logits_processor will be set by the caller after construction
+        self.logits_processor = None
+
+
 class MTPForCausalLM(nn.Module):
 
     def __init__(
@@ -899,6 +917,9 @@ def get_draft_model(model_config, draft_config, lm_head, model):
                               lm_head, model)
     elif spec_dec_mode.is_mtp_eagle():
         return MTPDraftModelForCausalLM(model_config)
+    elif spec_dec_mode.is_pard():
+        # PARD uses the target model itself for drafting (parallel generation with PARD tokens)
+        return PARDForCausalLM(model, lm_head)
     else:
         raise NotImplementedError(
             f"get_draft_model does not support speculative decoding mode {spec_dec_mode}."
@@ -954,6 +975,10 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
             self.draft_model = get_draft_model(model_config, self.draft_config,
                                                self.lm_head, self.model)
+            # For PARD, set logits_processor on the draft model wrapper
+            if spec_config.spec_dec_mode.is_pard(
+            ) and self.draft_model is not None:
+                self.draft_model.logits_processor = self.logits_processor
             self.spec_worker = get_spec_worker(
                 model_config.spec_config,
                 model_config,

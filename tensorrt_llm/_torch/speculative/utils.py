@@ -14,6 +14,7 @@ from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
 from .ngram import NGramDrafter, NGramPoolManager
+from .pard import PARDSpecMetadata, PARDWorker
 from .save_hidden_state import SaveHiddenStatesDrafter
 
 
@@ -78,6 +79,15 @@ def get_spec_metadata(spec_config,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
+            allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            use_rejection_sampling=spec_config.use_rejection_sampling,
+        )
+    if spec_config.spec_dec_mode.is_pard():
+        return PARDSpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
             use_rejection_sampling=spec_config.use_rejection_sampling,
         )
@@ -175,6 +185,9 @@ def get_spec_decoder(sampler_args: TorchSampler.Args,
         return TorchSampler(sampler_args)
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSampler(sampler_args)
+    if spec_config.spec_dec_mode.is_pard():
+        # PARD uses MTPSampler (common pattern for 1-model spec-dec)
+        return MTPSampler(sampler_args, nextn=spec_config.max_draft_len)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -235,6 +248,9 @@ def get_spec_worker(spec_config,
     if spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelWorker(spec_config, mapping,
                                     use_separate_draft_kv_cache)
+    if spec_dec_mode.is_pard():
+        return PARDWorker(spec_config, model_config,
+                          use_separate_draft_kv_cache)
     return None
 
 
