@@ -713,14 +713,42 @@ def _create_kv_cache_manager(
                 "Connector manager is not supported for MambaHybridCacheManager."
             )
 
-        num_layers = config.hybrid_override_pattern.count("*")
-        hybrid_layer_mask = [
-            char == "*" for char in config.hybrid_override_pattern
-        ]
-        mamba_num_layers = config.hybrid_override_pattern.count("M")
-        mamba_layer_mask = [
-            char == "M" for char in config.hybrid_override_pattern
-        ]
+        # When layer_mask is provided (e.g., for one-model speculative decoding),
+        # use it to determine which layers to include. The layer_mask may include
+        # draft layers beyond the hybrid_override_pattern.
+        if layer_mask is not None:
+            # layer_mask specifies which layers to include in this KV cache manager.
+            # For draft layers in one-model spec decoding, they are attention-only
+            # (no Mamba states), so we use the passed layer_mask directly.
+            #
+            # Compute the hybrid_layer_mask based on layer_mask:
+            # - If layer_mask[i] is True, include layer i
+            # - For layers beyond hybrid_override_pattern, treat them as attention layers
+            pattern_len = len(config.hybrid_override_pattern)
+            hybrid_layer_mask = []
+            mamba_layer_mask = []
+            for i, include in enumerate(layer_mask):
+                if i < pattern_len:
+                    # Within the pattern range, use the pattern to determine layer type
+                    is_attention = config.hybrid_override_pattern[i] == "*"
+                    is_mamba = config.hybrid_override_pattern[i] == "M"
+                else:
+                    # Beyond the pattern (e.g., MTP/draft layers), treat as attention-only
+                    is_attention = True
+                    is_mamba = False
+                hybrid_layer_mask.append(is_attention and include)
+                mamba_layer_mask.append(is_mamba and include)
+            num_layers = sum(hybrid_layer_mask)
+            mamba_num_layers = sum(mamba_layer_mask)
+        else:
+            num_layers = config.hybrid_override_pattern.count("*")
+            hybrid_layer_mask = [
+                char == "*" for char in config.hybrid_override_pattern
+            ]
+            mamba_num_layers = config.hybrid_override_pattern.count("M")
+            mamba_layer_mask = [
+                char == "M" for char in config.hybrid_override_pattern
+            ]
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             config.ssm_state_size,
