@@ -1035,6 +1035,12 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 model_config.quant_config.kv_cache_quant_algo
 
             elif spec_config.spec_dec_mode.is_pard():
+                # PARD draft model processes 2K tokens per request (N accepted
+                # + K-1 mask tokens) vs K+1 for the target model. Scale
+                # max_num_tokens so internal buffers are large enough.
+                K = spec_config.max_draft_len
+                pard_draft_max_tokens = (model_config.max_num_tokens *
+                                         (2 * K) // (K + 1))
                 self.draft_config = ModelConfig.from_pretrained(
                     model_config.spec_config.speculative_model,
                     trust_remote_code=True,
@@ -1042,7 +1048,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     moe_backend=model_config.moe_backend,
                     mapping=model_config.mapping,
                     spec_config=None,  # Avoid recursive spec-dec
-                    max_num_tokens=model_config.max_num_tokens,
+                    max_num_tokens=pard_draft_max_tokens,
                     moe_max_num_tokens=model_config.moe_max_num_tokens)
                 self.draft_config.quant_config.kv_cache_quant_algo = \
                     model_config.quant_config.kv_cache_quant_algo
