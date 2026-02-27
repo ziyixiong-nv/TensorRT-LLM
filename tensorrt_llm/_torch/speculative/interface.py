@@ -266,9 +266,13 @@ class SpecMetadata:
 
     # For non-greedy sampling on 1-model.
     allow_advanced_sampling: bool = False
+<<<<<<< HEAD
     # Whether to use rejection sampling (requires allow_advanced_sampling=True)
     use_rejection_sampling: bool = False
     # Sampling parameters for non-greedy sampling (per-request)
+=======
+    # Sampling parameters for non-greedy sampling (per-token for target model)
+>>>>>>> a83b7cb490 (WIP)
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
     top_ps: Optional[torch.Tensor] = None
@@ -276,6 +280,22 @@ class SpecMetadata:
     # Shape: [max_num_requests * max_draft_len * vocab_size] stored as flat, reshaped on use
     draft_probs: Optional[torch.Tensor] = None
     draft_probs_vocab_size: int = 0
+
+    # Per-request sampling parameters for draft model (shape: [max_num_requests])
+    draft_temperatures: Optional[torch.Tensor] = None
+    draft_top_ks: Optional[torch.Tensor] = None
+    draft_top_ps: Optional[torch.Tensor] = None
+
+    # Saved draft token probabilities from previous iteration
+    # q(x_i) = probability of drafted token x_i under the draft model's distribution
+    # Pool indexed by _draft_probs_batch_pool_indices (shape: [max_num_requests, max_draft_len])
+    saved_draft_token_probs: Optional[torch.Tensor] = None
+    # Internal: maps request_id -> pool index for saved_draft_token_probs
+    _draft_probs_req_to_idx: dict = field(default_factory=dict)
+    # Internal: free list of pool indices
+    _draft_probs_pool_free: Optional[list] = None
+    # Internal: maps batch position -> pool index (CUDA tensor, shape: [max_num_requests])
+    _draft_probs_batch_pool_indices: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         pass
@@ -332,6 +352,9 @@ class SpecMetadata:
         temperatures = []
         top_ks = []
         top_ps = []
+        per_request_temps = []
+        per_request_topks = []
+        per_request_topps = []
 
         # Need to use a very small value for temperature when disabled to avoid division by 0
         DISABLE_TEMP_VAL = 1e-5
@@ -367,6 +390,11 @@ class SpecMetadata:
             top_ks.extend(tk_val for _ in range(num_tokens))
             top_ps.extend(tp_val for _ in range(num_tokens))
 
+            # Collect per-request params for draft model sampling
+            per_request_temps.append(temp_val)
+            per_request_topks.append(tk_val)
+            per_request_topps.append(tp_val)
+
         if self.temperatures is None:
             self.temperatures = torch.ones(
                 (self.max_draft_len + 1) * self.max_num_requests,
@@ -390,6 +418,66 @@ class SpecMetadata:
         self.top_ps[:len(top_ps)].copy_(torch.tensor(
             top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
                                         non_blocking=True)
+
+        # Initialize draft sampling parameter buffers and pool on first call
+        num_requests = len(requests)
+        if self.draft_temperatures is None:
+            self.draft_temperatures = torch.ones(self.max_num_requests,
+                                                 dtype=torch.float32,
+                                                 device='cuda')
+            self.draft_top_ks = torch.zeros(self.max_num_requests,
+                                            dtype=torch.int32,
+                                            device='cuda')
+            self.draft_top_ps = torch.ones(self.max_num_requests,
+                                           dtype=torch.float32,
+                                           device='cuda')
+            self.saved_draft_token_probs = torch.ones(self.max_num_requests,
+                                                      self.max_draft_len,
+                                                      dtype=torch.float32,
+                                                      device='cuda')
+            self._draft_probs_pool_free = list(range(self.max_num_requests))
+            self._draft_probs_batch_pool_indices = torch.zeros(
+                self.max_num_requests, dtype=torch.long, device='cuda')
+
+        # Copy per-request draft sampling parameters
+        self.draft_temperatures[:num_requests].copy_(torch.tensor(
+            per_request_temps, dtype=torch.float32, pin_memory=True),
+                                                     non_blocking=True)
+        self.draft_top_ks[:num_requests].copy_(torch.tensor(per_request_topks,
+                                                            dtype=torch.int32,
+                                                            pin_memory=True),
+                                               non_blocking=True)
+        self.draft_top_ps[:num_requests].copy_(torch.tensor(per_request_topps,
+                                                            dtype=torch.float32,
+                                                            pin_memory=True),
+                                               non_blocking=True)
+
+        # Pool management: assign pool indices to each request
+        active_req_ids = set()
+        pool_indices = []
+        for request in requests:
+            req_id = request.py_request_id
+            active_req_ids.add(req_id)
+            if req_id not in self._draft_probs_req_to_idx:
+                pool_idx = self._draft_probs_pool_free.pop()
+                self._draft_probs_req_to_idx[req_id] = pool_idx
+                # Initialize saved probs to 1.0 for new requests (no prior info)
+                self.saved_draft_token_probs[pool_idx].fill_(1.0)
+            pool_indices.append(self._draft_probs_req_to_idx[req_id])
+
+        # Clean up stale entries for completed requests
+        stale_ids = [
+            rid for rid in self._draft_probs_req_to_idx
+            if rid not in active_req_ids
+        ]
+        for rid in stale_ids:
+            pool_idx = self._draft_probs_req_to_idx.pop(rid)
+            self._draft_probs_pool_free.append(pool_idx)
+
+        # Store batch-to-pool index mapping on CUDA
+        self._draft_probs_batch_pool_indices[:num_requests].copy_(
+            torch.tensor(pool_indices, dtype=torch.long, pin_memory=True),
+            non_blocking=True)
 
 
 class SpecWorkerBase(nn.Module, ABC):
@@ -550,6 +638,7 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return accepted_tokens, num_accepted_tokens
 
+<<<<<<< HEAD
     def _accept_draft_tokens(self, logits, draft_tokens, num_contexts,
                              batch_size, spec_metadata):
         """Unified draft token acceptance with automatic rejection sampling support.
@@ -582,11 +671,67 @@ class SpecWorkerBase(nn.Module, ABC):
         Whether rejection sampling can be used for the given spec_metadata and number of context requests.
         """
         return spec_metadata.use_rejection_sampling and spec_metadata.draft_probs is not None and num_contexts == 0
+=======
+    def _has_full_draft_logits(self):
+        """Check if draft model logits contain the full vocabulary.
+
+        Returns True if logits are NOT TP-split (i.e., all vocab tokens are
+        present). Subclasses with TP-split draft logits should override this
+        to return False when appropriate.
+
+        When False, advanced draft sampling cannot be used because non-greedy
+        sampling requires the full vocabulary distribution.
+        """
+        return True
+
+    def _draft_sampler_advanced(self,
+                                logits: torch.Tensor,
+                                spec_metadata: SpecMetadata,
+                                batch_size: int,
+                                draft_step: int,
+                                d2t=None):
+        """Non-greedy draft sampling with probability tracking.
+
+        Applies the same temperature/top-k/top-p as the target model, samples
+        from the resulting distribution, and saves q(x_i) for subsequent
+        rejection sampling in the acceptance step.
+
+        Args:
+            logits: [batch_size, vocab_size] - Draft model logits (full vocab)
+            spec_metadata: Speculative decoding metadata with draft params
+            batch_size: Number of requests
+            draft_step: Current draft step index (0-based)
+            d2t: Optional vocab offset tensor for draft-to-target mapping
+
+        Returns:
+            draft_tokens: [batch_size] - Sampled draft token ids (int32)
+        """
+        from .one_model_sampler import sample_and_track_probs
+
+        temperatures = spec_metadata.draft_temperatures[:batch_size]
+        top_ks = spec_metadata.draft_top_ks[:batch_size]
+        top_ps = spec_metadata.draft_top_ps[:batch_size]
+
+        sampled_tokens, token_probs = sample_and_track_probs(
+            logits, temperatures, top_ks, top_ps)
+
+        # Save q(x_i) for rejection sampling in next iteration's acceptance
+        pool_indices = spec_metadata._draft_probs_batch_pool_indices[:
+                                                                     batch_size]
+        spec_metadata.saved_draft_token_probs[pool_indices,
+                                              draft_step] = token_probs
+
+        if d2t is not None:
+            sampled_tokens = d2t[sampled_tokens] + sampled_tokens
+
+        return sampled_tokens.int()
+>>>>>>> a83b7cb490 (WIP)
 
     def _sample_and_accept_draft_tokens_rejection(
         self,
         logits: torch.Tensor,
         draft_tokens: torch.Tensor,
+<<<<<<< HEAD
         draft_probs: torch.Tensor,
         batch_size: int,
         spec_metadata,
@@ -608,17 +753,44 @@ class SpecWorkerBase(nn.Module, ABC):
             draft_probs: [batch_size, max_draft_len, vocab_size] - Draft model probabilities
             batch_size: Total number of generation requests
             spec_metadata: Speculative decoding metadata containing sampling parameters
+=======
+        num_contexts: int,
+        batch_size: int,
+        spec_metadata: SpecMetadata,
+    ):
+        """Batched rejection sampling for speculative decoding acceptance.
+
+        Uses min(1, p(x)/q(x)) acceptance criterion where p is the target
+        distribution and q is the draft distribution. Falls back to sampling
+        from the target distribution at the first rejection point.
+
+        Args:
+            logits: [num_tokens, vocab_size] - Target model logits
+            draft_tokens: [num_gens, max_draft_len] - Draft tokens from prev iteration
+            num_contexts: Number of context requests in the batch
+            batch_size: Total number of requests
+            spec_metadata: Speculative decoding metadata
+>>>>>>> a83b7cb490 (WIP)
 
         Returns:
             accepted_tokens: [batch_size, max_draft_len + 1] - Accepted tokens
             num_accepted_tokens: [batch_size] - Number of accepted tokens per request
         """
+<<<<<<< HEAD
         device = logits.device
         vocab_size = logits.shape[-1]
+=======
+        from .one_model_sampler import (compute_probs_with_sampling_params,
+                                        random_sample)
+
+        num_gens = batch_size - num_contexts
+        num_tokens = logits.shape[0]
+>>>>>>> a83b7cb490 (WIP)
 
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
 
+<<<<<<< HEAD
         draft_vocab_size = draft_probs.shape[-1]
 
         # Compute target probabilities from logits
@@ -676,6 +848,78 @@ class SpecWorkerBase(nn.Module, ABC):
         # Apply force override if set
         num_accepted_tokens = self._apply_force_accepted_tokens(
             num_accepted_tokens, 0)
+=======
+        # Allocate return buffers
+        accepted_tokens = torch.empty((batch_size, self.max_draft_len + 1),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        num_accepted_tokens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+
+        # Compute target probabilities with sampling params applied
+        temperatures = spec_metadata.temperatures[:num_tokens]
+        top_ks = spec_metadata.top_ks[:num_tokens]
+        top_ps = spec_metadata.top_ps[:num_tokens]
+        target_probs = compute_probs_with_sampling_params(
+            logits.clone(), temperatures, top_ks, top_ps)
+
+        # Context requests: sample from target distribution (no draft tokens)
+        if num_contexts > 0:
+            ctx_samples = random_sample(target_probs[:num_contexts])
+            accepted_tokens[:num_contexts, 0] = ctx_samples
+
+        if num_gens > 0:
+            # Reshape target probs for generation requests
+            # Each gen request has max_draft_len+1 target logit positions
+            gen_probs = target_probs[num_contexts:].reshape(
+                num_gens, self.max_draft_len + 1, -1)
+
+            # Get p(x_i) for each draft token position
+            p_xi = gen_probs[:, :self.max_draft_len].gather(
+                2,
+                draft_tokens.long().unsqueeze(2)).squeeze(2)
+
+            # Get saved q(x_i) from the pool using batch-to-pool mapping
+            gen_pool_indices = spec_metadata._draft_probs_batch_pool_indices[
+                num_contexts:num_contexts + num_gens]
+            q_xi = spec_metadata.saved_draft_token_probs[
+                gen_pool_indices, :self.max_draft_len]
+
+            # Acceptance probability: min(1, p/q)
+            accept_probs = torch.minimum(torch.ones_like(p_xi),
+                                         p_xi / q_xi.clamp(min=1e-10))
+            random_vals = torch.rand_like(accept_probs)
+            accepted_mask = random_vals < accept_probs
+
+            # Count consecutive accepted tokens from the start
+            num_accepted = torch.cumprod(accepted_mask.int(),
+                                         dim=-1).sum(dim=-1)
+
+            # Sample from target distribution at all positions
+            # (for replacement at rejection point and bonus token)
+            gen_probs_flat = gen_probs.reshape(-1, gen_probs.shape[-1])
+            all_target_samples = random_sample(gen_probs_flat).reshape(
+                num_gens, self.max_draft_len + 1).int()
+
+            # Start with all target samples
+            accepted_tokens[num_contexts:] = all_target_samples
+
+            # Overwrite accepted positions with draft tokens
+            pos_indices = torch.arange(self.max_draft_len,
+                                       device=logits.device).unsqueeze(0)
+            accepted_mask_expanded = pos_indices < num_accepted.unsqueeze(1)
+            accepted_tokens[
+                num_contexts:, :self.max_draft_len][accepted_mask_expanded] = (
+                    draft_tokens[accepted_mask_expanded])
+
+            # +1 for the replacement/bonus token
+            num_accepted_tokens[num_contexts:] = 1 + num_accepted
+
+        # Apply force override if set
+        num_accepted_tokens = self._apply_force_accepted_tokens(
+            num_accepted_tokens, num_contexts)
+>>>>>>> a83b7cb490 (WIP)
 
         return accepted_tokens, num_accepted_tokens
 

@@ -496,11 +496,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                             d2t,
                                                             draft_step=i)
 
-                # Capture draft logits for rejection sampling
-                if spec_metadata.use_rejection_sampling:
-                    draft_logits_list.append(logits.clone())
-
-                new_draft_token = self.draft_decoder(logits, draft_model)
+                new_draft_token = self.draft_decoder(
+                    logits,
+                    draft_model,
+                    spec_metadata=spec_metadata,
+                    draft_step=i)
                 next_draft_tokens.append(new_draft_token)
                 # update inputs
                 hidden_states = hidden_states_to_save[gather_ids]
@@ -572,13 +572,21 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         draft_tokens = spec_metadata.draft_tokens.reshape(
             num_gens, self.max_draft_len)
 
-        return self._accept_draft_tokens(logits, draft_tokens, num_contexts,
-                                         batch_size, spec_metadata)
+        # Use rejection sampling when advanced sampling is enabled
+        if spec_metadata.allow_advanced_sampling:
+            return self._sample_and_accept_draft_tokens_rejection(
+                logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+
+        # Use base implementation for strict acceptance
+        return self._sample_and_accept_draft_tokens_base(
+            logits, draft_tokens, num_contexts, batch_size, spec_metadata)
 
     def draft_decoder(
         self,
         logits: torch.Tensor,
         draft_model: nn.Module,
+        spec_metadata=None,
+        draft_step: int = None,
     ):
         '''
         Sampling draft tokens with support for non-greedy sampling.
@@ -589,17 +597,24 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 Logits produced by the draft model.
             draft_model: nn.Module
                 The draft model.
+            spec_metadata: Optional SpecMetadata for advanced sampling.
+            draft_step: Current draft step index (0-based) for advanced sampling.
 
         Returns:
             draft_tokens: torch.Tensor
                 [batch_size * max_draft_len]
                 Draft token ids. Flattened.
         '''
-
-        # Note: using greedy for draft tokens is a bit easier to implement and
-        # faster. It doesn't affect the final output and seems to have a negligible
-        # impact on AR.
         d2t = getattr(draft_model.model, "d2t", None)
+
+        # Use advanced draft sampling when enabled
+        # Eagle3 logits are always full (logits_processor gathers across TP)
+        if (spec_metadata is not None and spec_metadata.allow_advanced_sampling
+                and draft_step is not None):
+            batch_size = logits.shape[0]
+            return self._draft_sampler_advanced(logits, spec_metadata,
+                                                batch_size, draft_step, d2t)
+
         return self._draft_sampler_greedy(logits, d2t)
 
     def prepare_1st_drafter_inputs(

@@ -74,6 +74,55 @@ def apply_temperature(
 
 
 @torch.compile(options={"max-autotune": True})
+def compute_probs_with_sampling_params(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+) -> torch.Tensor:
+    """Compute probability distribution with temperature, top-k, and top-p applied.
+
+    Used by rejection sampling to get the probability of specific tokens
+    under a given sampling distribution. The logits tensor may be modified
+    in-place.
+
+    Returns:
+        probs: [batch_size, vocab_size] probability distribution
+    """
+    logits = apply_temperature(logits, temperatures)
+    logits = apply_top_k_top_p(logits, top_ks, top_ps)
+    return logits.softmax(dim=-1, dtype=torch.float32)
+
+
+@torch.compile(options={"max-autotune": True})
+def sample_and_track_probs(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample tokens and return their probabilities under the sampling distribution.
+
+    Unlike random_sample which destroys probs in-place, this function preserves
+    the probability values so they can be tracked for rejection sampling.
+
+    The logits tensor may be modified in-place.
+
+    Returns:
+        sampled_tokens: [batch_size] sampled token indices
+        token_probs: [batch_size] probability of each sampled token
+    """
+    logits = apply_temperature(logits, temperatures)
+    logits = apply_top_k_top_p(logits, top_ks, top_ps)
+    probs = logits.softmax(dim=-1, dtype=torch.float32)
+    # Use out-of-place division to preserve probs for gathering
+    q = torch.empty_like(probs).exponential_()
+    sampled_tokens = probs.div(q).argmax(dim=-1).view(-1)
+    token_probs = probs.gather(1, sampled_tokens.unsqueeze(1)).squeeze(1)
+    return sampled_tokens, token_probs
+
+
+@torch.compile(options={"max-autotune": True})
 def sampling_batch_spec_dec_one_model(
     logits: torch.Tensor,
     temperatures: torch.Tensor,

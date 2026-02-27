@@ -545,11 +545,16 @@ class MTPWorker(SpecWorkerBase):
                     self.guided_decoder.execute_draft_batch(logits,
                                                             draft_step=i)
 
+<<<<<<< HEAD
                 # Capture draft logits for rejection sampling (only the last token per sequence)
                 if spec_metadata.use_rejection_sampling:
                     draft_logits_list.append(logits[last_tokens_idx].clone())
 
                 new_draft_token = self.draft_sampler(logits)
+=======
+                new_draft_token = self.draft_sampler(
+                    logits, spec_metadata=spec_metadata, draft_step=i)
+>>>>>>> a83b7cb490 (WIP)
                 next_draft_tokens.append(new_draft_token)
                 # shift input_ids and hidden_states
                 input_ids = draft_inputs["input_ids"]
@@ -913,7 +918,20 @@ class MTPWorker(SpecWorkerBase):
             num_accepted_tokens = self._apply_force_accepted_tokens(
                 num_accepted_tokens, num_contexts)
 
+<<<<<<< HEAD
         # Strict acceptance or rejection sampling
+=======
+        # Rejection sampling for MTPEagle with advanced draft sampling
+        elif (spec_metadata.allow_advanced_sampling
+              and spec_metadata.spec_dec_mode.is_mtp_eagle_one_model()
+              and self._has_full_draft_logits()):
+            draft_tokens = spec_metadata.draft_tokens.reshape(
+                num_gens, mtp_num_modules)
+            accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_rejection(
+                logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+
+        # Strict acceptance
+>>>>>>> a83b7cb490 (WIP)
         else:
             if self.is_thop:
                 # Temporary buffer
@@ -1142,10 +1160,29 @@ class MTPWorker(SpecWorkerBase):
                                     max_indices).squeeze(-1).type(torch.int32)
         return draft_tokens
 
+    def _has_full_draft_logits(self):
+        """Check if MTP draft logits contain the full vocabulary.
+
+        Returns False when TP>1 and logits are split across ranks
+        (i.e., no attention_dp, or attention_dp with lm_head TP).
+        """
+        if self.model_config is None or not hasattr(self.model_config,
+                                                    'mapping'):
+            return True
+        mapping = self.model_config.mapping
+        if mapping.tp_size <= 1:
+            return True
+        if mapping.enable_attention_dp and not getattr(
+                mapping, 'enable_lm_head_tp_in_adp', False):
+            return True
+        return False
+
     def draft_sampler(
         self,
         logits: torch.Tensor,
         mapping_lm_head_tp: Mapping = None,
+        spec_metadata=None,
+        draft_step: int = None,
     ):
         '''
         Sampling draft tokens.
@@ -1154,12 +1191,23 @@ class MTPWorker(SpecWorkerBase):
             logits: torch.Tensor
                 [num_tokens, vocab_size]
                 Logits produced by the draft model.
+            mapping_lm_head_tp: Optional Mapping for ADP + LM head TP mode.
+            spec_metadata: Optional SpecMetadata for advanced sampling.
+            draft_step: Current draft step index (0-based) for advanced sampling.
 
         Returns:
             draft_tokens: torch.Tensor
                 [batch_size * max_draft_len]
                 Draft token ids. Flattened.
         '''
+        # Advanced draft sampling for MTPEagle one-model with full logits
+        if (spec_metadata is not None and spec_metadata.allow_advanced_sampling
+                and spec_metadata.spec_dec_mode.is_mtp_eagle_one_model()
+                and self._has_full_draft_logits() and draft_step is not None):
+            batch_size = logits.shape[0]
+            return self._draft_sampler_advanced(logits, spec_metadata,
+                                                batch_size, draft_step)
+
         if (self.model_config is not None
                 and hasattr(self.model_config, 'mapping')
                 and self.model_config.mapping.tp_size
@@ -1334,10 +1382,14 @@ class MTPEagleWorker(MTPWorker):
                     mapping_lm_head_tp = draft_model.mtp_layers[
                         0].shared_head.mapping_lm_head_tp
                     new_draft_token = self.draft_sampler(
-                        logits, mapping_lm_head_tp)
+                        logits,
+                        mapping_lm_head_tp,
+                        spec_metadata=spec_metadata,
+                        draft_step=i)
                     new_draft_token = new_draft_token[:token_count]
                 else:
-                    new_draft_token = self.draft_sampler(logits)
+                    new_draft_token = self.draft_sampler(
+                        logits, spec_metadata=spec_metadata, draft_step=i)
 
                 hidden_states, position_ids = self.update_draft_tokens(
                     next_draft_tokens, new_draft_token, hidden_states,
