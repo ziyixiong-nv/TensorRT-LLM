@@ -769,6 +769,299 @@ class PARDForCausalLM(nn.Module):
         return hidden_states_out, hidden_states_out
 
 
+class DFlashForCausalLM(nn.Module):
+    """Draft model wrapper for DFlash speculative decoding.
+
+    Loads a standard decoder model (e.g., Qwen3ForCausalLM) and adds DFlash-specific
+    projection modules (fc + hidden_norm) for target hidden state projection.
+
+    DFlash uses a cross-attention architecture: each decoder layer computes
+    Q from noise embeddings and K/V from concatenated [target_hidden; noise],
+    with non-causal attention masking. This differs from standard causal
+    self-attention and requires a custom forward path.
+
+    Reference: https://arxiv.org/abs/2602.06036
+    """
+
+    # Mapping from model_type to standard ForCausalLM architecture name.
+    _MODEL_TYPE_TO_ARCH = {
+        "qwen3": "Qwen3ForCausalLM",
+        "qwen2": "Qwen2ForCausalLM",
+        "llama": "LlamaForCausalLM",
+        "mistral": "MistralForCausalLM",
+        "gemma3": "Gemma3ForCausalLM",
+        "phi3": "Phi3ForCausalLM",
+    }
+
+    def __init__(self, draft_config, target_config):
+        super().__init__()
+        pretrained_config = draft_config.pretrained_config
+
+        model_type = getattr(pretrained_config, 'model_type', None)
+        if model_type in self._MODEL_TYPE_TO_ARCH:
+            pretrained_config.architectures = [
+                self._MODEL_TYPE_TO_ARCH[model_type]
+            ]
+        else:
+            raise ValueError(
+                f"DFlash: unsupported model_type '{model_type}'. "
+                f"Supported types: {list(self._MODEL_TYPE_TO_ARCH.keys())}")
+
+        DraftModelClass, _ = get_model_architecture(pretrained_config)
+
+        draft_config_no_spec = replace(draft_config, spec_config=None)
+        self.draft_model_full = DraftModelClass(draft_config_no_spec)
+        self.model = self.draft_model_full.model
+        self.lm_head = self.draft_model_full.lm_head
+
+        self.model_config = draft_config_no_spec
+        self.config = draft_config_no_spec.pretrained_config
+
+        dflash_config = getattr(pretrained_config, 'dflash_config', {})
+        self.mask_token_id = dflash_config.get(
+            'mask_token_id', getattr(pretrained_config, 'mask_token_id', None))
+        self.target_layer_ids = dflash_config.get('target_layer_ids', [])
+
+        hidden_size = pretrained_config.hidden_size
+        num_target_layers = len(self.target_layer_ids)
+        rms_norm_eps = getattr(pretrained_config, 'rms_norm_eps', 1e-6)
+        dtype = getattr(pretrained_config, 'torch_dtype', torch.bfloat16)
+
+        self.fc = nn.Linear(num_target_layers * hidden_size,
+                            hidden_size,
+                            bias=False,
+                            dtype=dtype)
+        self.hidden_norm = nn.modules.normalization.RMSNorm(hidden_size,
+                                                            eps=rms_norm_eps,
+                                                            dtype=dtype)
+
+        self._hidden_size = hidden_size
+        self._num_heads = pretrained_config.num_attention_heads
+        self._num_kv_heads = pretrained_config.num_key_value_heads
+        self._head_dim = getattr(pretrained_config, 'head_dim',
+                                 hidden_size // self._num_heads)
+        self._rope_theta = getattr(pretrained_config, 'rope_theta', 1000000.0)
+        self._rms_norm_eps = rms_norm_eps
+        self._dtype = dtype
+        self._rope_cos_sin = None
+        self._rope_max_seq_len = getattr(pretrained_config,
+                                         'max_position_embeddings', 32768)
+
+        logger.info(
+            f"DFlash draft model initialized with mask_token_id={self.mask_token_id}, "
+            f"target_layer_ids={self.target_layer_ids}, "
+            f"model_type={model_type}, "
+            f"num_layers={pretrained_config.num_hidden_layers}")
+
+        self.logits_processor = None
+
+    def _ensure_rope_cache(self, max_seq_len: int, device: torch.device):
+        if self._rope_cos_sin is not None:
+            return
+        dim = self._head_dim
+        inv_freq = 1.0 / (self._rope_theta**(
+            torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+        t = torch.arange(max_seq_len, dtype=torch.float32, device=device)
+        freqs = torch.outer(t, inv_freq)
+        cos = freqs.cos().to(self._dtype)
+        sin = freqs.sin().to(self._dtype)
+        self._rope_cos_sin = (cos, sin)
+
+    @staticmethod
+    def _apply_rope_neox(x: torch.Tensor, cos: torch.Tensor,
+                         sin: torch.Tensor) -> torch.Tensor:
+        half = x.shape[-1] // 2
+        x1 = x[..., :half]
+        x2 = x[..., half:]
+        return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
+    def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
+        """Load weights, separating DFlash-specific (fc, hidden_norm) from model weights."""
+        _DFLASH_PREFIXES = ("fc.", "hidden_norm.")
+
+        dflash_weights = {}
+        model_weights = {}
+        for name, param in weights.items():
+            clean = name[len("model."):] if name.startswith("model.") else name
+
+            if any(clean.startswith(p) for p in _DFLASH_PREFIXES):
+                dflash_weights[clean] = param
+            else:
+                key = clean if clean.startswith("model.") else f"model.{clean}"
+                model_weights[key] = param
+
+        self.draft_model_full.load_weights(weights=model_weights,
+                                           weight_mapper=weight_mapper,
+                                           **kwargs)
+
+        if dflash_weights:
+            dtype = self.config.torch_dtype
+            for name, param in dflash_weights.items():
+                dflash_weights[name] = param.to(dtype=dtype, device='cuda')
+            missing, unexpected = self.load_state_dict(dflash_weights,
+                                                       strict=False)
+            real_missing = [
+                k for k in missing if any(
+                    k.startswith(p) for p in _DFLASH_PREFIXES)
+            ]
+            if real_missing:
+                logger.warning(
+                    f"DFlash projection missing keys: {real_missing}")
+
+    def forward_dflash(
+        self,
+        noise_embedding: torch.Tensor,
+        target_hidden_proj: torch.Tensor,
+        noise_position_ids: torch.Tensor,
+        target_position_ids: torch.Tensor,
+        num_target_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """DFlash cross-attention forward (batched, CUDA-graph compatible).
+
+        Q from noise_embedding, K/V from [target_hidden_proj; noise_embedding],
+        with non-causal masking. Returns (batch * noise_len, hidden_size).
+        """
+        batch, noise_len, hidden_size = noise_embedding.shape
+        max_target = target_hidden_proj.shape[1]
+        device = noise_embedding.device
+        kv_len = max_target + noise_len
+
+        first_attn = self.model.layers[0].self_attn
+        head_dim = first_attn.head_dim
+        num_heads = first_attn.num_heads  # TP-divided
+        num_kv_heads = first_attn.num_key_value_heads  # TP-divided
+
+        self._ensure_rope_cache(self._rope_max_seq_len, device)
+        rope_cos, rope_sin = self._rope_cos_sin
+
+        cos_n = rope_cos[noise_position_ids.long()].unsqueeze(2)
+        sin_n = rope_sin[noise_position_ids.long()].unsqueeze(2)
+        cos_t = rope_cos[target_position_ids.long()].unsqueeze(2)
+        sin_t = rope_sin[target_position_ids.long()].unsqueeze(2)
+
+        target_range = torch.arange(max_target, device=device)
+        target_valid = target_range.unsqueeze(0) < num_target_tokens.unsqueeze(
+            1)
+        kv_valid = torch.cat([
+            target_valid,
+            torch.ones(batch, noise_len, dtype=torch.bool, device=device)
+        ],
+                             dim=1)
+        attn_mask = torch.zeros(batch,
+                                1,
+                                noise_len,
+                                kv_len,
+                                dtype=noise_embedding.dtype,
+                                device=device)
+        attn_mask.masked_fill_(
+            ~kv_valid.unsqueeze(1).unsqueeze(2).expand(-1, 1, noise_len, -1),
+            float('-inf'))
+
+        hidden_states = noise_embedding
+
+        for layer in self.model.layers:
+            attn = layer.self_attn
+            residual = hidden_states
+
+            hn = layer.input_layernorm(hidden_states.reshape(-1, hidden_size))
+
+            qkv_n = attn.qkv_proj(hn)
+            q_n, k_n, v_n = attn.split_qkv(qkv_n)
+
+            qkv_t = attn.qkv_proj(target_hidden_proj.reshape(-1, hidden_size))
+            _, k_t, v_t = attn.split_qkv(qkv_t)
+
+            q_n = q_n.reshape(batch, noise_len, num_heads, head_dim)
+            k_n = k_n.reshape(batch, noise_len, num_kv_heads, head_dim)
+            v_n = v_n.reshape(batch, noise_len, num_kv_heads, head_dim)
+            k_t = k_t.reshape(batch, max_target, num_kv_heads, head_dim)
+            v_t = v_t.reshape(batch, max_target, num_kv_heads, head_dim)
+
+            q_n = attn.q_norm(q_n.reshape(-1, head_dim)).reshape(
+                batch, noise_len, num_heads, head_dim)
+            k_n = attn.k_norm(k_n.reshape(-1, head_dim)).reshape(
+                batch, noise_len, num_kv_heads, head_dim)
+            k_t = attn.k_norm(k_t.reshape(-1, head_dim)).reshape(
+                batch, max_target, num_kv_heads, head_dim)
+
+            q_n = self._apply_rope_neox(q_n, cos_n, sin_n)
+            k_n = self._apply_rope_neox(k_n, cos_n, sin_n)
+            k_t = self._apply_rope_neox(k_t, cos_t, sin_t)
+
+            k_full = torch.cat([k_t, k_n], dim=1)
+            v_full = torch.cat([v_t, v_n], dim=1)
+
+            if num_kv_heads != num_heads:
+                groups = num_heads // num_kv_heads
+                k_full = k_full.unsqueeze(3).expand(
+                    -1, -1, -1, groups, -1).reshape(batch, kv_len, num_heads,
+                                                    head_dim)
+                v_full = v_full.unsqueeze(3).expand(
+                    -1, -1, -1, groups, -1).reshape(batch, kv_len, num_heads,
+                                                    head_dim)
+
+            q_4d = q_n.transpose(1, 2)
+            k_4d = k_full.transpose(1, 2)
+            v_4d = v_full.transpose(1, 2)
+
+            attn_out = torch.nn.functional.scaled_dot_product_attention(
+                q_4d, k_4d, v_4d, attn_mask=attn_mask, is_causal=False)
+            attn_out = attn_out.transpose(1, 2).reshape(batch * noise_len, -1)
+
+            hidden_states = attn.o_proj(attn_out).reshape(
+                batch, noise_len, hidden_size)
+
+            hidden_states = hidden_states + residual
+            residual = hidden_states
+            hn_post = layer.post_attention_layernorm(
+                hidden_states.reshape(-1, hidden_size))
+            hidden_states = layer.mlp(hn_post).reshape(batch, noise_len,
+                                                       hidden_size) + residual
+
+        hidden_states = self.model.norm(hidden_states.reshape(-1, hidden_size))
+        return hidden_states
+
+    def forward(
+        self,
+        attn_metadata,
+        input_ids: torch.LongTensor = None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        return_context_logits: bool = False,
+        spec_metadata=None,
+        hidden_states: torch.Tensor | None = None,
+        noise_embedding: torch.Tensor | None = None,
+        target_hidden_proj: torch.Tensor | None = None,
+        noise_position_ids: torch.Tensor | None = None,
+        target_position_ids: torch.Tensor | None = None,
+        num_target_tokens: torch.Tensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if noise_embedding is not None and target_hidden_proj is not None:
+            if num_target_tokens is None:
+                raise ValueError(
+                    "DFlash forward_dflash path requires num_target_tokens.")
+            hidden_states_out = self.forward_dflash(
+                noise_embedding=noise_embedding,
+                target_hidden_proj=target_hidden_proj,
+                noise_position_ids=noise_position_ids,
+                target_position_ids=target_position_ids,
+                num_target_tokens=num_target_tokens,
+            )
+            return hidden_states_out, hidden_states_out
+
+        hidden_states_out = self.model(
+            input_ids=input_ids,
+            attn_metadata=attn_metadata,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            spec_metadata=spec_metadata,
+            **kwargs,
+        )
+
+        return hidden_states_out, hidden_states_out
+
+
 class MTPForCausalLM(nn.Module):
 
     def __init__(
@@ -988,6 +1281,8 @@ def get_draft_model(model_config, draft_config, lm_head, model):
         return PARDForCausalLM(draft_config)
     elif spec_dec_mode.is_draft_target_one_model():
         return AutoModelForCausalLM.from_config(draft_config)
+    elif spec_dec_mode.is_dflash():
+        return DFlashForCausalLM(draft_config, model_config)
     else:
         raise NotImplementedError(
             f"get_draft_model does not support speculative decoding mode {spec_dec_mode}."
@@ -1066,6 +1361,13 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 if spec_config.spec_dec_mode.is_pard(
                 ) and self.draft_model is not None:
                     self.draft_model.logits_processor = self.logits_processor
+                if spec_config.spec_dec_mode.is_dflash(
+                ) and self.draft_model is not None:
+                    self.draft_model.logits_processor = self.logits_processor
+                    # Resolve target_layer_ids from draft model config if not set
+                    if spec_config.target_layer_ids is None and hasattr(
+                            self.draft_model, 'target_layer_ids'):
+                        spec_config.target_layer_ids = self.draft_model.target_layer_ids
 
             # EAGLE3-specific logic: merge extra_attrs from draft model for Llama3
             if (self.draft_config is not None and model_config.spec_config.
@@ -1172,7 +1474,12 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         else:
             self.draft_model.load_weights(weights=weights)
 
-        if self.spec_config and not self.spec_config.spec_dec_mode.is_external_drafter(
+        if self.spec_config and self.spec_config.spec_dec_mode.is_dflash():
+            # DFlash has independent layer weights but shares embed_tokens
+            # and lm_head from the target model (not in the DFlash checkpoint).
+            self.draft_model.model.embed_tokens = self.model.embed_tokens
+            self.draft_model.lm_head = self.lm_head
+        elif self.spec_config and not self.spec_config.spec_dec_mode.is_external_drafter(
         ):
             self.draft_model.load_weights_from_target_model(self)
 

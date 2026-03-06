@@ -3,6 +3,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
@@ -10,6 +12,7 @@ from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from ..speculative.interface import SpecMetadata
+from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSampler,
                            DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
@@ -112,6 +115,23 @@ def get_spec_metadata(spec_config,
             max_num_requests=max_num_requests,
             max_num_tokens=max_num_tokens,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
+        )
+    if spec_config.spec_dec_mode.is_dflash():
+        logger.debug(
+            f"get_spec_metadata(DFlash): target_layer_ids={spec_config.target_layer_ids}, "
+            f"hidden_size={model_config.hidden_size}, max_num_tokens={max_num_tokens}"
+        )
+        layers = set(spec_config.target_layer_ids
+                     ) if spec_config.target_layer_ids else None
+        return DFlashSpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            hidden_size=model_config.hidden_size,
+            max_num_tokens=max_num_tokens,
+            dtype=model_config.torch_dtype,
+            layers_to_capture=layers,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesSpecMetadata(
@@ -231,6 +251,9 @@ def get_spec_decoder(
         return SASampler(sampler_args, max_draft_len=spec_config.max_draft_len)
     if spec_config.spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelSampler(sampler_args)
+    if spec_config.spec_dec_mode.is_dflash():
+        return MTPSampler(sampler_args,
+                          nextn=spec_config.tokens_per_gen_step - 1)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -295,6 +318,8 @@ def get_spec_worker(spec_config,
     if spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelWorker(spec_config, mapping,
                                          use_separate_draft_kv_cache)
+    if spec_dec_mode.is_dflash():
+        return DFlashWorker(spec_config, mapping, use_separate_draft_kv_cache)
     return None
 
 

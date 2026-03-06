@@ -69,6 +69,7 @@ class SpeculativeDecodingMode(IntEnum):
     USER_PROVIDED = auto()
     SAVE_HIDDEN_STATES = auto()
     PARD = auto()
+    DFLASH = auto()
     NONE = auto()
     AUTO = auto()
 
@@ -97,6 +98,9 @@ class SpeculativeDecodingMode(IntEnum):
     def is_pard(self):
         return self == SpeculativeDecodingMode.PARD
 
+    def is_dflash(self):
+        return self == SpeculativeDecodingMode.DFLASH
+
     def is_ngram(self):
         return self == SpeculativeDecodingMode.NGRAM
 
@@ -119,7 +123,8 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
     def is_external_drafter(self):
-        return self.is_pard() or self.is_draft_target_one_model()
+        return self.is_pard() or self.is_draft_target_one_model(
+        ) or self.is_dflash()
 
     def without_logits(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
