@@ -473,6 +473,12 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
     Metadata = FlashInferAttentionMetadata
 
+    _DTYPE_MAP = {
+        "fp8": torch.float8_e4m3fn,
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+    }
+
     def __init__(
         self,
         layer_idx: int,
@@ -482,6 +488,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         quant_config: Optional[QuantConfig] = None,
         q_scaling: Optional[float] = None,
         skip_create_weights_in_init: bool = False,
+        mixed_kv_precision: Optional[Dict[str, Optional[str]]] = None,
         **kwargs,
     ):
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
@@ -489,6 +496,18 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
         self.q_scaling = q_scaling
+
+        # Mixed K/V precision: track per-role torch dtypes
+        self.mixed_kv_precision = mixed_kv_precision
+        self.key_cache_dtype: Optional[torch.dtype] = None
+        self.value_cache_dtype: Optional[torch.dtype] = None
+        if mixed_kv_precision is not None:
+            key_str = mixed_kv_precision.get("key_cache_dtype")
+            value_str = mixed_kv_precision.get("value_cache_dtype")
+            if key_str is not None:
+                self.key_cache_dtype = self._DTYPE_MAP.get(key_str)
+            if value_str is not None:
+                self.value_cache_dtype = self._DTYPE_MAP.get(value_str)
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config
@@ -514,19 +533,33 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # Key and Value
         kv_cache = metadata.kv_cache_manager.get_buffers(
             self.layer_idx, kv_layout=metadata.kv_layout)
+        is_mixed_kv = isinstance(kv_cache, tuple)
 
         if k is not None and v is not None:
             k = k.view(-1, self.num_kv_heads, self.head_dim)
             v = v.view(-1, self.num_kv_heads, self.head_dim)
 
-            if self.has_fp8_kv_cache:
+            if is_mixed_kv:
+                # Mixed K/V precision: cast K and V to their respective cache dtypes
+                k_cache, v_cache = kv_cache
+                if self.key_cache_dtype is not None:
+                    k = k.to(self.key_cache_dtype)
+                else:
+                    k = k.to(k_cache.dtype)
+                if self.value_cache_dtype is not None:
+                    v = v.to(self.value_cache_dtype)
+                else:
+                    v = v.to(v_cache.dtype)
+            elif self.has_fp8_kv_cache:
                 assert kv_cache.dtype == torch.float8_e4m3fn, (
                     f"KV cache should have fp8 dtype, but get {kv_cache.dtype}")
                 k = k.to(torch.float8_e4m3fn)
                 v = v.to(torch.float8_e4m3fn)
-            assert k.dtype == v.dtype == kv_cache.dtype, (
-                f"KV cache dtype {kv_cache.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
-            )
+
+            if not is_mixed_kv:
+                assert k.dtype == v.dtype == kv_cache.dtype, (
+                    f"KV cache dtype {kv_cache.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
+                )
 
             flashinfer.page.append_paged_kv_cache(
                 append_key=k,
@@ -555,12 +588,19 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                         kv_cache,
                         out=out.view(-1, self.num_heads, self.head_dim))
 
+        # For plan(), kv_dtype should match k_cache dtype
+        # (FlashInfer validates k_cache.dtype against kv_data_type)
+        if is_mixed_kv:
+            kv_dtype_for_plan = kv_cache[0].dtype  # k_cache dtype
+        else:
+            kv_dtype_for_plan = kv_cache.dtype
+
         # this will do nothing if the last forward pass had the same parameters
         plan_params = metadata.plan(self.num_heads,
                                     self.num_kv_heads,
                                     self.head_dim,
                                     q_dtype=q.dtype,
-                                    kv_dtype=kv_cache.dtype,
+                                    kv_dtype=kv_dtype_for_plan,
                                     q_scaling=self.q_scaling,
                                     attention_window_size=attention_window_size,
                                     attention_mask_type=attention_mask_type,

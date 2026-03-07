@@ -1909,6 +1909,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "The data type to use for the KV cache. Use 'auto' to follow checkpoint metadata, otherwise force the specified dtype."
     )
 
+    # Simulated mixed K/V precision fields (pure python, PyTorch backend only).
+    key_cache_dtype: Optional[str] = Field(
+        default=None,
+        description="Simulated key cache precision. When set, applies round-trip "
+        "quantization to keys before caching. Supported: 'int2','int3','int4','int8','fp8'."
+    )
+    value_cache_dtype: Optional[str] = Field(
+        default=None,
+        description=
+        "Simulated value cache precision. When set, applies round-trip "
+        "quantization to values before caching. Supported: 'int2','int3','int4','int8','fp8'."
+    )
+
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
         "auto", "float16", "bfloat16", "float32"] = Field(
@@ -2010,6 +2023,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if not 0 <= v <= 1:
             raise ValueError(
                 "kv_cache_config.max_util_for_resume must be between 0 and 1")
+        return v
+
+    @field_validator('key_cache_dtype', 'value_cache_dtype')
+    @classmethod
+    def validate_kv_cache_sim_dtype(cls, v: Optional[str]):
+        if v is None:
+            return v
+        valid = {"int2", "int3", "int4", "int8", "fp8"}
+        v = v.lower()
+        if v not in valid:
+            raise ValueError(
+                f"key_cache_dtype/value_cache_dtype must be one of {sorted(valid)}, got '{v}'"
+            )
         return v
 
 
@@ -3347,16 +3373,42 @@ class TorchLlmArgs(BaseLlmArgs):
             return self
 
         assert self.quant_config is not None
-        if self.kv_cache_config.dtype == "auto":
-            return self
-        elif self.kv_cache_config.dtype == 'fp8':
+        if self.kv_cache_config.dtype == 'fp8':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
         elif self.kv_cache_config.dtype == 'nvfp4':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
-        else:
+        elif self.kv_cache_config.dtype != "auto":
             logger.warning(
                 f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "
                 "please update the validator")
+
+        if (self.kv_cache_config.key_cache_dtype is not None
+                or self.kv_cache_config.value_cache_dtype is not None):
+            key_dt = self.kv_cache_config.key_cache_dtype
+            value_dt = self.kv_cache_config.value_cache_dtype
+            has_fp8 = key_dt == "fp8" or value_dt == "fp8"
+
+            if has_fp8:
+                # FP8 mixed precision requires FlashInfer + V2 for real
+                # memory savings (separate K/V buffers with different dtypes).
+                if self.attn_backend != "FLASHINFER":
+                    logger.warning(
+                        "Mixed KV precision with FP8 requires attn_backend='FLASHINFER'. "
+                        "Auto-setting attn_backend to FLASHINFER.")
+                    self.attn_backend = "FLASHINFER"
+                if not self.kv_cache_config.use_kv_cache_manager_v2:
+                    logger.warning(
+                        "Mixed KV precision with FP8 requires use_kv_cache_manager_v2=True. "
+                        "Auto-enabling.")
+                    self.kv_cache_config.use_kv_cache_manager_v2 = True
+                logger.info(
+                    f"Mixed KV precision with real memory savings enabled: "
+                    f"K={key_dt}, V={value_dt} (FlashInfer + V2)")
+            else:
+                logger.info(
+                    f"Mixed KV precision simulation enabled: "
+                    f"K={key_dt}, V={value_dt} "
+                    "(INT types: simulation only, no real memory savings)")
 
         return self
 

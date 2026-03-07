@@ -126,6 +126,9 @@ class ModelConfig(Generic[TConfig]):
     use_cute_dsl_blockscaling_mm: bool = False
     use_cute_dsl_blockscaling_bmm: bool = False
 
+    # Simulated mixed K/V precision: {"key_cache_dtype": str, "value_cache_dtype": str}
+    mixed_kv_precision: Optional[Dict[str, Optional[str]]] = None
+
     _frozen: bool = field(default=False, init=False, repr=False)
 
     # If true, ONLY the vision encoder part of the full model is loaded/executed.
@@ -143,7 +146,7 @@ class ModelConfig(Generic[TConfig]):
         """
         if self._frozen:
             if key not in ('_frozen', 'extra_attrs', 'pretrained_config',
-                           'quant_config'):
+                           'quant_config', 'mixed_kv_precision'):
                 raise AttributeError(
                     f"Cannot modify ModelConfig.'{key}' - instance is frozen")
         super().__setattr__(key, value)

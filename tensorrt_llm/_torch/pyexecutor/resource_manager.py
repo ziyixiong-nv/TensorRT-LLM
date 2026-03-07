@@ -1526,10 +1526,22 @@ class KVCacheManagerV2(BaseResourceManager):
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
         execution_stream: Optional[torch.cuda.Stream] = None,
+        mixed_kv_precision: Optional[Dict[str, Optional[str]]] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
+
+        # Mixed K/V precision: per-role dtype for real memory savings
+        self.mixed_kv_precision = mixed_kv_precision
+        if mixed_kv_precision is not None:
+            key_dtype_str = mixed_kv_precision.get("key_cache_dtype")
+            value_dtype_str = mixed_kv_precision.get("value_cache_dtype")
+            self.key_dtype = DataType.FP8 if key_dtype_str == "fp8" else dtype
+            self.value_dtype = DataType.FP8 if value_dtype_str == "fp8" else dtype
+        else:
+            self.key_dtype = dtype
+            self.value_dtype = dtype
 
         assert kv_connector_manager is None, "kv_connector_manager is not supported for KVCacheManagerV2"
         assert max_beam_width == 1, "max_beam_width must be 1 for KVCacheManagerV2"
@@ -1719,10 +1731,16 @@ class KVCacheManagerV2(BaseResourceManager):
             self.index_scales[pool_id] = self.impl.get_page_index_scale(
                 layer_id, Role.KEY)
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-                self.kv_offset[pool_id] = exact_div(
-                    self.impl.get_mem_pool_base_address(layer_id, Role.VALUE) -
-                    self.impl.get_mem_pool_base_address(layer_id, Role.KEY),
-                    self.impl.get_page_stride(layer_id, Role.KEY))
+                if self.key_dtype != self.value_dtype:
+                    # Mixed precision: K/V are in separate pools, kv_offset
+                    # is not meaningful (TRTLLM backend not supported).
+                    self.kv_offset[pool_id] = 0
+                else:
+                    self.kv_offset[pool_id] = exact_div(
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.VALUE) -
+                        self.impl.get_mem_pool_base_address(layer_id, Role.KEY),
+                        self.impl.get_page_stride(layer_id, Role.KEY))
             else:
                 self.kv_offset[pool_id] = 0
 
@@ -1780,10 +1798,13 @@ class KVCacheManagerV2(BaseResourceManager):
                     self.get_layer_bytes_per_token(
                         layer_id, Role.KEY_BLOCK_SCALE) * self.kv_factor *
                     self.tokens_per_block)
+            # When K/V have different dtypes, they are in separate pools,
+            # so each pool contains only one data role (effective kv_factor=1).
+            effective_kv_factor = 1 if self.key_dtype != self.value_dtype else self.kv_factor
             offset = exact_div(
                 addr_offset,
                 self.get_layer_bytes_per_token(layer_id, Role.KEY) *
-                self.kv_factor * self.tokens_per_block)
+                effective_kv_factor * self.tokens_per_block)
 
             if self.dtype == DataType.NVFP4:
                 assert block_scale_offset == offset, "Block scale offset and offset should be the same"
@@ -1843,9 +1864,54 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return self.impl.get_page_index_upper_bound(0, Role.KEY)
 
-    def get_buffers(self,
-                    layer_idx: int,
-                    kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+    def _get_single_role_buffer(self, layer_idx: int, role: "Role",
+                                role_dtype: DataType,
+                                kv_layout: str) -> torch.Tensor:
+        """Return a single-role (KEY or VALUE) cache tensor for the given layer."""
+        layer_offset = self.layer_offsets[layer_idx]
+        addr = self.impl.get_mem_pool_base_address(layer_offset, role)
+        num_pages = self.impl.get_page_index_upper_bound(layer_offset, role)
+
+        assert kv_layout in ["NHD",
+                             "HND"], f"Unsupported kv_layout: {kv_layout}"
+
+        if kv_layout == "NHD":
+            shape = [
+                num_pages,
+                self.tokens_per_block,
+                self.num_kv_heads_per_layer[layer_offset],
+                self.head_dim,
+            ]
+        else:
+            shape = [
+                num_pages,
+                self.num_kv_heads_per_layer[layer_offset],
+                self.tokens_per_block,
+                self.head_dim,
+            ]
+
+        return convert_to_torch_tensor(TensorWrapper(addr, role_dtype, shape))
+
+    def get_k_buffer(self,
+                     layer_idx: int,
+                     kv_layout: str = "NHD") -> torch.Tensor:
+        """Return K cache tensor for the given layer."""
+        return self._get_single_role_buffer(layer_idx, Role.KEY, self.key_dtype,
+                                            kv_layout)
+
+    def get_v_buffer(self,
+                     layer_idx: int,
+                     kv_layout: str = "NHD") -> torch.Tensor:
+        """Return V cache tensor for the given layer."""
+        return self._get_single_role_buffer(layer_idx, Role.VALUE,
+                                            self.value_dtype, kv_layout)
+
+    def get_buffers(self, layer_idx: int, kv_layout: str = "NHD"):
+        # Mixed precision: return tuple of (k_cache, v_cache) with different dtypes
+        if self.key_dtype != self.value_dtype:
+            return (self.get_k_buffer(layer_idx, kv_layout),
+                    self.get_v_buffer(layer_idx, kv_layout))
+
         layer_offset = self.layer_offsets[layer_idx]
         addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY)
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
@@ -2221,8 +2287,16 @@ class KVCacheManagerV2(BaseResourceManager):
         cache_size_per_token = kv_factor * self.num_kv_heads_per_layer[
             local_layer_idx] * self.head_dim
 
+        # Use per-role dtype when mixed K/V precision is active
+        if data_role == Role.KEY:
+            effective_dtype = self.key_dtype
+        elif data_role == Role.VALUE:
+            effective_dtype = self.value_dtype
+        else:
+            effective_dtype = self.dtype
+
         cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token,
-                                                       self.dtype)
+                                                       effective_dtype)
 
         if data_role in [Role.KEY, Role.VALUE]:
             return cache_size_bytes_per_token

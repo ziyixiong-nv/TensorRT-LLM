@@ -993,6 +993,8 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,
+            mixed_kv_precision=getattr(_model_config, 'mixed_kv_precision',
+                                       None),
         )
     return kv_cache_manager
 

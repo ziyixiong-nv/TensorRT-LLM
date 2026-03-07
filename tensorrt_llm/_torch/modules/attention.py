@@ -382,6 +382,7 @@ class Attention(nn.Module):
             self.register_to_config = True
 
         config = config or ModelConfig()
+        self.mixed_kv_precision = getattr(config, 'mixed_kv_precision', None)
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
         self.head_dim = getattr(config.pretrained_config, 'head_dim', None)
@@ -594,6 +595,7 @@ class Attention(nn.Module):
             q_scaling=self.q_scaling,
             attention_chunk_size=self.attention_chunk_size,
             sparse_attention_config=config.sparse_attention_config,
+            mixed_kv_precision=self.mixed_kv_precision,
         )
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
@@ -623,6 +625,30 @@ class Attention(nn.Module):
         elif k is not None and v is not None and self.support_fused_qkv:
             qkv = torch.concat([q, k, v], dim=-1)
             q, k, v = qkv, None, None
+        return q, k, v
+
+    def _apply_simulated_kv_quant(self, q, k, v):
+        from .kv_quant_simulation import simulated_quantize
+
+        key_dtype = self.mixed_kv_precision.get("key_cache_dtype")
+        value_dtype = self.mixed_kv_precision.get("value_cache_dtype")
+
+        if key_dtype is None and value_dtype is None:
+            return q, k, v
+
+        # Force-split if fused
+        if k is None and v is None:
+            q, k, v = self.split_qkv(q)
+
+        if key_dtype is not None:
+            k = simulated_quantize(k, key_dtype)
+        if value_dtype is not None:
+            v = simulated_quantize(v, value_dtype)
+
+        # Re-fuse if backend expects fused format
+        if self.support_fused_qkv:
+            qkv = torch.cat([q, k, v], dim=-1)
+            return qkv, None, None
         return q, k, v
 
     def _use_quantize_output(self):
@@ -874,6 +900,15 @@ class Attention(nn.Module):
 
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
+
+        if self.mixed_kv_precision is not None:
+            # Skip simulation for FP8 types when FlashInfer handles real
+            # precision natively (the backend casts K/V and stores in
+            # separate-dtype buffers). Still simulate for INT types.
+            if not (self.attn_backend == "FLASHINFER"
+                    and hasattr(self.attn, 'mixed_kv_precision')
+                    and self.attn.mixed_kv_precision is not None):
+                q, k, v = self._apply_simulated_kv_quant(q, k, v)
 
         if attention_sinks is not None:
             assert self.attn_backend == "TRTLLM", "Attention sinks are only supported for TRTLLM backend."

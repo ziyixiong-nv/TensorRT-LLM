@@ -423,6 +423,16 @@ class ModelLoader:
         validate_and_set_mamba_ssm_cache_dtype(
             config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype)
 
+        # Propagate mixed KV precision config
+        if (self.llm_args.kv_cache_config.key_cache_dtype is not None
+                or self.llm_args.kv_cache_config.value_cache_dtype is not None):
+            config.mixed_kv_precision = {
+                "key_cache_dtype":
+                self.llm_args.kv_cache_config.key_cache_dtype,
+                "value_cache_dtype":
+                self.llm_args.kv_cache_config.value_cache_dtype,
+            }
+
         # Allow overriding the number of layers via environment variable
         # Note: This is kept for backward compatibility, but model_kwargs is preferred
         num_layers_override = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM",
