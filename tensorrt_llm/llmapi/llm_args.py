@@ -1377,7 +1377,7 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "If None, it will be read from the draft model config (dflash_config.target_layer_ids)."
     )
 
-    decoding_type: Literal["DFLASH"] = "DFLASH"
+    decoding_type: Literal["DFlash"] = "DFlash"
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -2787,7 +2787,7 @@ class TrtLlmArgs(BaseLlmArgs):
                 )
             elif isinstance(self.speculative_config, DFlashDecodingConfig):
                 raise ValueError(
-                    "speculative_config.decoding_type 'DFLASH' is only supported on the PyTorch backend."
+                    "speculative_config.decoding_type 'DFlash' is only supported on the PyTorch backend."
                 )
             else:
                 raise ValueError(

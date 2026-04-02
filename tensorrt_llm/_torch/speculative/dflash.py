@@ -506,10 +506,12 @@ class DFlashWorker(SpecWorkerBase):
             hidden_size_up = num_capture_layers * h_size
             hidden_size = h_size
 
-            # Cap noise block at model's training block_size.
+            # Always use the model's training block_size for the noise block.
+            # The model was trained with a fixed block_size (e.g. 16), so the
+            # noise block must match that size regardless of K (max_draft_len).
             if not hasattr(self, "_noise_block_size"):
                 model_block_size = getattr(draft_model.config, "block_size", None)
-                if model_block_size is not None and model_block_size < total_tokens_per_req:
+                if model_block_size is not None:
                     self._noise_block_size = model_block_size
                 else:
                     self._noise_block_size = total_tokens_per_req
