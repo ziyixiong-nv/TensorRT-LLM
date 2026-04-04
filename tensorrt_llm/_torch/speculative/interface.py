@@ -270,11 +270,12 @@ class SpeculativeDecodingMode(IntEnum):
                               TrtllmAttention) or not xqa_supported
 
     def attention_need_spec_dec_mode(
-            self,
-            spec_resource_manager: Optional[BaseResourceManager],
-            is_draft_model: bool,
-            attention_backend: Type[AttentionBackend],
-            use_chain_drafter: bool,  # CDL
+        self,
+        spec_resource_manager: Optional[BaseResourceManager],
+        is_draft_model: bool,
+        attention_backend: Type[AttentionBackend],
+        use_chain_drafter: bool,  # CDL
+        is_mla: bool = False,
     ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
@@ -283,11 +284,15 @@ class SpeculativeDecodingMode(IntEnum):
             is_draft_model: whether the model is a draft model.
             attention_backend: the attention backend.
             use_chain_drafter: whether to use capturable drafting loops (CDL). For the target model, it is always False.
+            is_mla: whether the model uses Multi-head Latent Attention.
         """
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
 
         # Always use the multi-token query mode for 1-model if the kernels are available.
-        use_case_1 = self.use_one_engine()
+        # SM120 (Blackwell Desktop) does not have XQA spec-dec cubins for non-MLA GQA models,
+        # so disable spec-dec mode there to avoid a fatal assertion in the attention kernel.
+        xqa_supported = is_mla or get_sm_version() < 120
+        use_case_1 = self.use_one_engine() and xqa_supported
         # For 2-model, we need to enable it when we process multiple tokens at once. This occurs with
         # the target model (verification) or on the first draft for CDL based speculation.
         use_case_2 = not self.use_one_engine() and (
