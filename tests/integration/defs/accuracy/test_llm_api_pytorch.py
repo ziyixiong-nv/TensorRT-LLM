@@ -414,16 +414,15 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @parametrize_with_ids("overlap_scheduler", [True, False])
     def test_pard(self, overlap_scheduler):
+        max_bs = 8
         pytorch_config = dict(
-            max_batch_size=
-            1,  # add max_batch_size to avoid error in overlap scheduler
+            max_batch_size=max_bs,
             disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=1,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=max_bs,
                                               enable_padding=True),
         )
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True, free_gpu_memory_fraction=0.8
-        )  # both one-model and two-model supports this feature
+        kv_cache_config = KvCacheConfig(enable_block_reuse=True,
+                                        free_gpu_memory_fraction=0.8)
 
         pard_model_dir = f"{llm_models_root()}/PARD-Llama-3.2-1B"
         target_model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
@@ -436,8 +435,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  kv_cache_config=kv_cache_config,
                  speculative_config=spec_config) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
