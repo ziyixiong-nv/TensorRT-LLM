@@ -683,8 +683,9 @@ class PyTorchModelEngine(ModelEngine):
 
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-        token_num_upper_bound = min(self.max_num_tokens,
-                                    self.batch_size * (self.max_seq_len - 1))
+        token_num_upper_bound = min(
+            self.max_num_tokens,
+            self.batch_size * self._get_effective_max_seq_len())
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
@@ -818,8 +819,9 @@ class PyTorchModelEngine(ModelEngine):
         logger.info("Running autotuner warmup...")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-        token_num_upper_bound = min(self.max_num_tokens,
-                                    self.batch_size * (self.max_seq_len - 1))
+        token_num_upper_bound = min(
+            self.max_num_tokens,
+            self.batch_size * self._get_effective_max_seq_len())
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
@@ -1101,6 +1103,14 @@ class PyTorchModelEngine(ModelEngine):
             )
             return 0
 
+    def _get_effective_max_seq_len(self) -> int:
+        """Returns max per-request sequence length for warmup, accounting for
+        extra KV tokens from one-model speculative decoding and extra decoding
+        steps from fused drafting loops."""
+        num_extra_kv_tokens = get_num_extra_kv_tokens(self.spec_config)
+        num_extra_decoding_steps = self._get_num_extra_decoding_steps()
+        return self.max_seq_len - 1 - num_extra_decoding_steps - num_extra_kv_tokens
+
     def _create_warmup_request(
             self,
             resource_manager: ResourceManager,
@@ -1136,8 +1146,7 @@ class PyTorchModelEngine(ModelEngine):
         ctx_requests = []
         gen_requests = []
 
-        # For drafting loops, reduce max_seq_len to leave room for extra decoding steps
-        max_seq_len = self.max_seq_len - 1 - num_extra_decoding_steps
+        max_seq_len = self._get_effective_max_seq_len()
         if max_seq_len < 1:
             return None  # Not enough sequence length for drafting loop
         num_full_seqs = 0

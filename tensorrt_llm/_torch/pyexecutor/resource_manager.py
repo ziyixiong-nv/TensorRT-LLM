@@ -1769,8 +1769,14 @@ class KVCacheManagerV2(BaseResourceManager):
         (self.kv_cache_pool_pointers,
          self.kv_cache_pool_mapping) = self._build_pool_mapping_tensors()
 
+        # Account for extra tokens from speculative decoding that can push
+        # KV cache capacity beyond max_seq_len during warmup and normal
+        # operation (e.g. num_extra_kv_tokens from one-model draft tokens and
+        # max_total_draft_tokens from the drafting loop).
+        effective_max_capacity = (max_seq_len + self.num_extra_kv_tokens +
+                                  self.max_total_draft_tokens)
         # Pad max_blocks_per_seq to next multiple of 4 for copy_block_offsets kernel
-        self.max_blocks_per_seq = (max_seq_len + tokens_per_block -
+        self.max_blocks_per_seq = (effective_max_capacity + tokens_per_block -
                                    1) // tokens_per_block
         if self.max_blocks_per_seq % 4 != 0:
             self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
