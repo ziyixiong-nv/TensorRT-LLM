@@ -868,7 +868,6 @@ class DFlashForCausalLM(nn.Module):
         self._kv_size = 0
         self._head_dim = 0
         self._num_kv_heads = 0
-        self._rms_norm_eps = 1e-6
 
     def _init_rope(self):
         """Initialize RoPE from the draft model's attention configuration.
@@ -990,38 +989,35 @@ class DFlashForCausalLM(nn.Module):
         L = self._num_attn_layers
         nkv = self._num_kv_heads
         hd = self._head_dim
-        dtype = projected_hidden.dtype
-        if self._fused_kv_weight.dtype != dtype:
-            projected_hidden = projected_hidden.to(self._fused_kv_weight.dtype)
+        weight_dtype = self._fused_kv_weight.dtype
+        if projected_hidden.dtype != weight_dtype:
+            projected_hidden = projected_hidden.to(weight_dtype)
 
-        # Single fused GEMM for all layers.
         kv_flat = F.linear(projected_hidden, self._fused_kv_weight,
                            self._fused_kv_bias)
-        # Layout: [N, L, 2, kv_size]  — order is [L0_K | L0_V | L1_K | L1_V | ...]
+        # Weight rows are laid out per-layer as [L0_K | L0_V | L1_K | L1_V | ...],
+        # so this view keeps K and V in contiguous per-layer slabs after the
+        # `.select(2, ...)` splits below -- no extra copy required.
         kv = kv_flat.view(N, L, 2, nkv, hd)
         k = kv[:, :, 0].contiguous()  # [N, L, nkv, hd]
-        v = kv[:, :, 1].contiguous()  # [N, L, nkv, hd]
+        v = kv[:, :, 1].contiguous()
 
-        # Per-layer k_norm on the head_dim axis.
         if self._k_norm_weights:
             for i in range(L):
-                k_norm_mod = self.model.layers[i].self_attn.k_norm
-                # k[:, i] shape [N, nkv, hd]; k_norm operates over last dim
-                k[:, i] = k_norm_mod(k[:, i])
+                k[:, i] = self.model.layers[i].self_attn.k_norm(k[:, i])
 
-        # Fused RoPE across L layers: treat (N, L*nkv, hd) as one batch.
-        k_for_rope = k.view(N, L * nkv, hd)
-        pos_2d = positions.view(1, -1)
-        cos, sin = self._get_rope_cos_sin(pos_2d, dtype=k_for_rope.dtype)
-        cos = cos.squeeze(0)
-        sin = sin.squeeze(0)
-        k_roped = RotaryEmbedding.apply_rotary_pos_emb(k_for_rope,
-                                                       cos,
-                                                       sin,
-                                                       unsqueeze_dim=1,
-                                                       is_neox=self._is_neox)
-        k = k_roped.view(N, L, nkv, hd)
-        return k.to(dtype), v.to(dtype)
+        # One RoPE call for all layers: broadcast cos/sin [N, rot//2] across
+        # L*nkv via unsqueeze_dim=1.
+        cos, sin = self._get_rope_cos_sin(positions.view(1, -1),
+                                          dtype=weight_dtype)
+        k_roped = RotaryEmbedding.apply_rotary_pos_emb(
+            k.view(N, L * nkv, hd),
+            cos.squeeze(0),
+            sin.squeeze(0),
+            unsqueeze_dim=1,
+            is_neox=self._is_neox,
+        )
+        return k_roped.view(N, L, nkv, hd), v
 
     def _build_fused_kv_buffers(self) -> None:
         """Stack per-layer KV-projection weights and record per-layer k_norm
@@ -1062,8 +1058,6 @@ class DFlashForCausalLM(nn.Module):
         self._kv_size = kv_size
         self._head_dim = attn0.head_dim
         self._num_kv_heads = attn0.num_key_value_heads
-        self._rms_norm_eps = getattr(attn0.q_norm, 'variance_epsilon',
-                                     getattr(self.config, 'rms_norm_eps', 1e-6))
         for a in layers_attn[1:]:
             assert (a.kv_size == kv_size and a.head_dim == self._head_dim
                     and a.num_key_value_heads == self._num_kv_heads), (
