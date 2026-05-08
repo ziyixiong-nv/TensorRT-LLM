@@ -178,6 +178,11 @@ class DFlashWorker(SpecWorkerBase):
         self._batch_to_slot = None  # [max_batch] maps batch pos -> buffer slot
         self._max_ctx = 0
         self._proj_dim = 0
+        # Per-layer post-norm/post-rope K/V cache for context tokens; lets
+        # dflash_forward skip the per-layer kv_ctx projection.
+        self._ctx_k_buf = None  # [max_batch, L, max_ctx, nkv, hd]
+        self._ctx_v_buf = None  # [max_batch, L, max_ctx, nkv, hd]
+        self._ctx_kv_cached = False
 
         # Slot management (Python, updated in prepare() and eager mode)
         self._req_to_slot = {}  # request_id -> slot index
@@ -201,7 +206,14 @@ class DFlashWorker(SpecWorkerBase):
         return 2 * self.max_draft_len
 
     def _lazy_init_ctx_buffers(self, draft_model, spec_metadata):
-        """Initialize pre-allocated context buffers on first forward."""
+        """Initialize pre-allocated context buffers on first forward.
+
+        In addition to the original projected-hidden-state buffer `_ctx_buf`,
+        allocate per-layer post-norm/post-rope K/V buffers. Context K/V is
+        computed ONCE per new accepted token and cached here, so every
+        drafter layer just reads from these buffers during dflash_forward
+        instead of re-projecting the full target_hidden every iter.
+        """
         if self._ctx_buf_inited:
             return
 
@@ -231,11 +243,31 @@ class DFlashWorker(SpecWorkerBase):
 
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
+
+        # Per-layer post-norm/post-rope K/V cache. Requires the drafter to
+        # have built its fused KV projection weights.
+        if hasattr(draft_model, "_build_fused_kv_buffers"):
+            draft_model._build_fused_kv_buffers()
+            L = draft_model._num_attn_layers
+            nkv = draft_model._num_kv_heads
+            hd = draft_model._head_dim
+            self._ctx_k_buf = torch.zeros(
+                (max_batch, L, self._max_ctx, nkv, hd), dtype=dtype, device="cuda"
+            )
+            self._ctx_v_buf = torch.zeros(
+                (max_batch, L, self._max_ctx, nkv, hd), dtype=dtype, device="cuda"
+            )
+            self._ctx_kv_cached = True
+        else:
+            self._ctx_k_buf = None
+            self._ctx_v_buf = None
+            self._ctx_kv_cached = False
         self._ctx_buf_inited = True
 
         logger.info(
             f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
-            f"max_ctx={self._max_ctx}, proj_dim={self._proj_dim}, dtype={dtype}"
+            f"max_ctx={self._max_ctx}, proj_dim={self._proj_dim}, dtype={dtype}, "
+            f"ctx_kv_cache_enabled={self._ctx_kv_cached}"
         )
 
     def _prepare_attn_metadata_for_dflash(self, attn_metadata, spec_metadata):
@@ -343,9 +375,19 @@ class DFlashWorker(SpecWorkerBase):
             end = min(cur + slen, self._max_ctx)
             actual = end - cur
             if actual > 0:
-                self._ctx_buf[slot, cur:end] = chunk_proj[:actual].to(self._ctx_buf.dtype)
+                chunk_proj_cast = chunk_proj[:actual].to(self._ctx_buf.dtype)
+                self._ctx_buf[slot, cur:end] = chunk_proj_cast
                 self._ctx_pos_buf[slot, cur:end] = chunk_pos[:actual]
                 self._ctx_len[slot] = end
+                if self._ctx_kv_cached:
+                    # Precompute post-norm/post-RoPE K,V for this prefill
+                    # chunk so decode iters can read without re-projecting.
+                    chunk_k, chunk_v = draft_model.precompute_context_kv(
+                        chunk_proj_cast, chunk_pos[:actual]
+                    )
+                    # chunk_k/v: [actual, L, nkv, hd] → [L, actual, nkv, hd]
+                    self._ctx_k_buf[slot, :, cur:end] = chunk_k.permute(1, 0, 2, 3)
+                    self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
             offset += slen
 
     def forward(
@@ -458,13 +500,18 @@ class DFlashWorker(SpecWorkerBase):
 
         if num_gens > 0:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-                # Use custom dflash_forward with cross-attention
+                # Use custom dflash_forward with cross-attention.
+                # ctx_k_cache / ctx_v_cache (when populated) let the drafter
+                # skip per-layer context-KV projection/norm/rope entirely
+                # and just read from the persistent per-layer buffers.
                 hidden_states_out = draft_model.dflash_forward(
                     noise_embedding=inputs["noise_embedding"],
                     target_hidden=inputs["target_hidden"],
                     query_positions=inputs["query_positions"],
                     context_positions=inputs["context_positions"],
                     num_ctx_per_req=inputs["num_ctx_per_req"],
+                    ctx_k_cache=inputs.get("ctx_k_cache"),
+                    ctx_v_cache=inputs.get("ctx_v_cache"),
                 )
 
                 # Gather K logits per gen request from mask positions (1..K).
@@ -679,6 +726,21 @@ class DFlashWorker(SpecWorkerBase):
                 self._ctx_buf[slot_flat, col_flat] = proj_masked.to(self._ctx_buf.dtype)
                 self._ctx_pos_buf[slot_flat, col_flat] = pos_masked
 
+                if self._ctx_kv_cached:
+                    # Fused K/V projection + per-layer k_norm + RoPE for the
+                    # new K+1 accepted tokens, across all drafter layers.
+                    # Replaces per-layer re-projection inside dflash_forward.
+                    k_new, v_new = draft_model.precompute_context_kv(
+                        proj_flat.to(self._ctx_k_buf.dtype), pos_flat
+                    )
+                    mask_bc = mask_1d.view(-1, 1, 1, 1).to(k_new.dtype)
+                    k_new = k_new * mask_bc
+                    v_new = v_new * mask_bc
+                    slot_long = slot_flat.long()
+                    col_long = col_flat.long()
+                    self._ctx_k_buf[slot_long, :, col_long] = k_new
+                    self._ctx_v_buf[slot_long, :, col_long] = v_new
+
                 self._ctx_len[slots] += gen_num_accepted_long
                 self._ctx_len.clamp_(max=self._max_ctx)
 
@@ -686,6 +748,11 @@ class DFlashWorker(SpecWorkerBase):
             target_hidden = self._ctx_buf[slots]
             context_positions = self._ctx_pos_buf[slots].long()
             num_ctx_per_req_t = self._ctx_len[slots]
+            # Gather per-layer K/V cache for the drafter. Shape:
+            # [B, L, max_ctx, nkv, hd]. Used inside dflash_forward to skip
+            # per-layer kv_ctx recomputation.
+            ctx_k_cache_gathered = self._ctx_k_buf[slots] if self._ctx_kv_cached else None
+            ctx_v_cache_gathered = self._ctx_v_buf[slots] if self._ctx_kv_cached else None
 
             # 3D padded tensors for CUDA graph compatible dflash_forward
             noise_embedding = noise_embed_2d
@@ -702,6 +769,8 @@ class DFlashWorker(SpecWorkerBase):
             query_positions = torch.empty(0, 0, dtype=torch.long, device="cuda")
             context_positions = torch.empty(0, 0, dtype=torch.long, device="cuda")
             num_ctx_per_req_t = torch.empty(0, dtype=torch.long, device="cuda")
+            ctx_k_cache_gathered = None
+            ctx_v_cache_gathered = None
 
         return {
             "noise_embedding": noise_embedding,
@@ -709,4 +778,6 @@ class DFlashWorker(SpecWorkerBase):
             "query_positions": query_positions,
             "context_positions": context_positions,
             "num_ctx_per_req": num_ctx_per_req_t,
+            "ctx_k_cache": ctx_k_cache_gathered,
+            "ctx_v_cache": ctx_v_cache_gathered,
         }

@@ -3,6 +3,7 @@ from dataclasses import replace
 from typing import Dict, Generic, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
@@ -855,6 +856,20 @@ class DFlashForCausalLM(nn.Module):
         self._cache_seqlens = None
         self._block_offsets = None
 
+        # Fused per-layer KV projection buffers -- lazy-built after weights
+        # load. Lets DFlashWorker run the context KV projection across ALL
+        # drafter layers in one GEMM on just the newly accepted tokens, and
+        # cache the result persistently so subsequent iters don't re-project.
+        self._fused_kv_inited = False
+        self._fused_kv_weight = None  # [L*2*kv_size, hidden]
+        self._fused_kv_bias = None  # [L*2*kv_size] or None
+        self._k_norm_weights = None  # list of L tensors, each [head_dim]
+        self._num_attn_layers = 0
+        self._kv_size = 0
+        self._head_dim = 0
+        self._num_kv_heads = 0
+        self._rms_norm_eps = 1e-6
+
     def _init_rope(self):
         """Initialize RoPE from the draft model's attention configuration.
 
@@ -952,6 +967,113 @@ class DFlashForCausalLM(nn.Module):
         self.draft_model_full.lm_head = target_model.lm_head
         self.lm_head = target_model.lm_head
 
+    def precompute_context_kv(
+        self,
+        projected_hidden: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute post-norm / post-RoPE K and V for ALL drafter layers in
+        one fused GEMM. Called on the newly accepted (K+1) tokens each iter;
+        results are cached in DFlashWorker.ctx_k_buf / ctx_v_buf so that
+        dflash_forward no longer has to re-project the full target_hidden.
+
+        Args:
+            projected_hidden: [N, hidden_size], already fc + hidden_norm'd.
+            positions:        [N] int32/64, RoPE positions for each entry.
+        Returns:
+            k: [N, L, nkv, hd]  post k_norm and RoPE
+            v: [N, L, nkv, hd]  post split only (V doesn't get k_norm/RoPE)
+        """
+        if not self._fused_kv_inited:
+            self._build_fused_kv_buffers()
+        N = projected_hidden.shape[0]
+        L = self._num_attn_layers
+        nkv = self._num_kv_heads
+        hd = self._head_dim
+        dtype = projected_hidden.dtype
+        if self._fused_kv_weight.dtype != dtype:
+            projected_hidden = projected_hidden.to(self._fused_kv_weight.dtype)
+
+        # Single fused GEMM for all layers.
+        kv_flat = F.linear(projected_hidden, self._fused_kv_weight,
+                           self._fused_kv_bias)
+        # Layout: [N, L, 2, kv_size]  — order is [L0_K | L0_V | L1_K | L1_V | ...]
+        kv = kv_flat.view(N, L, 2, nkv, hd)
+        k = kv[:, :, 0].contiguous()  # [N, L, nkv, hd]
+        v = kv[:, :, 1].contiguous()  # [N, L, nkv, hd]
+
+        # Per-layer k_norm on the head_dim axis.
+        if self._k_norm_weights:
+            for i in range(L):
+                k_norm_mod = self.model.layers[i].self_attn.k_norm
+                # k[:, i] shape [N, nkv, hd]; k_norm operates over last dim
+                k[:, i] = k_norm_mod(k[:, i])
+
+        # Fused RoPE across L layers: treat (N, L*nkv, hd) as one batch.
+        k_for_rope = k.view(N, L * nkv, hd)
+        pos_2d = positions.view(1, -1)
+        cos, sin = self._get_rope_cos_sin(pos_2d, dtype=k_for_rope.dtype)
+        cos = cos.squeeze(0)
+        sin = sin.squeeze(0)
+        k_roped = RotaryEmbedding.apply_rotary_pos_emb(k_for_rope,
+                                                       cos,
+                                                       sin,
+                                                       unsqueeze_dim=1,
+                                                       is_neox=self._is_neox)
+        k = k_roped.view(N, L, nkv, hd)
+        return k.to(dtype), v.to(dtype)
+
+    def _build_fused_kv_buffers(self) -> None:
+        """Stack per-layer KV-projection weights and record per-layer k_norm
+        weights so DFlashWorker can run ONE fused GEMM for all layers and
+        cache the resulting K/V persistently across iters.
+
+        Inspired by vLLM's DFlash `_build_fused_kv_buffers`. Must be called
+        after weights are loaded (both draft-model layer weights and the
+        DFlash-specific `hidden_norm`).
+        """
+        if self._fused_kv_inited:
+            return
+        layers_attn = [layer.self_attn for layer in self.model.layers]
+        attn0 = layers_attn[0]
+        q_size = attn0.q_size
+        kv_size = attn0.kv_size
+        has_bias = attn0.qkv_proj.bias is not None
+
+        # Concat KV slices of each layer's fused qkv weight. Result:
+        # [L*2*kv_size, hidden_size], contiguous.
+        kv_weights = [
+            a.qkv_proj.weight[q_size:q_size + 2 * kv_size] for a in layers_attn
+        ]
+        self._fused_kv_weight = torch.cat(kv_weights, dim=0).contiguous()
+        if has_bias:
+            kv_biases = [
+                a.qkv_proj.bias[q_size:q_size + 2 * kv_size]
+                for a in layers_attn
+            ]
+            self._fused_kv_bias = torch.cat(kv_biases, dim=0).contiguous()
+        else:
+            self._fused_kv_bias = None
+
+        self._k_norm_weights = [
+            a.k_norm.weight.data for a in layers_attn if hasattr(a, 'k_norm')
+        ]
+        self._num_attn_layers = len(layers_attn)
+        self._kv_size = kv_size
+        self._head_dim = attn0.head_dim
+        self._num_kv_heads = attn0.num_key_value_heads
+        self._rms_norm_eps = getattr(attn0.q_norm, 'variance_epsilon',
+                                     getattr(self.config, 'rms_norm_eps', 1e-6))
+        for a in layers_attn[1:]:
+            assert (a.kv_size == kv_size and a.head_dim == self._head_dim
+                    and a.num_key_value_heads == self._num_kv_heads), (
+                        "DFlash fused KV requires all drafter layers to share "
+                        "kv_size / head_dim / num_kv_heads.")
+        self._fused_kv_inited = True
+        logger.info(
+            f"DFlash: fused KV weights built for {self._num_attn_layers} layers "
+            f"(fused_kv_weight shape={tuple(self._fused_kv_weight.shape)})")
+
     def _get_rope_cos_sin(self, positions, dtype=None):
         """Get cos/sin for given positions, suitable for apply_rotary_pos_emb.
 
@@ -981,6 +1103,8 @@ class DFlashForCausalLM(nn.Module):
         query_positions: torch.Tensor,
         context_positions: torch.Tensor,
         num_ctx_per_req: torch.Tensor,
+        ctx_k_cache: Optional[torch.Tensor] = None,
+        ctx_v_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Custom DFlash forward with batched cross-attention.
 
@@ -1053,12 +1177,16 @@ class DFlashForCausalLM(nn.Module):
         noise_scatter_idx = noise_pos.unsqueeze(-1).unsqueeze(-1).expand(
             -1, -1, num_kv_heads_per_rank, head_dim)
 
-        # Precompute RoPE cos/sin (positions are constant across layers)
+        # Precompute RoPE cos/sin for query tokens. Context K is already
+        # pre-roped in ctx_k_cache (if provided), so we only need ctx rope
+        # cos/sin when falling back to the recompute path.
         rope_dtype = hidden_states.dtype
         q_rope_cos, q_rope_sin = self._get_rope_cos_sin(query_positions,
                                                         dtype=rope_dtype)
-        ctx_rope_cos, ctx_rope_sin = self._get_rope_cos_sin(context_positions,
-                                                            dtype=rope_dtype)
+        use_ctx_cache = ctx_k_cache is not None and ctx_v_cache is not None
+        if not use_ctx_cache:
+            ctx_rope_cos, ctx_rope_sin = self._get_rope_cos_sin(
+                context_positions, dtype=rope_dtype)
         _rope = RotaryEmbedding.apply_rotary_pos_emb
 
         residual = None
@@ -1087,35 +1215,20 @@ class DFlashForCausalLM(nn.Module):
             k_noise_all = qkv_query[..., q_size:q_size + kv_size]
             v_noise_all = qkv_query[..., q_size + kv_size:]
 
-            # K/V from target_hidden (NO input_layernorm!)
-            # Combined K+V projection in a single GEMM for efficiency
-            qkv_weight = attn_mod.qkv_proj.weight
-            kv_weight = qkv_weight[q_size:]  # [2*kv_size, hidden]
-            qkv_bias = getattr(attn_mod.qkv_proj, 'bias', None)
-            kv_bias = qkv_bias[q_size:] if qkv_bias is not None else None
-
-            # Context K/V via single GEMM: [B*max_ctx, 2*kv_size]
-            th_flat = target_hidden.reshape(-1, target_hidden.shape[-1])
-            kv_ctx = F.linear(th_flat, kv_weight,
-                              kv_bias).reshape(B, max_ctx, 2 * kv_size)
-            k_ctx_all = kv_ctx[..., :kv_size]
-            v_ctx_all = kv_ctx[..., kv_size:]
-
-            # QK norm (only for architectures that use it, e.g. Qwen3)
+            # Query QK-norm (Q and k_noise). k_ctx skipped when ctx_k_cache
+            # is used (pre-norm'd at write time).
             if has_qk_norm:
                 q_for_rope = attn_mod.q_norm(q_all.reshape(
                     -1, head_dim)).reshape(B, block_size, q_size)
                 k_noise_for_rope = attn_mod.k_norm(
                     k_noise_all.reshape(-1, head_dim)).reshape(
                         B, block_size, kv_size)
-                k_ctx_for_rope = attn_mod.k_norm(k_ctx_all.reshape(
-                    -1, head_dim)).reshape(B, max_ctx, kv_size)
             else:
                 q_for_rope = q_all
                 k_noise_for_rope = k_noise_all
-                k_ctx_for_rope = k_ctx_all
 
-            # Apply RoPE using precomputed cos/sin
+            # RoPE for Q and k_noise. Context K is pre-roped upstream when
+            # ctx_k_cache is used.
             Q = _rope(q_for_rope.reshape(B, block_size, num_heads_per_rank,
                                          head_dim).transpose(1, 2),
                       q_rope_cos,
@@ -1129,23 +1242,44 @@ class DFlashForCausalLM(nn.Module):
                                  unsqueeze_dim=1,
                                  is_neox=self._is_neox)
 
-            k_ctx_rope = _rope(k_ctx_for_rope.reshape(B, max_ctx,
-                                                      num_kv_heads_per_rank,
-                                                      head_dim).transpose(1, 2),
-                               ctx_rope_cos,
-                               ctx_rope_sin,
-                               unsqueeze_dim=1,
-                               is_neox=self._is_neox)
+            if use_ctx_cache:
+                # Fill ctx K/V from the persistent per-layer cache. All the
+                # expensive work (GEMM + k_norm + RoPE) was done once in
+                # DFlashWorker when the context was written.
+                self._kv_buf_k[:B, :max_ctx] = ctx_k_cache[:, layer_idx]
+                self._kv_buf_v[:B, :max_ctx] = ctx_v_cache[:, layer_idx]
+            else:
+                # Fallback: per-layer kv_ctx projection (original path).
+                qkv_weight = attn_mod.qkv_proj.weight
+                kv_weight = qkv_weight[q_size:]
+                qkv_bias = getattr(attn_mod.qkv_proj, 'bias', None)
+                kv_bias = qkv_bias[q_size:] if qkv_bias is not None else None
+                th_flat = target_hidden.reshape(-1, target_hidden.shape[-1])
+                kv_ctx = F.linear(th_flat, kv_weight,
+                                  kv_bias).reshape(B, max_ctx, 2 * kv_size)
+                k_ctx_all = kv_ctx[..., :kv_size]
+                v_ctx_all = kv_ctx[..., kv_size:]
+                if has_qk_norm:
+                    k_ctx_for_rope = attn_mod.k_norm(
+                        k_ctx_all.reshape(-1, head_dim)).reshape(
+                            B, max_ctx, kv_size)
+                else:
+                    k_ctx_for_rope = k_ctx_all
+                k_ctx_rope = _rope(k_ctx_for_rope.reshape(
+                    B, max_ctx, num_kv_heads_per_rank,
+                    head_dim).transpose(1, 2),
+                                   ctx_rope_cos,
+                                   ctx_rope_sin,
+                                   unsqueeze_dim=1,
+                                   is_neox=self._is_neox)
+                self._kv_buf_k[:B, :max_ctx] = k_ctx_rope.transpose(1, 2)
+                self._kv_buf_v[:B, :max_ctx] = v_ctx_all.reshape(
+                    B, max_ctx, num_kv_heads_per_rank, head_dim)
 
-            # Fill KV buffer: [B, seq, nkv, hd] layout for flash_attn.
-            # Context fills [0, max_ctx), noise is scattered right after
-            # each request's valid context via noise_scatter_idx so
-            # cache_seqlens covers [valid_ctx | noise] contiguously.
-            self._kv_buf_k[:B, :max_ctx] = k_ctx_rope.transpose(1, 2)
+            # Scatter noise K/V right after each request's valid context
+            # (common to both paths).
             self._kv_buf_k[:B].scatter_(1, noise_scatter_idx,
                                         k_noise_rope.transpose(1, 2))
-            self._kv_buf_v[:B, :max_ctx] = v_ctx_all.reshape(
-                B, max_ctx, num_kv_heads_per_rank, head_dim)
             self._kv_buf_v[:B].scatter_(
                 1, noise_scatter_idx,
                 v_noise_all.reshape(B, block_size, num_kv_heads_per_rank,
