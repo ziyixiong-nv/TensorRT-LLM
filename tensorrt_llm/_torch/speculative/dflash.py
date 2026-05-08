@@ -245,22 +245,28 @@ class DFlashWorker(SpecWorkerBase):
         self._req_to_slot = {}
 
         # Per-layer post-norm/post-rope K/V cache. Requires the drafter to
-        # have built its fused KV projection weights.
+        # have built its fused KV projection weights. Allocate extra
+        # block_size slots at the end so per-iter noise K/V can be scattered
+        # directly into the gathered view and flash_attn reads it in-place,
+        # avoiding a per-layer dense copy of max_ctx rows into _kv_buf_k.
         if hasattr(draft_model, "_build_fused_kv_buffers"):
             draft_model._build_fused_kv_buffers()
             L = draft_model._num_attn_layers
             nkv = draft_model._num_kv_heads
             hd = draft_model._head_dim
+            block_size = getattr(draft_model, "block_size", None) or (self.max_draft_len + 1)
+            self._ctx_buf_seq = self._max_ctx + block_size
             self._ctx_k_buf = torch.zeros(
-                (max_batch, L, self._max_ctx, nkv, hd), dtype=dtype, device="cuda"
+                (max_batch, L, self._ctx_buf_seq, nkv, hd), dtype=dtype, device="cuda"
             )
             self._ctx_v_buf = torch.zeros(
-                (max_batch, L, self._max_ctx, nkv, hd), dtype=dtype, device="cuda"
+                (max_batch, L, self._ctx_buf_seq, nkv, hd), dtype=dtype, device="cuda"
             )
             self._ctx_kv_cached = True
         else:
             self._ctx_k_buf = None
             self._ctx_v_buf = None
+            self._ctx_buf_seq = self._max_ctx
             self._ctx_kv_cached = False
         self._ctx_buf_inited = True
 

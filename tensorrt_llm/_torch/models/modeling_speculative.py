@@ -1243,11 +1243,14 @@ class DFlashForCausalLM(nn.Module):
                                  is_neox=self._is_neox)
 
             if use_ctx_cache:
-                # Fill ctx K/V from the persistent per-layer cache. All the
-                # expensive work (GEMM + k_norm + RoPE) was done once in
-                # DFlashWorker when the context was written.
-                self._kv_buf_k[:B, :max_ctx] = ctx_k_cache[:, layer_idx]
-                self._kv_buf_v[:B, :max_ctx] = ctx_v_cache[:, layer_idx]
+                # Use the gathered ctx cache view DIRECTLY as flash_attn's
+                # k_cache/v_cache. The ctx_k_cache/ctx_v_cache tensors have
+                # trailing block_size slots reserved for noise; we scatter
+                # noise into the view and flash_attn reads [ctx | noise]
+                # in place. Skips the per-layer dense copy into _kv_buf_k/v
+                # that used to run every layer.
+                layer_k_cache = ctx_k_cache[:, layer_idx]
+                layer_v_cache = ctx_v_cache[:, layer_idx]
             else:
                 # Fallback: per-layer kv_ctx projection (original path).
                 qkv_weight = attn_mod.qkv_proj.weight
@@ -1275,12 +1278,14 @@ class DFlashForCausalLM(nn.Module):
                 self._kv_buf_k[:B, :max_ctx] = k_ctx_rope.transpose(1, 2)
                 self._kv_buf_v[:B, :max_ctx] = v_ctx_all.reshape(
                     B, max_ctx, num_kv_heads_per_rank, head_dim)
+                layer_k_cache = self._kv_buf_k[:B]
+                layer_v_cache = self._kv_buf_v[:B]
 
             # Scatter noise K/V right after each request's valid context
             # (common to both paths).
-            self._kv_buf_k[:B].scatter_(1, noise_scatter_idx,
-                                        k_noise_rope.transpose(1, 2))
-            self._kv_buf_v[:B].scatter_(
+            layer_k_cache.scatter_(1, noise_scatter_idx,
+                                   k_noise_rope.transpose(1, 2))
+            layer_v_cache.scatter_(
                 1, noise_scatter_idx,
                 v_noise_all.reshape(B, block_size, num_kv_heads_per_rank,
                                     head_dim))
@@ -1291,8 +1296,8 @@ class DFlashForCausalLM(nn.Module):
             from flash_attn import flash_attn_with_kvcache
             out = flash_attn_with_kvcache(
                 q=Q_bshd,
-                k_cache=self._kv_buf_k[:B],
-                v_cache=self._kv_buf_v[:B],
+                k_cache=layer_k_cache,
+                v_cache=layer_v_cache,
                 cache_seqlens=self._cache_seqlens[:B],
                 causal=False,
             )
