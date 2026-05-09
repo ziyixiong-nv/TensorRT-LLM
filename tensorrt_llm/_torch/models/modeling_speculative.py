@@ -1029,7 +1029,8 @@ class DFlashForCausalLM(nn.Module):
 
         has_k_norm = [hasattr(a, 'k_norm') for a in layers_attn]
         assert all(has_k_norm) or not any(has_k_norm), (
-            "DFlash fused KV requires either all or no drafter layers to have k_norm.")
+            "DFlash fused KV requires either all or no drafter layers to have k_norm."
+        )
 
         kv_weights = [
             a.qkv_proj.weight[q_size:q_size + 2 * kv_size] for a in layers_attn
@@ -1044,9 +1045,8 @@ class DFlashForCausalLM(nn.Module):
         else:
             self._fused_kv_bias = None
 
-        self._k_norm_weights = (
-            [a.k_norm.weight.data for a in layers_attn] if all(has_k_norm) else None
-        )
+        self._k_norm_weights = ([a.k_norm.weight.data for a in layers_attn]
+                                if all(has_k_norm) else None)
         self._num_attn_layers = len(layers_attn)
         self._head_dim = head_dim
         self._num_kv_heads = num_kv_heads

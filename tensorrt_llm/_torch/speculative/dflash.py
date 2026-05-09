@@ -362,7 +362,7 @@ class DFlashWorker(SpecWorkerBase):
                 self._ctx_buf[slot, cur:end] = chunk_proj_cast
                 self._ctx_pos_buf[slot, cur:end] = chunk_pos[:actual]
                 self._ctx_len[slot] = end
-                if (self._ctx_k_buf is not None):
+                if self._ctx_k_buf is not None:
                     # Precompute post-norm/post-RoPE K,V for this prefill
                     # chunk so decode iters can read without re-projecting.
                     chunk_k, chunk_v = draft_model.precompute_context_kv(
@@ -709,7 +709,7 @@ class DFlashWorker(SpecWorkerBase):
                 self._ctx_buf[slot_flat, col_flat] = proj_masked.to(self._ctx_buf.dtype)
                 self._ctx_pos_buf[slot_flat, col_flat] = pos_masked
 
-                if (self._ctx_k_buf is not None):
+                if self._ctx_k_buf is not None:
                     # Fused K/V projection + per-layer k_norm + RoPE for the
                     # new K+1 accepted tokens, across all drafter layers.
                     # Replaces per-layer re-projection inside dflash_forward.
