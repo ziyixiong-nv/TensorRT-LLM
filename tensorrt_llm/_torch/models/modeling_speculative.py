@@ -856,16 +856,11 @@ class DFlashForCausalLM(nn.Module):
         self._cache_seqlens = None
         self._block_offsets = None
 
-        # Fused per-layer KV projection buffers -- lazy-built after weights
-        # load. Lets DFlashWorker run the context KV projection across ALL
-        # drafter layers in one GEMM on just the newly accepted tokens, and
-        # cache the result persistently so subsequent iters don't re-project.
-        self._fused_kv_inited = False
+        # Lazy-built after weights load (see _build_fused_kv_buffers).
         self._fused_kv_weight = None  # [L*2*kv_size, hidden]
         self._fused_kv_bias = None  # [L*2*kv_size] or None
         self._k_norm_weights = None  # list of L tensors, each [head_dim]
         self._num_attn_layers = 0
-        self._kv_size = 0
         self._head_dim = 0
         self._num_kv_heads = 0
 
@@ -971,19 +966,16 @@ class DFlashForCausalLM(nn.Module):
         projected_hidden: torch.Tensor,
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute post-norm / post-RoPE K and V for ALL drafter layers in
-        one fused GEMM. Called on the newly accepted (K+1) tokens each iter;
-        results are cached in DFlashWorker.ctx_k_buf / ctx_v_buf so that
-        dflash_forward no longer has to re-project the full target_hidden.
+        """Post-norm / post-RoPE K and V for ALL drafter layers in one fused GEMM.
 
         Args:
             projected_hidden: [N, hidden_size], already fc + hidden_norm'd.
             positions:        [N] int32/64, RoPE positions for each entry.
         Returns:
             k: [N, L, nkv, hd]  post k_norm and RoPE
-            v: [N, L, nkv, hd]  post split only (V doesn't get k_norm/RoPE)
+            v: [N, L, nkv, hd]  post split only
         """
-        if not self._fused_kv_inited:
+        if self._fused_kv_weight is None:
             self._build_fused_kv_buffers()
         N = projected_hidden.shape[0]
         L = self._num_attn_layers
@@ -995,19 +987,16 @@ class DFlashForCausalLM(nn.Module):
 
         kv_flat = F.linear(projected_hidden, self._fused_kv_weight,
                            self._fused_kv_bias)
-        # Weight rows are laid out per-layer as [L0_K | L0_V | L1_K | L1_V | ...],
-        # so this view keeps K and V in contiguous per-layer slabs after the
-        # `.select(2, ...)` splits below -- no extra copy required.
+        # Per-layer layout [L0_K|L0_V|L1_K|L1_V|...] keeps K and V contiguous
+        # after the select() splits — no extra copy required.
         kv = kv_flat.view(N, L, 2, nkv, hd)
-        k = kv[:, :, 0].contiguous()  # [N, L, nkv, hd]
-        v = kv[:, :, 1].contiguous()
+        k = kv[:, :, 0].contiguous()
+        v = kv[:, :, 1]
 
         if self._k_norm_weights:
             for i in range(L):
                 k[:, i] = self.model.layers[i].self_attn.k_norm(k[:, i])
 
-        # One RoPE call for all layers: broadcast cos/sin [N, rot//2] across
-        # L*nkv via unsqueeze_dim=1.
         cos, sin = self._get_rope_cos_sin(positions.view(1, -1),
                                           dtype=weight_dtype)
         k_roped = RotaryEmbedding.apply_rotary_pos_emb(
@@ -1020,29 +1009,33 @@ class DFlashForCausalLM(nn.Module):
         return k_roped.view(N, L, nkv, hd), v
 
     def _build_fused_kv_buffers(self) -> None:
-        """Stack per-layer KV-projection weights and record per-layer k_norm
-        weights so DFlashWorker can run ONE fused GEMM for all layers and
-        cache the resulting K/V persistently across iters.
+        """Stack per-layer KV projection + k_norm weights for a single fused GEMM.
 
-        Inspired by vLLM's DFlash `_build_fused_kv_buffers`. Must be called
-        after weights are loaded (both draft-model layer weights and the
-        DFlash-specific `hidden_norm`).
+        Must run after weights are loaded.
         """
-        if self._fused_kv_inited:
+        if self._fused_kv_weight is not None:
             return
         layers_attn = [layer.self_attn for layer in self.model.layers]
         attn0 = layers_attn[0]
         q_size = attn0.q_size
         kv_size = attn0.kv_size
-        has_bias = attn0.qkv_proj.bias is not None
+        head_dim = attn0.head_dim
+        num_kv_heads = attn0.num_key_value_heads
+        for a in layers_attn[1:]:
+            assert (a.kv_size == kv_size and a.head_dim == head_dim
+                    and a.num_key_value_heads == num_kv_heads), (
+                        "DFlash fused KV requires all drafter layers to share "
+                        "kv_size / head_dim / num_kv_heads.")
 
-        # Concat KV slices of each layer's fused qkv weight. Result:
-        # [L*2*kv_size, hidden_size], contiguous.
+        has_k_norm = [hasattr(a, 'k_norm') for a in layers_attn]
+        assert all(has_k_norm) or not any(has_k_norm), (
+            "DFlash fused KV requires either all or no drafter layers to have k_norm.")
+
         kv_weights = [
             a.qkv_proj.weight[q_size:q_size + 2 * kv_size] for a in layers_attn
         ]
-        self._fused_kv_weight = torch.cat(kv_weights, dim=0).contiguous()
-        if has_bias:
+        fused_kv_weight = torch.cat(kv_weights, dim=0).contiguous()
+        if attn0.qkv_proj.bias is not None:
             kv_biases = [
                 a.qkv_proj.bias[q_size:q_size + 2 * kv_size]
                 for a in layers_attn
@@ -1051,20 +1044,14 @@ class DFlashForCausalLM(nn.Module):
         else:
             self._fused_kv_bias = None
 
-        self._k_norm_weights = [
-            a.k_norm.weight.data for a in layers_attn if hasattr(a, 'k_norm')
-        ]
+        self._k_norm_weights = (
+            [a.k_norm.weight.data for a in layers_attn] if all(has_k_norm) else None
+        )
         self._num_attn_layers = len(layers_attn)
-        self._kv_size = kv_size
-        self._head_dim = attn0.head_dim
-        self._num_kv_heads = attn0.num_key_value_heads
-        for a in layers_attn[1:]:
-            assert (a.kv_size == kv_size and a.head_dim == self._head_dim
-                    and a.num_key_value_heads == self._num_kv_heads), (
-                        "DFlash fused KV requires all drafter layers to share "
-                        "kv_size / head_dim / num_kv_heads.")
-        self._fused_kv_inited = True
-        logger.info(
+        self._head_dim = head_dim
+        self._num_kv_heads = num_kv_heads
+        self._fused_kv_weight = fused_kv_weight
+        logger.debug(
             f"DFlash: fused KV weights built for {self._num_attn_layers} layers "
             f"(fused_kv_weight shape={tuple(self._fused_kv_weight.shape)})")
 
