@@ -22,6 +22,12 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
+
+try:
+    from ..custom_ops import \
+        flashinfer_apply_rope_with_cos_sin_cache_inplace as _flashinfer_rope
+except ImportError:
+    _flashinfer_rope = None
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
@@ -1033,17 +1039,11 @@ class DFlashForCausalLM(nn.Module):
         Layout of k_flat: row (i*L + l) holds layer l of position i, so
         positions must be repeat_interleaved by L to match.
         """
-        try:
-            from ..custom_ops import \
-                flashinfer_apply_rope_with_cos_sin_cache_inplace
-        except ImportError:
-            flashinfer_apply_rope_with_cos_sin_cache_inplace = None
-
         positions_int32 = positions.view(-1).to(torch.int32)
         if L > 1:
             positions_int32 = positions_int32.repeat_interleave(L)
 
-        if flashinfer_apply_rope_with_cos_sin_cache_inplace is not None:
+        if _flashinfer_rope is not None:
             # flashinfer requires a non-None query tensor; pass a single-head
             # scratch so the extra rotate is negligible.
             need_rows = k_flat.shape[0]
@@ -1052,7 +1052,7 @@ class DFlashForCausalLM(nn.Module):
                     or dummy_q.shape[0] < need_rows):
                 dummy_q = k_flat.new_empty(need_rows, self._head_dim)
                 self._rope_dummy_q = dummy_q
-            flashinfer_apply_rope_with_cos_sin_cache_inplace(
+            _flashinfer_rope(
                 positions_int32,
                 dummy_q[:need_rows],
                 k_flat,
@@ -1190,12 +1190,7 @@ class DFlashForCausalLM(nn.Module):
         # fused_qk_norm_rope / apply_rotary_pos_emb derive YaRN (or other
         # scaled) frequencies on their own, and a mismatch against the cached
         # cos/sin breaks context-vs-query attention and collapses acceptance.
-        try:
-            from ..custom_ops import \
-                flashinfer_apply_rope_with_cos_sin_cache_inplace as _fi_rope
-        except ImportError:
-            _fi_rope = None
-        use_fused_rope = (_fi_rope is not None
+        use_fused_rope = (_flashinfer_rope is not None and has_qk_norm
                           and noise_embedding.dtype == torch.bfloat16)
 
         B = noise_embedding.shape[0]
@@ -1267,36 +1262,28 @@ class DFlashForCausalLM(nn.Module):
             qkv_query = attn_mod.qkv_proj(hs_normed_flat)  # [B*blk, qkv_size]
 
             if use_fused_rope:
-                # q_norm / k_norm via tekit's fused RMSNorm (returns a new
-                # contiguous tensor), then flashinfer in-place RoPE sharing the
-                # same cos/sin cache as precompute_context_kv.
-                q_all_2d = qkv_query[:, :q_size].reshape(-1, head_dim)
-                k_noise_2d = qkv_query[:, q_size:q_size + kv_size].reshape(
-                    -1, head_dim)
-                v_noise_2d = qkv_query[:, q_size + kv_size:]
-                if has_qk_norm:
-                    q_all_2d = attn_mod.q_norm(q_all_2d)
-                    k_noise_2d = attn_mod.k_norm(k_noise_2d)
-                else:
-                    q_all_2d = q_all_2d.contiguous()
-                    k_noise_2d = k_noise_2d.contiguous()
-                q_all_2d = q_all_2d.reshape(B * block_size, q_size)
-                k_noise_2d = k_noise_2d.reshape(B * block_size, kv_size)
-                _fi_rope(
+                # Per-head RMSNorm on q/k (returns new contiguous tensors),
+                # then flashinfer in-place RoPE sharing the same cos/sin cache
+                # as precompute_context_kv.
+                q = attn_mod.q_norm(qkv_query[:, :q_size].reshape(
+                    -1, head_dim)).view(-1, q_size)
+                k = attn_mod.k_norm(qkv_query[:,
+                                              q_size:q_size + kv_size].reshape(
+                                                  -1,
+                                                  head_dim)).view(-1, kv_size)
+                _flashinfer_rope(
                     query_positions_flat_i32,
-                    q_all_2d,
-                    k_noise_2d,
+                    q,
+                    k,
                     head_dim,
                     self._get_cos_sin_cache(),
                     self._is_neox,
                 )
-                Q_bshd = q_all_2d.view(B, block_size, num_heads_per_rank,
-                                       head_dim)
-                k_noise_bshd = k_noise_2d.view(B, block_size,
-                                               num_kv_heads_per_rank, head_dim)
-                v_noise_bshd = v_noise_2d.reshape(B, block_size,
-                                                  num_kv_heads_per_rank,
-                                                  head_dim)
+                Q_bshd = q.view(B, block_size, num_heads_per_rank, head_dim)
+                k_noise_bshd = k.view(B, block_size, num_kv_heads_per_rank,
+                                      head_dim)
+                v_noise_bshd = qkv_query[:, q_size + kv_size:].reshape(
+                    B, block_size, num_kv_heads_per_rank, head_dim)
             else:
                 qkv_query_3d = qkv_query.reshape(B, block_size, -1)
                 q_all = qkv_query_3d[..., :q_size]
