@@ -1185,14 +1185,18 @@ class DFlashForCausalLM(nn.Module):
         num_heads_per_rank = attn0.num_heads
         num_kv_heads_per_rank = attn0.num_key_value_heads
         has_qk_norm = hasattr(attn0, 'q_norm') and hasattr(attn0, 'k_norm')
-        # Use the C++ fused_qk_norm_rope kernel when available — handles
-        # q_norm + k_norm + RoPE in a single in-place CUDA kernel. Only
-        # valid on bf16 qkv and when the drafter has qk-norm.
-        use_fused_qk_norm_rope = (has_qk_norm
-                                  and hasattr(attn0, 'apply_qk_norm_rope')
-                                  and getattr(attn0, 'pos_embd_params',
-                                              None) is not None
-                                  and noise_embedding.dtype == torch.bfloat16)
+        # Apply RoPE via the same flashinfer in-place kernel + cos/sin cache
+        # that precompute_context_kv uses. Sharing the cache is critical —
+        # fused_qk_norm_rope / apply_rotary_pos_emb derive YaRN (or other
+        # scaled) frequencies on their own, and a mismatch against the cached
+        # cos/sin breaks context-vs-query attention and collapses acceptance.
+        try:
+            from ..custom_ops import \
+                flashinfer_apply_rope_with_cos_sin_cache_inplace as _fi_rope
+        except ImportError:
+            _fi_rope = None
+        use_fused_rope = (_fi_rope is not None
+                          and noise_embedding.dtype == torch.bfloat16)
 
         B = noise_embedding.shape[0]
         block_size = noise_embedding.shape[1]
@@ -1202,11 +1206,10 @@ class DFlashForCausalLM(nn.Module):
 
         use_ctx_cache = ctx_k_cache is not None and ctx_v_cache is not None
 
-        # Precompute RoPE cos/sin for query tokens (used only when the
-        # fused_qk_norm_rope kernel is not available, and for the legacy
-        # fallback path). flashinfer RoPE requires int32 positions.
+        # Precompute RoPE cos/sin for the pure-PyTorch fallback path only.
+        # The fused flashinfer path reads self._get_cos_sin_cache() inline.
         rope_dtype = hidden_states.dtype
-        if not use_fused_qk_norm_rope:
+        if not use_fused_rope:
             q_rope_cos, q_rope_sin = self._get_rope_cos_sin(query_positions,
                                                             dtype=rope_dtype)
         if not use_ctx_cache:
@@ -1263,19 +1266,34 @@ class DFlashForCausalLM(nn.Module):
             # QKV projection on normed query tokens (2D)
             qkv_query = attn_mod.qkv_proj(hs_normed_flat)  # [B*blk, qkv_size]
 
-            # Fused q_norm + k_norm + RoPE in one CUDA kernel (mutates qkv).
-            if use_fused_qk_norm_rope:
-                attn_mod.apply_qk_norm_rope(qkv_query, query_positions_flat_i32)
-                # Slices of qkv_query are non-contiguous in the last dim, so
-                # use reshape (may copy) instead of view.
-                q_all_2d = qkv_query[:, :q_size]
-                k_noise_2d = qkv_query[:, q_size:q_size + kv_size]
+            if use_fused_rope:
+                # q_norm / k_norm via tekit's fused RMSNorm (returns a new
+                # contiguous tensor), then flashinfer in-place RoPE sharing the
+                # same cos/sin cache as precompute_context_kv.
+                q_all_2d = qkv_query[:, :q_size].reshape(-1, head_dim)
+                k_noise_2d = qkv_query[:, q_size:q_size + kv_size].reshape(
+                    -1, head_dim)
                 v_noise_2d = qkv_query[:, q_size + kv_size:]
-                Q_bshd = q_all_2d.reshape(B, block_size, num_heads_per_rank,
-                                          head_dim)
-                k_noise_bshd = k_noise_2d.reshape(B, block_size,
-                                                  num_kv_heads_per_rank,
-                                                  head_dim)
+                if has_qk_norm:
+                    q_all_2d = attn_mod.q_norm(q_all_2d)
+                    k_noise_2d = attn_mod.k_norm(k_noise_2d)
+                else:
+                    q_all_2d = q_all_2d.contiguous()
+                    k_noise_2d = k_noise_2d.contiguous()
+                q_all_2d = q_all_2d.reshape(B * block_size, q_size)
+                k_noise_2d = k_noise_2d.reshape(B * block_size, kv_size)
+                _fi_rope(
+                    query_positions_flat_i32,
+                    q_all_2d,
+                    k_noise_2d,
+                    head_dim,
+                    self._get_cos_sin_cache(),
+                    self._is_neox,
+                )
+                Q_bshd = q_all_2d.view(B, block_size, num_heads_per_rank,
+                                       head_dim)
+                k_noise_bshd = k_noise_2d.view(B, block_size,
+                                               num_kv_heads_per_rank, head_dim)
                 v_noise_bshd = v_noise_2d.reshape(B, block_size,
                                                   num_kv_heads_per_rank,
                                                   head_dim)
