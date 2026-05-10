@@ -156,8 +156,7 @@ class DFlashSpecMetadata(SpecMetadata):
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
-                    worker._ctx_len[slot] = 0
-                    worker._free_slots.append(slot)
+                    worker._release_slot(slot)
 
             # Default to slot 0 for unknown request IDs (e.g. during warmup
             # where synthetic requests may not have assigned slots).
@@ -228,18 +227,32 @@ class DFlashWorker(SpecWorkerBase):
         # Replaces per-request Python dicts with fixed-size CUDA buffers
         # indexed by slot, enabling CUDA graph compatibility.
         self._ctx_buf_inited = False
-        self._ctx_buf = None  # [max_batch, max_ctx, proj_dim]
+        self._ctx_buf = None  # [max_batch, max_ctx, proj_dim] (fallback path)
         self._ctx_pos_buf = None
         self._ctx_len = None
         self._batch_to_slot = None
         self._max_ctx = 0
         self._proj_dim = 0
-        self._ctx_k_buf = None  # [max_batch, L, max_ctx+block, nkv, hd]
-        self._ctx_v_buf = None
+
+        # Paged per-layer K/V pool (fast path).
+        # Layout [L, num_blocks, page_block_size, nkv, hd]: per-layer view is
+        # contiguous so flash_attn_with_kvcache's block_table mode can read
+        # each layer directly without a gather. num_blocks defaults to
+        # max_batch * max_blocks_per_req (same total capacity as the old
+        # dense [max_batch, L, max_ctx+block, nkv, hd] layout); users can
+        # tune spec_config.ctx_kv_cache_num_blocks lower to trade capacity
+        # for memory.
+        self._ctx_k_pool = None
+        self._ctx_v_pool = None
+        self._slot_block_table = None  # [max_batch, max_blocks_per_req] int32
+        self._page_block_size = 0
+        self._max_blocks_per_req = 0
 
         # Slot management (Python, updated in prepare() and eager mode)
         self._req_to_slot = {}  # request_id -> slot index
         self._free_slots = deque()  # available slot indices
+        self._free_block_ids = deque()  # available block ids (paged pool)
+        self._slot_blocks = {}  # slot_id -> list[int] of blocks owned
 
         logger.info(
             f"DFlashWorker initialized with use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
@@ -289,25 +302,110 @@ class DFlashWorker(SpecWorkerBase):
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
 
-        # +block_size slack lets per-iter noise K/V scatter into the
-        # gathered view and flash_attn read it in place, avoiding a
-        # per-layer dense copy of the whole ctx into _kv_buf_k.
         if hasattr(draft_model, "_build_fused_kv_buffers"):
             draft_model._build_fused_kv_buffers()
             L = draft_model._num_attn_layers
             nkv = draft_model._num_kv_heads
             hd = draft_model._head_dim
-            block_size = getattr(draft_model, "block_size", None) or (self.max_draft_len + 1)
-            kv_shape = (max_batch, L, self._max_ctx + block_size, nkv, hd)
-            self._ctx_k_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
-            self._ctx_v_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
+            model_block_size = getattr(draft_model, "block_size", None) or (self.max_draft_len + 1)
+
+            # Paged pool geometry. flash_attn_with_kvcache requires the page
+            # block size to be a multiple of 256.
+            page_block = getattr(self.spec_config, "ctx_kv_cache_page_block_size", 256)
+            assert page_block % 256 == 0, (
+                "ctx_kv_cache_page_block_size must be a multiple of 256 "
+                "(flash_attn_with_kvcache requirement)."
+            )
+            per_req_capacity = self._max_ctx + model_block_size
+            max_blocks_per_req = (per_req_capacity + page_block - 1) // page_block
+            default_num_blocks = max_batch * max_blocks_per_req
+            num_blocks = getattr(self.spec_config, "ctx_kv_cache_num_blocks", default_num_blocks)
+            assert num_blocks >= max_blocks_per_req, (
+                f"ctx_kv_cache_num_blocks={num_blocks} is too small to hold one "
+                f"request's max context (needs {max_blocks_per_req} blocks)."
+            )
+
+            self._page_block_size = page_block
+            self._max_blocks_per_req = max_blocks_per_req
+            pool_shape = (L, num_blocks, page_block, nkv, hd)
+            self._ctx_k_pool = torch.zeros(pool_shape, dtype=dtype, device="cuda")
+            self._ctx_v_pool = torch.zeros(pool_shape, dtype=dtype, device="cuda")
+            self._slot_block_table = torch.zeros(
+                (max_batch, max_blocks_per_req), dtype=torch.int32, device="cuda"
+            )
+            self._free_block_ids = deque(range(num_blocks))
+            self._slot_blocks = {}
+            logger.info(
+                f"DFlash: paged ctx pool: L={L}, num_blocks={num_blocks}, "
+                f"page_block={page_block}, nkv={nkv}, hd={hd}, dtype={dtype}, "
+                f"max_blocks_per_req={max_blocks_per_req}"
+            )
         self._ctx_buf_inited = True
 
         logger.info(
             f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
             f"max_ctx={self._max_ctx}, proj_dim={self._proj_dim}, dtype={dtype}, "
-            f"ctx_kv_cache_enabled={self._ctx_k_buf is not None}"
+            f"ctx_kv_cache_enabled={self._ctx_k_pool is not None}"
         )
+
+    def _assign_slot(self, req_id: int) -> int:
+        """Pop a free slot + reserve its page blocks. Python-only, called on
+        prefill only (rare), never inside the hot draft forward."""
+        slot = self._free_slots.popleft()
+        self._req_to_slot[req_id] = slot
+        if self._ctx_k_pool is not None:
+            if len(self._free_block_ids) < self._max_blocks_per_req:
+                raise RuntimeError(
+                    f"DFlash paged ctx pool exhausted: need "
+                    f"{self._max_blocks_per_req} blocks for a new slot but "
+                    f"only {len(self._free_block_ids)} free. Raise "
+                    f"spec_config.ctx_kv_cache_num_blocks."
+                )
+            blocks = [self._free_block_ids.popleft() for _ in range(self._max_blocks_per_req)]
+            self._slot_blocks[slot] = blocks
+            self._slot_block_table[slot].copy_(
+                torch.tensor(blocks, dtype=torch.int32), non_blocking=True
+            )
+        return slot
+
+    def _release_slot(self, slot: int) -> None:
+        """Return a slot's blocks to the free pool."""
+        self._ctx_len[slot] = 0
+        self._free_slots.append(slot)
+        if self._ctx_k_pool is not None:
+            for bid in self._slot_blocks.pop(slot, ()):
+                self._free_block_ids.append(bid)
+
+    def _scatter_ctx_kv_to_pool(
+        self, slot: int, start_col: int, chunk_k: torch.Tensor, chunk_v: torch.Tensor
+    ) -> None:
+        """Scatter prefill K/V into this slot's pre-allocated pool blocks.
+
+        chunk_k / chunk_v are [N, L, nkv, hd]. Positions land at
+        [start_col, start_col + N) within this request's logical space, which
+        maps into blocks in self._slot_blocks[slot] at offsets computed mod
+        page_block_size.
+        """
+        N = chunk_k.shape[0]
+        if N == 0:
+            return
+        page = self._page_block_size
+        blocks = self._slot_blocks[slot]
+        # chunk_k: [N, L, nkv, hd] -> [L, N, nkv, hd] so a layer axis indexes
+        # cleanly when writing to pool[:, block, off].
+        k_ln = chunk_k.permute(1, 0, 2, 3).contiguous()
+        v_ln = chunk_v.permute(1, 0, 2, 3).contiguous()
+        col = start_col
+        src_off = 0
+        while src_off < N:
+            block_idx = col // page
+            off = col % page
+            bid = blocks[block_idx]
+            take = min(page - off, N - src_off)
+            self._ctx_k_pool[:, bid, off : off + take] = k_ln[:, src_off : src_off + take]
+            self._ctx_v_pool[:, bid, off : off + take] = v_ln[:, src_off : src_off + take]
+            col += take
+            src_off += take
 
     def _prepare_attn_metadata_for_dflash(self, attn_metadata, spec_metadata):
         """Save attn_metadata fields that DFlash modifies during forward."""
@@ -398,16 +496,13 @@ class DFlashWorker(SpecWorkerBase):
             # Assign slot for new requests or reset for reused IDs
             if req_id not in self._req_to_slot or first_pos == 0:
                 if req_id in self._req_to_slot:
-                    old_slot = self._req_to_slot[req_id]
-                    self._ctx_len[old_slot] = 0
-                    self._free_slots.append(old_slot)
+                    old_slot = self._req_to_slot.pop(req_id)
+                    self._release_slot(old_slot)
                 if not self._free_slots:
                     logger.warning("DFlash: no free slots, skipping context store")
                     offset += slen
                     continue
-                slot = self._free_slots.popleft()
-                self._req_to_slot[req_id] = slot
-                self._ctx_len[slot] = 0
+                self._assign_slot(req_id)
 
             slot = self._req_to_slot[req_id]
             cur = int(self._ctx_len[slot].item())
@@ -418,15 +513,14 @@ class DFlashWorker(SpecWorkerBase):
                 self._ctx_buf[slot, cur:end] = chunk_proj_cast
                 self._ctx_pos_buf[slot, cur:end] = chunk_pos[:actual]
                 self._ctx_len[slot] = end
-                if self._ctx_k_buf is not None:
+                if self._ctx_k_pool is not None:
                     # Precompute post-norm/post-RoPE K,V for this prefill
-                    # chunk so decode iters can read without re-projecting.
+                    # chunk so decode iters can read without re-projecting,
+                    # then scatter into the paged pool at this slot's blocks.
                     chunk_k, chunk_v = draft_model.precompute_context_kv(
                         chunk_proj_cast, chunk_pos[:actual]
-                    )
-                    # chunk_k/v: [actual, L, nkv, hd] → [L, actual, nkv, hd]
-                    self._ctx_k_buf[slot, :, cur:end] = chunk_k.permute(1, 0, 2, 3)
-                    self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
+                    )  # [actual, L, nkv, hd]
+                    self._scatter_ctx_kv_to_pool(slot, cur, chunk_k, chunk_v)
             offset += slen
 
     def forward(
@@ -551,7 +645,7 @@ class DFlashWorker(SpecWorkerBase):
                     num_ctx_per_req=inputs["num_ctx_per_req"],
                     ctx_k_cache=inputs.get("ctx_k_cache"),
                     ctx_v_cache=inputs.get("ctx_v_cache"),
-                    ctx_cache_batch_idx=inputs.get("ctx_cache_batch_idx"),
+                    ctx_block_table=inputs.get("ctx_block_table"),
                 )
 
                 # Gather K logits per gen request from mask positions (1..K).
@@ -761,21 +855,32 @@ class DFlashWorker(SpecWorkerBase):
                 pos_flat = ctx_position_ids.long().reshape(-1)
                 mask_1d = write_mask.reshape(-1)
 
-                if self._ctx_k_buf is not None:
-                    # Fast path: store only the pre-projected/pre-RoPE'd K/V.
-                    # dflash_forward reads these directly via cache_batch_idx,
-                    # so the hidden-state and position-id scatter into
-                    # _ctx_buf / _ctx_pos_buf are not needed.
+                if self._ctx_k_pool is not None:
+                    # Fast path: store only the pre-projected/pre-RoPE'd K/V
+                    # into the paged pool. dflash_forward reads the pool in
+                    # place via block_table; no gather, no per-request
+                    # hidden-state scatter.
                     k_new, v_new = draft_model.precompute_context_kv(
-                        proj_flat.to(self._ctx_k_buf.dtype), pos_flat
-                    )
+                        proj_flat.to(self._ctx_k_pool.dtype), pos_flat
+                    )  # [num_gens*(K+1), L, nkv, hd]
                     mask_bc = mask_1d.view(-1, 1, 1, 1).to(k_new.dtype)
                     k_new = k_new * mask_bc
                     v_new = v_new * mask_bc
-                    slot_long = slot_flat.long()
-                    col_long = col_flat.long()
-                    self._ctx_k_buf[slot_long, :, col_long] = k_new
-                    self._ctx_v_buf[slot_long, :, col_long] = v_new
+                    # Map each (slot, col) to (block_id, offset) on the
+                    # paged pool. col_flat is already clamped to _max_ctx-1
+                    # which is inside the last pre-allocated block for every
+                    # slot, so no OOB risk on masked/invalid entries.
+                    page = self._page_block_size
+                    block_idx_in_req = (col_flat // page).clamp(max=self._max_blocks_per_req - 1)
+                    offsets = col_flat % page
+                    block_ids = self._slot_block_table[
+                        slot_flat.long(), block_idx_in_req.long()
+                    ].long()
+                    # pool: [L, num_blocks, page, nkv, hd]; write layer-major.
+                    k_ln = k_new.permute(1, 0, 2, 3).contiguous()
+                    v_ln = v_new.permute(1, 0, 2, 3).contiguous()
+                    self._ctx_k_pool[:, block_ids, offsets] = k_ln
+                    self._ctx_v_pool[:, block_ids, offsets] = v_ln
                 else:
                     # Fallback path: dflash_forward will recompute K/V from
                     # target_hidden each layer, so we must persist the
@@ -788,26 +893,27 @@ class DFlashWorker(SpecWorkerBase):
                 self._ctx_len[slots] += gen_num_accepted_long
                 self._ctx_len.clamp_(max=self._max_ctx)
 
-            # Read padded context from buffers. When the per-layer K/V
-            # cache exists, skip the target_hidden + context_positions gather
-            # entirely — dflash_forward uses the pooled _ctx_k_buf / _ctx_v_buf
-            # directly via flash_attn's cache_batch_idx, which reads per-slot
-            # without copying the full buffer (saves ~L*max_ctx*nkv*hd*B bytes
-            # per step, which is multiple GB in typical configs).
-            has_ctx_kv_cache = self._ctx_k_buf is not None
+            # Read padded context from buffers. Fast path uses the paged
+            # pool + per-slot block_table; flash_attn reads each layer in
+            # place. Fallback path still gathers the projected hidden
+            # states + positions for per-layer recomputation.
+            has_ctx_kv_cache = self._ctx_k_pool is not None
             num_ctx_per_req_t = self._ctx_len[slots]
             if has_ctx_kv_cache:
                 target_hidden = self._ctx_buf.new_empty(num_gens, 0, self._proj_dim)
                 context_positions = self._ctx_pos_buf.new_empty(num_gens, 0)
-                ctx_k_cache = self._ctx_k_buf
-                ctx_v_cache = self._ctx_v_buf
-                ctx_cache_batch_idx = slots
+                ctx_k_cache = self._ctx_k_pool
+                ctx_v_cache = self._ctx_v_pool
+                # Per-forward block_table gather: [B, max_blocks_per_req]
+                # int32. Tiny (a few KB even at bs=64) compared to the
+                # GB-scale gather the old cache_batch_idx mode replaced.
+                ctx_block_table = self._slot_block_table[slots.long()]
             else:
                 target_hidden = self._ctx_buf[slots]
                 context_positions = self._ctx_pos_buf[slots].long()
                 ctx_k_cache = None
                 ctx_v_cache = None
-                ctx_cache_batch_idx = None
+                ctx_block_table = None
 
             # 3D padded tensors for CUDA graph compatible dflash_forward
             noise_embedding = noise_embed_2d
@@ -826,7 +932,7 @@ class DFlashWorker(SpecWorkerBase):
             num_ctx_per_req_t = torch.empty(0, dtype=torch.long, device="cuda")
             ctx_k_cache = None
             ctx_v_cache = None
-            ctx_cache_batch_idx = None
+            ctx_block_table = None
 
         return {
             "noise_embedding": noise_embedding,
@@ -836,5 +942,5 @@ class DFlashWorker(SpecWorkerBase):
             "num_ctx_per_req": num_ctx_per_req_t,
             "ctx_k_cache": ctx_k_cache,
             "ctx_v_cache": ctx_v_cache,
-            "ctx_cache_batch_idx": ctx_cache_batch_idx,
+            "ctx_block_table": ctx_block_table,
         }

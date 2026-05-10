@@ -1152,7 +1152,7 @@ class DFlashForCausalLM(nn.Module):
         num_ctx_per_req: torch.Tensor,
         ctx_k_cache: Optional[torch.Tensor] = None,
         ctx_v_cache: Optional[torch.Tensor] = None,
-        ctx_cache_batch_idx: Optional[torch.Tensor] = None,
+        ctx_block_table: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Custom DFlash forward with batched cross-attention.
 
@@ -1233,11 +1233,11 @@ class DFlashForCausalLM(nn.Module):
                                              dtype=rope_dtype,
                                              device='cuda')
 
-        # cache_batch_idx: tells flash_attn which pool slot each batch
-        # entry belongs to. Lets us use _ctx_k_buf in place — no 7.5GB
-        # gather. int32 required.
-        cache_batch_idx_i32 = (ctx_cache_batch_idx.to(torch.int32)
-                               if ctx_cache_batch_idx is not None else None)
+        # block_table: per-request list of page-block ids. Lets flash_attn's
+        # paged-cache mode read the correct slice of the shared pool without
+        # any gather. int32 required.
+        block_table_i32 = (ctx_block_table.to(torch.int32)
+                           if ctx_block_table is not None else None)
 
         # Flatten query positions once for the fused QK-norm-RoPE kernel.
         query_positions_flat_i32 = query_positions.reshape(-1).to(torch.int32)
@@ -1318,11 +1318,12 @@ class DFlashForCausalLM(nn.Module):
                                                    head_dim)
 
             if use_ctx_cache:
-                # Per-layer view into the pooled ctx cache. Shape:
-                # [pool_batch, max_ctx+block, nkv, hd]. No gather — we use
-                # flash_attn's cache_batch_idx to dereference per batch.
-                layer_k_cache = ctx_k_cache[:, layer_idx]
-                layer_v_cache = ctx_v_cache[:, layer_idx]
+                # Per-layer slice of the paged pool. Pool layout is
+                # [L, num_blocks, page_block, nkv, hd], so ctx_k_cache[layer]
+                # is a contiguous view shaped (num_blocks, page_block, nkv,
+                # hd) — exactly what flash_attn wants for its paged cache.
+                layer_k_cache = ctx_k_cache[layer_idx]
+                layer_v_cache = ctx_v_cache[layer_idx]
             else:
                 # Legacy fallback: recompute context K/V per layer. Kept for
                 # safety when the worker has not built the per-layer cache.
@@ -1354,9 +1355,9 @@ class DFlashForCausalLM(nn.Module):
                 layer_k_cache = self._kv_buf_k[:B]
                 layer_v_cache = self._kv_buf_v[:B]
 
-            # flash_attn writes k_noise/v_noise in-place into the cache at
-            # positions cache_seqlens[i]..+block_size for each batch i.
-            # Replaces the old torch.scatter_ step.
+            # flash_attn writes k_noise/v_noise in-place into the paged cache
+            # at positions cache_seqlens[i]..+block_size for each batch i,
+            # dereferenced via block_table. Replaces the old scatter_ step.
             out = flash_attn_with_kvcache(
                 q=Q_bshd,
                 k_cache=layer_k_cache,
@@ -1364,7 +1365,7 @@ class DFlashForCausalLM(nn.Module):
                 k=k_noise_bshd,
                 v=v_noise_bshd,
                 cache_seqlens=cache_seqlens_i32,
-                cache_batch_idx=cache_batch_idx_i32,
+                block_table=block_table_i32,
                 causal=False,
             )
             attn_output = out.reshape(B * block_size, q_size)
