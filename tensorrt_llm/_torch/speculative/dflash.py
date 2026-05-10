@@ -302,12 +302,19 @@ class DFlashWorker(SpecWorkerBase):
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
 
+        # Number of query tokens per gen request (1 bonus + block_size-1 mask).
+        # Resolved unconditionally so the fallback path (no _build_fused_kv_buffers)
+        # also sees it.
+        self._resolved_block_size = getattr(draft_model, "block_size", None) or (
+            self.max_draft_len + 1
+        )
+
         if hasattr(draft_model, "_build_fused_kv_buffers"):
             draft_model._build_fused_kv_buffers()
             L = draft_model._num_attn_layers
             nkv = draft_model._num_kv_heads
             hd = draft_model._head_dim
-            model_block_size = getattr(draft_model, "block_size", None) or (self.max_draft_len + 1)
+            model_block_size = self._resolved_block_size
 
             # Paged pool geometry. flash_attn_with_kvcache requires the page
             # block size to be a multiple of 256.
@@ -760,11 +767,6 @@ class DFlashWorker(SpecWorkerBase):
                     "or ensure the draft model config has 'dflash_config.mask_token_id' or 'mask_token_id'."
                 )
         mask_token_id = self._resolved_mask_token_id
-
-        if self._resolved_block_size is None:
-            self._resolved_block_size = getattr(draft_model, "block_size", None) or (
-                self.max_draft_len + 1
-            )
 
         # Get the embed_tokens layer from the draft model
         embed_tokens = draft_model.draft_model_full.model.embed_tokens
