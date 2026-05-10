@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 
 from tensorrt_llm._utils import prefer_pinned
@@ -28,6 +30,61 @@ from ..attention_backend import AttentionMetadata
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager
 from .interface import SpecMetadata, SpecWorkerBase
+
+
+@triton.jit
+def _build_dflash_query_inputs_kernel(
+    # Inputs
+    accepted_tokens_ptr,  # [num_gens, accepted_stride] int32
+    accepted_tokens_stride,
+    num_accepted_ptr,  # [num_gens] int32
+    ctx_len_ptr,  # [max_batch] int64
+    slots_ptr,  # [num_gens] int64 (already sliced from _batch_to_slot)
+    # Outputs
+    input_ids_out_ptr,  # [num_gens, block_size] int64
+    query_positions_out_ptr,  # [num_gens, block_size] int64
+    ctx_positions_out_ptr,  # [num_gens, K_plus_1] int64
+    # Scalars
+    mask_token_id,
+    block_size,
+    K_plus_1,
+    BLOCK: tl.constexpr,
+):
+    """Build DFlash per-gen-request query inputs in one kernel:
+
+      input_ids[i, 0]        = bonus (last accepted token)
+      input_ids[i, 1..block]  = mask_token_id
+      query_positions[i, j]   = ctx_len[slot(i)] + num_accepted(i) + j
+      ctx_positions[i, j]     = ctx_len[slot(i)] + j   (j < K+1)
+
+    Replaces ~10 small PyTorch ops (expand + clone + gather + scatter + arange
+    broadcasts) that ran sequentially on the host per draft step.
+    """
+    req_idx = tl.program_id(0)
+    j = tl.arange(0, BLOCK)
+    query_mask = j < block_size
+    ctx_mask = j < K_plus_1
+
+    slot = tl.load(slots_ptr + req_idx)
+    ctx_len = tl.load(ctx_len_ptr + slot)
+    num_acc = tl.load(num_accepted_ptr + req_idx)
+    bonus_idx = tl.maximum(num_acc - 1, 0)
+    bonus_token = tl.load(accepted_tokens_ptr + req_idx * accepted_tokens_stride + bonus_idx)
+
+    # input_ids
+    input_id = tl.where(
+        j == 0, bonus_token.to(tl.int64), tl.full((BLOCK,), mask_token_id, dtype=tl.int64)
+    )
+    tl.store(input_ids_out_ptr + req_idx * block_size + j, input_id, mask=query_mask)
+
+    # query positions: ctx_len + num_accepted + j
+    query_pos = ctx_len + num_acc.to(tl.int64) + j.to(tl.int64)
+    tl.store(query_positions_out_ptr + req_idx * block_size + j, query_pos, mask=query_mask)
+
+    # ctx positions: ctx_len + j for j < K+1
+    ctx_pos = ctx_len + j.to(tl.int64)
+    tl.store(ctx_positions_out_ptr + req_idx * K_plus_1 + j, ctx_pos, mask=ctx_mask)
+
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DFlashDecodingConfig
@@ -164,7 +221,6 @@ class DFlashWorker(SpecWorkerBase):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
-        self._mask_embed = None  # Cached mask token embedding (CUDA-graph safe)
         self._resolved_mask_token_id = None
         self._resolved_block_size = None
 
@@ -641,40 +697,42 @@ class DFlashWorker(SpecWorkerBase):
             block_size = self._resolved_block_size
             query_tokens_per_req = block_size
 
-            if self._mask_embed is None:
-                mask_token = torch.tensor([mask_token_id], dtype=torch.long, device="cuda")
-                self._mask_embed = embed_tokens(mask_token).detach()
-
-            # Start with all mask embeddings for block_size tokens
-            noise_embed_2d = self._mask_embed.expand(
-                num_gens * query_tokens_per_req, hidden_dim
-            ).clone()
-            noise_embed_2d = noise_embed_2d.reshape(num_gens, query_tokens_per_req, hidden_dim)
-
-            # Fill position 0 (bonus) with embedding of last accepted token
-            bonus_indices = (gen_num_accepted - 1).long().clamp(min=0).unsqueeze(1)
-            bonus_token_ids = gen_accepted_tokens.gather(1, bonus_indices).squeeze(1)
-            bonus_embeds = embed_tokens(bonus_token_ids.long())
-            noise_embed_2d[:, 0, :] = bonus_embeds.to(noise_embed_2d.dtype)
-
             # Get slots for gen requests from pre-computed mapping
             slots = self._batch_to_slot[num_contexts : num_contexts + num_gens]
 
-            # Position starts from accumulated context length (BEFORE
-            # adding current step's features).
-            gen_pos_starts = self._ctx_len[slots].int()
+            # Fused build of input_ids + query_positions + ctx_positions in
+            # one Triton kernel. Replaces the expand+clone+gather+scatter
+            # pattern and the two arange-broadcast-add chains with a single
+            # per-gen-request launch.
+            K_plus_1 = K + 1
+            input_ids_2d = torch.empty(
+                (num_gens, query_tokens_per_req), dtype=torch.long, device="cuda"
+            )
+            query_position_ids = torch.empty(
+                (num_gens, query_tokens_per_req), dtype=torch.long, device="cuda"
+            )
+            ctx_position_ids = torch.empty((num_gens, K_plus_1), dtype=torch.long, device="cuda")
+            _build_dflash_query_inputs_kernel[(num_gens,)](
+                gen_accepted_tokens,
+                gen_accepted_tokens.stride(0),
+                gen_num_accepted,
+                self._ctx_len,
+                slots,
+                input_ids_2d,
+                query_position_ids,
+                ctx_position_ids,
+                mask_token_id=int(mask_token_id),
+                block_size=query_tokens_per_req,
+                K_plus_1=K_plus_1,
+                BLOCK=triton.next_power_of_2(max(query_tokens_per_req, K_plus_1)),
+            )
+            # One embed_tokens call replaces the expand+clone+per-position
+            # overwrite; also avoids caching a mask embedding tensor.
+            noise_embed_2d = embed_tokens(input_ids_2d.view(-1)).view(
+                num_gens, query_tokens_per_req, hidden_dim
+            )
 
-            # Context positions for storing new accepted tokens (reused below)
             offsets_kp1 = torch.arange(K + 1, dtype=torch.long, device="cuda")
-            ctx_position_ids = (
-                gen_pos_starts.unsqueeze(1) + offsets_kp1.unsqueeze(0).int()
-            )  # [num_gens, K+1]
-
-            # Query positions start AFTER the full context including current
-            # step's accepted features
-            gen_query_start = gen_pos_starts + gen_num_accepted.to(torch.int32)
-            query_offsets = torch.arange(query_tokens_per_req, dtype=torch.int32, device="cuda")
-            query_position_ids = gen_query_start.unsqueeze(1) + query_offsets.unsqueeze(0)
 
             # Accumulate new accepted features into context buffers
             if has_target_features:
