@@ -9,7 +9,7 @@ from transformers import LlamaConfig, PretrainedConfig
 
 from tensorrt_llm.logger import logger
 
-from ...functional import PositionEmbeddingType
+from ...functional import PositionEmbeddingType, RotaryScalingType
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig, TConfig
@@ -1185,25 +1185,24 @@ class DFlashForCausalLM(nn.Module):
         num_heads_per_rank = attn0.num_heads
         num_kv_heads_per_rank = attn0.num_key_value_heads
         has_qk_norm = hasattr(attn0, 'q_norm') and hasattr(attn0, 'k_norm')
-        # Prefer the fully-fused q_norm + k_norm + RoPE kernel when the
-        # drafter's rope params match what precompute_context_kv's cos/sin
-        # cache was built from (standard RoPE or none). On YaRN / long-rope /
-        # partial-rotary drafters the two paths derive frequencies
-        # differently, so we must fall back to the shared flashinfer cache to
-        # keep context K and query Q/K rotated identically — see YaRN fix
-        # commit 53f6e0ed for the bug that motivated this branch.
-        rope_params = getattr(attn0, 'pos_embd_params', None)
-        rope_params = getattr(rope_params, 'rope',
-                              None) if rope_params else None
+        # The fused_qk_norm_rope kernel recomputes cos/sin on-the-fly from
+        # (theta, factor, low, high, attention_factor). For YaRN / long-rope /
+        # partial-rotary drafters those derivations can disagree with
+        # precompute_context_kv's cached cos/sin, producing inconsistent
+        # frequencies between context K and query Q/K. Fall back to the
+        # shared-cache flashinfer rope in those cases.
+        rope_params = getattr(getattr(attn0, 'pos_embd_params', None), 'rope',
+                              None)
         scale_type = getattr(rope_params, 'scale_type', None)
-        rope_cache_safe = (scale_type is None
-                           or str(scale_type).endswith('.none'))
-        partial_rotary = getattr(attn0, 'pretrained_config', None) and getattr(
-            attn0.pretrained_config, 'partial_rotary_factor', 1.0) != 1.0
+        rope_cache_safe = scale_type in (None, RotaryScalingType.none)
+        partial_rotary_factor = getattr(
+            getattr(attn0, 'pretrained_config', None), 'partial_rotary_factor',
+            1.0)
         use_fused_qk_norm_rope = (has_qk_norm
                                   and hasattr(attn0, 'apply_qk_norm_rope')
                                   and rope_params is not None
-                                  and rope_cache_safe and not partial_rotary
+                                  and rope_cache_safe
+                                  and partial_rotary_factor == 1.0
                                   and noise_embedding.dtype == torch.bfloat16)
         use_fused_rope = (_flashinfer_rope is not None and has_qk_norm
                           and noise_embedding.dtype == torch.bfloat16
