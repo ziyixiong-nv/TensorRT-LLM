@@ -1744,15 +1744,6 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "for cross-attention in the draft model. If None, read from the draft "
         "model config (dflash_config.target_layer_ids).")
 
-    block_size: Optional[int] = Field(
-        default=None,
-        description=
-        "Override the draft model's trained block_size (number of parallel "
-        "query tokens per gen request = 1 bonus + block_size-1 mask tokens). "
-        "Defaults to the trained block_size when None. Setting this to a "
-        "smaller value (e.g. max_draft_len + 1) reduces per-step draft "
-        "compute at the possible cost of some acceptance rate.")
-
     decoding_type: Literal["DFlash"] = "DFlash"
 
     @model_validator(mode="after")
