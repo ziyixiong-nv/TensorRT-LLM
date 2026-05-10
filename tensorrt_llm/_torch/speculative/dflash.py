@@ -495,6 +495,7 @@ class DFlashWorker(SpecWorkerBase):
                     num_ctx_per_req=inputs["num_ctx_per_req"],
                     ctx_k_cache=inputs.get("ctx_k_cache"),
                     ctx_v_cache=inputs.get("ctx_v_cache"),
+                    ctx_cache_batch_idx=inputs.get("ctx_cache_batch_idx"),
                 )
 
                 # Gather K logits per gen request from mask positions (1..K).
@@ -687,7 +688,6 @@ class DFlashWorker(SpecWorkerBase):
                     gen_hs_to_project.to(draft_model.fc.weight.dtype)
                 )
                 projected_to_store = draft_model.hidden_norm(projected_to_store)
-                projected_to_store = projected_to_store.reshape(num_gens, K + 1, -1)
                 gen_num_accepted_long = gen_num_accepted.long()
                 col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
                 write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
@@ -699,20 +699,15 @@ class DFlashWorker(SpecWorkerBase):
                 # _ctx_len range, so they're harmless.
                 slot_flat = slots.unsqueeze(1).expand(-1, K + 1).reshape(-1)
                 col_flat = col_idx.reshape(-1)
-                proj_flat = projected_to_store.reshape(-1, self._proj_dim)
+                proj_flat = projected_to_store  # already [num_gens*(K+1), proj_dim]
                 pos_flat = ctx_position_ids.long().reshape(-1)
-
                 mask_1d = write_mask.reshape(-1)
-                proj_masked = proj_flat * mask_1d.unsqueeze(1).to(proj_flat.dtype)
-                pos_masked = pos_flat * mask_1d.long()
-
-                self._ctx_buf[slot_flat, col_flat] = proj_masked.to(self._ctx_buf.dtype)
-                self._ctx_pos_buf[slot_flat, col_flat] = pos_masked
 
                 if self._ctx_k_buf is not None:
-                    # Fused K/V projection + per-layer k_norm + RoPE for the
-                    # new K+1 accepted tokens, across all drafter layers.
-                    # Replaces per-layer re-projection inside dflash_forward.
+                    # Fast path: store only the pre-projected/pre-RoPE'd K/V.
+                    # dflash_forward reads these directly via cache_batch_idx,
+                    # so the hidden-state and position-id scatter into
+                    # _ctx_buf / _ctx_pos_buf are not needed.
                     k_new, v_new = draft_model.precompute_context_kv(
                         proj_flat.to(self._ctx_k_buf.dtype), pos_flat
                     )
@@ -723,19 +718,38 @@ class DFlashWorker(SpecWorkerBase):
                     col_long = col_flat.long()
                     self._ctx_k_buf[slot_long, :, col_long] = k_new
                     self._ctx_v_buf[slot_long, :, col_long] = v_new
+                else:
+                    # Fallback path: dflash_forward will recompute K/V from
+                    # target_hidden each layer, so we must persist the
+                    # projected hidden states and positions.
+                    proj_masked = proj_flat * mask_1d.unsqueeze(1).to(proj_flat.dtype)
+                    pos_masked = pos_flat * mask_1d.long()
+                    self._ctx_buf[slot_flat, col_flat] = proj_masked.to(self._ctx_buf.dtype)
+                    self._ctx_pos_buf[slot_flat, col_flat] = pos_masked
 
                 self._ctx_len[slots] += gen_num_accepted_long
                 self._ctx_len.clamp_(max=self._max_ctx)
 
-            # Read padded context from buffers (fixed shape for CUDA graph)
-            target_hidden = self._ctx_buf[slots]
-            context_positions = self._ctx_pos_buf[slots].long()
+            # Read padded context from buffers. When the per-layer K/V
+            # cache exists, skip the target_hidden + context_positions gather
+            # entirely — dflash_forward uses the pooled _ctx_k_buf / _ctx_v_buf
+            # directly via flash_attn's cache_batch_idx, which reads per-slot
+            # without copying the full buffer (saves ~L*max_ctx*nkv*hd*B bytes
+            # per step, which is multiple GB in typical configs).
+            has_ctx_kv_cache = self._ctx_k_buf is not None
             num_ctx_per_req_t = self._ctx_len[slots]
-            # Gather per-layer K/V cache for the drafter. Shape:
-            # [B, L, max_ctx, nkv, hd]. Used inside dflash_forward to skip
-            # per-layer kv_ctx recomputation.
-            ctx_k_cache_gathered = self._ctx_k_buf[slots] if (self._ctx_k_buf is not None) else None
-            ctx_v_cache_gathered = self._ctx_v_buf[slots] if (self._ctx_k_buf is not None) else None
+            if has_ctx_kv_cache:
+                target_hidden = self._ctx_buf.new_empty(num_gens, 0, self._proj_dim)
+                context_positions = self._ctx_pos_buf.new_empty(num_gens, 0)
+                ctx_k_cache = self._ctx_k_buf
+                ctx_v_cache = self._ctx_v_buf
+                ctx_cache_batch_idx = slots
+            else:
+                target_hidden = self._ctx_buf[slots]
+                context_positions = self._ctx_pos_buf[slots].long()
+                ctx_k_cache = None
+                ctx_v_cache = None
+                ctx_cache_batch_idx = None
 
             # 3D padded tensors for CUDA graph compatible dflash_forward
             noise_embedding = noise_embed_2d
@@ -752,8 +766,9 @@ class DFlashWorker(SpecWorkerBase):
             query_positions = torch.empty(0, 0, dtype=torch.long, device="cuda")
             context_positions = torch.empty(0, 0, dtype=torch.long, device="cuda")
             num_ctx_per_req_t = torch.empty(0, dtype=torch.long, device="cuda")
-            ctx_k_cache_gathered = None
-            ctx_v_cache_gathered = None
+            ctx_k_cache = None
+            ctx_v_cache = None
+            ctx_cache_batch_idx = None
 
         return {
             "noise_embedding": noise_embedding,
@@ -761,6 +776,7 @@ class DFlashWorker(SpecWorkerBase):
             "query_positions": query_positions,
             "context_positions": context_positions,
             "num_ctx_per_req": num_ctx_per_req_t,
-            "ctx_k_cache": ctx_k_cache_gathered,
-            "ctx_v_cache": ctx_v_cache_gathered,
+            "ctx_k_cache": ctx_k_cache,
+            "ctx_v_cache": ctx_v_cache,
+            "ctx_cache_batch_idx": ctx_cache_batch_idx,
         }
