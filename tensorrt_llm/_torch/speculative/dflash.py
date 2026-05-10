@@ -762,8 +762,22 @@ class DFlashWorker(SpecWorkerBase):
         mask_token_id = self._resolved_mask_token_id
 
         if self._resolved_block_size is None:
-            self._resolved_block_size = getattr(draft_model, "block_size", None) or (
+            # Default to the draft model's trained block_size, but cap at
+            # K+1 (minimum needed for K draft predictions + 1 bonus) when
+            # the user opts in. The trained block_size may be larger than
+            # K+1 — e.g. Qwen3-8B-DFlash-b16 uses 16 but we only read back
+            # K predictions, so the extra mask tokens are wasted compute.
+            trained_block_size = getattr(draft_model, "block_size", None) or (
                 self.max_draft_len + 1
+            )
+            override = getattr(self.spec_config, "block_size", None)
+            if override is not None:
+                self._resolved_block_size = int(override)
+            else:
+                self._resolved_block_size = trained_block_size
+            logger.info(
+                f"DFlash: resolved block_size={self._resolved_block_size} "
+                f"(trained={trained_block_size}, K={self.max_draft_len})"
             )
 
         # Get the embed_tokens layer from the draft model

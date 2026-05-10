@@ -1185,13 +1185,29 @@ class DFlashForCausalLM(nn.Module):
         num_heads_per_rank = attn0.num_heads
         num_kv_heads_per_rank = attn0.num_key_value_heads
         has_qk_norm = hasattr(attn0, 'q_norm') and hasattr(attn0, 'k_norm')
-        # Apply RoPE via the same flashinfer in-place kernel + cos/sin cache
-        # that precompute_context_kv uses. Sharing the cache is critical —
-        # fused_qk_norm_rope / apply_rotary_pos_emb derive YaRN (or other
-        # scaled) frequencies on their own, and a mismatch against the cached
-        # cos/sin breaks context-vs-query attention and collapses acceptance.
+        # Prefer the fully-fused q_norm + k_norm + RoPE kernel when the
+        # drafter's rope params match what precompute_context_kv's cos/sin
+        # cache was built from (standard RoPE or none). On YaRN / long-rope /
+        # partial-rotary drafters the two paths derive frequencies
+        # differently, so we must fall back to the shared flashinfer cache to
+        # keep context K and query Q/K rotated identically — see YaRN fix
+        # commit 53f6e0ed for the bug that motivated this branch.
+        rope_params = getattr(attn0, 'pos_embd_params', None)
+        rope_params = getattr(rope_params, 'rope',
+                              None) if rope_params else None
+        scale_type = getattr(rope_params, 'scale_type', None)
+        rope_cache_safe = (scale_type is None
+                           or str(scale_type).endswith('.none'))
+        partial_rotary = getattr(attn0, 'pretrained_config', None) and getattr(
+            attn0.pretrained_config, 'partial_rotary_factor', 1.0) != 1.0
+        use_fused_qk_norm_rope = (has_qk_norm
+                                  and hasattr(attn0, 'apply_qk_norm_rope')
+                                  and rope_params is not None
+                                  and rope_cache_safe and not partial_rotary
+                                  and noise_embedding.dtype == torch.bfloat16)
         use_fused_rope = (_flashinfer_rope is not None and has_qk_norm
-                          and noise_embedding.dtype == torch.bfloat16)
+                          and noise_embedding.dtype == torch.bfloat16
+                          and not use_fused_qk_norm_rope)
 
         B = noise_embedding.shape[0]
         block_size = noise_embedding.shape[1]
@@ -1261,7 +1277,24 @@ class DFlashForCausalLM(nn.Module):
             # QKV projection on normed query tokens (2D)
             qkv_query = attn_mod.qkv_proj(hs_normed_flat)  # [B*blk, qkv_size]
 
-            if use_fused_rope:
+            if use_fused_qk_norm_rope:
+                # One kernel does q_norm + k_norm + RoPE in-place on qkv.
+                # Only safe when the drafter's rope params don't use YaRN /
+                # long-rope / partial-rotary — otherwise fall back to the
+                # shared-cache path below.
+                attn_mod.apply_qk_norm_rope(qkv_query, query_positions_flat_i32)
+                q_all_2d = qkv_query[:, :q_size]
+                k_noise_2d = qkv_query[:, q_size:q_size + kv_size]
+                v_noise_2d = qkv_query[:, q_size + kv_size:]
+                Q_bshd = q_all_2d.reshape(B, block_size, num_heads_per_rank,
+                                          head_dim)
+                k_noise_bshd = k_noise_2d.reshape(B, block_size,
+                                                  num_kv_heads_per_rank,
+                                                  head_dim)
+                v_noise_bshd = v_noise_2d.reshape(B, block_size,
+                                                  num_kv_heads_per_rank,
+                                                  head_dim)
+            elif use_fused_rope:
                 # Per-head RMSNorm on q/k (returns new contiguous tensors),
                 # then flashinfer in-place RoPE sharing the same cos/sin cache
                 # as precompute_context_kv.
