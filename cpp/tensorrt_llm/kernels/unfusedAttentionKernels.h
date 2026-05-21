@@ -173,6 +173,13 @@ struct QKVPreprocessingParams
     // shape is {rotary_embedding_max_positions, rotary_embedding_dim}. eg (2048, 128)
     float2 const* rotary_coef_cache_buffer{nullptr};
     int const* spec_decoding_position_offsets{nullptr};
+    // Per-request cap on how many tokens append K/V to the paged cache.
+    // When non-null, token_idx_in_seq >= kv_append_lens[batch_idx] means
+    // "compute attention for this Q but DO NOT write its K/V to the
+    // paged cache". Used by DFlash + Target-Side SSD to keep candidate
+    // K/V out of the main paged cache (see DFLASH_TARGET_SIDE_SSD_DESIGN.md
+    // §5.1). When null, all input tokens append (default behavior).
+    int const* kv_append_lens{nullptr};
 
     float2 const* mrope_rotary_cos_sin{nullptr};
     int32_t const* mrope_position_deltas{nullptr};

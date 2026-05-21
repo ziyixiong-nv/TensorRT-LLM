@@ -93,6 +93,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     spec_decoding_position_offsets: Optional[torch.Tensor] = None
     spec_decoding_packed_mask: Optional[torch.Tensor] = None
     spec_decoding_generation_lengths: Optional[torch.Tensor] = None
+    # DFlash + T-SSD: per-request K/V append cap. When set, only the
+    # first kv_append_lens[i] tokens of request i write K/V to the
+    # paged cache; the rest (candidate Q tokens) compute attention but
+    # don't pollute the cache.
+    kv_append_lens: Optional[torch.Tensor] = None
     spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None
     spec_decoding_bl_tree_mask: Optional[torch.Tensor] = None
     spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor] = None
@@ -786,13 +791,95 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         # Disable spec decoding on Blackwell (sm100+). The trtllmGen FMHA
         # kernels do not yet support speculative decoding mode.
+        # Exception: SSD path — when DFlash T-SSD provides a packed mask
+        # we keep spec decoding enabled so the §4.2 mask is consumed by
+        # the kernel. We also pass kv_append_lens so candidate K/V is not
+        # written to the main paged cache.
+        _tssd_active = (spec_metadata is not None
+                        and getattr(spec_metadata, "tssd_enabled", False))
         self.is_spec_decoding_enabled = is_spec_decoding_enabled and (
-            not self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()))
+            _tssd_active
+            or not self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()))
 
         # use_spec_decoding is default to true by default, change in runtime by layers / requests
         self.use_spec_decoding = self.is_spec_decoding_enabled
         self.is_spec_dec_tree = is_spec_dec_tree
         self.is_spec_dec_dynamic_tree = is_spec_dec_dynamic_tree
+
+        # SSD (DFlash Target-Side Saguaro Speculation) path. Bypasses the
+        # native tree-decoding infrastructure entirely so SSD does not
+        # need to coexist with Eagle3 / SpecTreeManager assumptions.
+        # When tssd_enabled, allocate + populate the same backend buffers
+        # (position_offsets, packed_mask, generation_lengths) directly
+        # from spec_metadata's pre-built mask, then short-circuit the rest.
+        # Note: SSD intentionally fires regardless of `self.is_spec_decoding_enabled`
+        # (which is forced False on Blackwell trtllm-gen). The buffers must be
+        # populated for any kernel that consults them; if the kernel ignores
+        # them, SSD reduces to "extra Q tokens with standard causal mask"
+        # (lossy but still runs end-to-end for overhead measurement).
+        if spec_metadata is not None and getattr(spec_metadata, "tssd_enabled",
+                                                 False):
+            n_dt = max_total_draft_tokens + 1
+            mask_pattern = spec_metadata.get_tssd_packed_mask()
+            assert mask_pattern is not None, (
+                "tssd_enabled=True but get_tssd_packed_mask() returned None. "
+                "Mask must be built in DFlashSpecMetadata.__post_init__.")
+            num_blocks = mask_pattern.shape[-1]
+            if self.spec_decoding_position_offsets is None:
+                self.spec_decoding_position_offsets = torch.empty(
+                    [self.max_num_requests, n_dt],
+                    dtype=torch.int,
+                    device='cuda',
+                )
+            if self.spec_decoding_packed_mask is None:
+                self.spec_decoding_packed_mask = torch.empty(
+                    [self.max_num_requests, n_dt, num_blocks],
+                    dtype=torch.int,
+                    device='cuda',
+                )
+            if self.spec_decoding_generation_lengths is None:
+                self.spec_decoding_generation_lengths = torch.empty(
+                    [self.max_num_requests],
+                    dtype=torch.int,
+                    device='cuda',
+                )
+            # Blackwell needs the bl_tree buffers populated even though
+            # SSD is not a "tree" — the kernel reads them whenever
+            # spec_decoding mode is active.
+            if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
+                self.spec_decoding_param_prepare_for_blackwell()
+            self.spec_decoding_position_offsets[:batch_size, :n_dt].copy_(
+                torch.arange(n_dt, dtype=torch.int,
+                             device='cuda').unsqueeze(0).expand(batch_size, -1),
+                non_blocking=True,
+            )
+            self.spec_decoding_packed_mask[:batch_size, :n_dt, :].copy_(
+                mask_pattern[:batch_size, :n_dt, :],
+                non_blocking=True,
+            )
+            self.spec_decoding_generation_lengths[:batch_size].fill_(n_dt)
+            # K/V append cap: gen requests append only the first K+1 tokens
+            # (1 bonus + K main draft); F_total candidates never pollute
+            # the paged cache. For ctx requests we want full append (set
+            # to a large value). Build a per-request buffer of size
+            # max_num_requests, default-large for ctx, K+1 for gens.
+            kv_append_cap = getattr(spec_metadata, "tssd_kv_append_cap",
+                                    max_draft_len + 1)
+            if self.kv_append_lens is None:
+                self.kv_append_lens = torch.empty(
+                    [self.max_num_requests],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
+            # Default to a sentinel "no cap" (set to something larger than
+            # any plausible sequence length). For gen requests we'll cap at
+            # K+1; ctx requests get the sentinel.
+            self.kv_append_lens.fill_(2**30)
+            num_gens = batch_size - getattr(self, "num_contexts", 0)
+            if num_gens > 0:
+                self.kv_append_lens[self.num_contexts:batch_size].fill_(
+                    kv_append_cap)
+            return
 
         # Parameters can be fixed and not changed during runtime if the
         if self.is_spec_decoding_enabled:
@@ -1553,6 +1640,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 num_contexts=metadata.num_contexts,
                 num_ctx_tokens=metadata.num_ctx_tokens,
                 compressed_kv_cache_pool_ptr=compressed_kv_cache_pool_ptr,
+                kv_append_lens=getattr(metadata, "kv_append_lens", None),
             )
 
         if self.print_skip_softmax_stat:

@@ -1793,19 +1793,54 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "for cross-attention in the draft model. If None, read from the draft "
         "model config (dflash_config.target_layer_ids).")
 
+    tssd_enabled: bool = Field(
+        default=False,
+        description=
+        "Enable Target-Side Saguaro Speculation Decoding (T-SSD) on top of "
+        "DFlash. Pre-speculates F_total candidate tokens per accept-length "
+        "outcome and verifies them in the same target forward, saving one "
+        "fixup forward + ctx K/V projection on cache hit. See "
+        "DFLASH_TARGET_SIDE_SSD_DESIGN.md.")
+
+    tssd_F_total: int = Field(
+        default=8,
+        description=
+        "Total speculation budget per request (sum of F_k across k=0..K). "
+        "Geometric fan-out distributes this across accept-length groups. "
+        "Default 8 keeps attention overhead < 25%% across the BS=1 SPEED-bench "
+        "decode trajectory; F_total > 16 only viable for very short prefix.")
+
+    tssd_a_p: float = Field(
+        default=0.78,
+        description=
+        "Per-token acceptance rate used by Saguaro Theorem 12 to compute "
+        "geometric fan-out F_k = F_0 * a_p^(k/(1+r)). 0.78 is gpt-oss-120b "
+        "decode median; 0.89 is Kimi-K2.5.")
+
+    tssd_max_batch: int = Field(
+        default=2,
+        description=
+        "Disable T-SSD when running batch exceeds this. Phase 0 measurements "
+        "show catastrophic attention overhead (>130%%) at B>=4 across all "
+        "tested prefix lengths.")
+
     decoding_type: Literal["DFlash"] = "DFlash"
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
+        # Baseline DFlash and multi-stream T-SSD both use K main draft +
+        # 1 bonus = K+1 tokens per gen in main target verify. T-SSD
+        # candidates are processed via a SEPARATE target forward call on
+        # a parallel stream; they don't enter main verify shape.
         self.max_total_draft_tokens = self.max_draft_len
         return self
 
     @property
     def tokens_per_gen_step(self) -> int:
-        """DFlash only needs K+1 tokens per gen request (K drafts + 1 bonus).
+        """DFlash main-verify tokens per gen request (K drafts + 1 bonus).
 
-        The draft produces its own mask queries internally; passing mask
-        fillers through the target is pure wasted work at large batch size.
+        T-SSD candidates run on a separate stream — see
+        DFLASH_TARGET_SIDE_SSD_DESIGN.md §7.2 (multi-stream design).
         """
         return self.max_draft_len + 1
 

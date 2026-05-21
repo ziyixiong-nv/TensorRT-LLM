@@ -1766,6 +1766,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.mrope_rotary_cos_sin = params.mrope_rotary_cos_sin;
         preprocessingParams.qkv_scale_orig_quant = params.kv_scale_orig_quant;
         preprocessingParams.spec_decoding_position_offsets = nullptr;
+        preprocessingParams.kv_append_lens = params.kv_append_lens;
         preprocessingParams.helix_position_offsets = params.helix_position_offsets;
         preprocessingParams.helix_is_inactive_rank = params.helix_is_inactive_rank;
         preprocessingParams.logn_scaling = params.logn_scaling_ptr;

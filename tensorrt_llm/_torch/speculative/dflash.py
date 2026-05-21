@@ -52,6 +52,15 @@ class DFlashSpecMetadata(SpecMetadata):
     dtype: torch.dtype = torch.bfloat16
     captured_hidden_states: Optional[torch.Tensor] = None
 
+    # T-SSD: per-request packed mask (lazily computed in __post_init__).
+    _tssd_packed_mask: Optional[torch.Tensor] = None
+    # tssd_enabled is the user-facing flag. _tssd_active is the internal
+    # flag actually used in code paths — it's only True when both
+    # tssd_enabled=True AND tssd_F_total > 0 (else SSD adds nothing).
+    tssd_enabled: bool = False
+    tssd_F_total: int = 0
+    tssd_a_p: float = 0.78
+
     def __post_init__(self):
         self.batch_indices_cuda = torch.empty(
             [self.max_num_requests],
@@ -59,8 +68,38 @@ class DFlashSpecMetadata(SpecMetadata):
             device="cuda",
         )
 
+        # SSD takes a dedicated path in TRTLLM backend; we do NOT flip
+        # is_spec_dec_tree (that path is reserved for native trees like
+        # Eagle3). The SSD packed mask is exposed via
+        # ``get_tssd_packed_mask`` and consumed by a dedicated SSD branch
+        # in `update_spec_dec_param`.
         self.is_spec_dec_tree = False
         self.is_spec_dec_dynamic_tree = False
+        # Internal "is SSD actually active" flag: only True when budget > 0.
+        # F_total=0 falls back to plain DFlash even if tssd_enabled=True.
+        self._tssd_active = self.tssd_enabled and self.tssd_F_total > 0
+        # Surface to backend probes via the original `tssd_enabled` shim
+        # so trtllm.py's getattr(spec_metadata, "tssd_enabled", ...) sees
+        # the effective state, not the user-requested one.
+        self.tssd_enabled = self._tssd_active
+        if self._tssd_active:
+            from .dflash_tssd import build_tssd_packed_mask, geometric_fanout
+
+            F_list = geometric_fanout(
+                K=self.max_draft_len,
+                B_budget=self.tssd_F_total,
+                a_p=self.tssd_a_p,
+            )
+            self._tssd_packed_mask = build_tssd_packed_mask(
+                K=self.max_draft_len,
+                F=F_list,
+                max_num_requests=self.max_num_requests,
+            )
+            logger.info(
+                f"DFlashSpecMetadata: T-SSD packed mask built shape="
+                f"{tuple(self._tssd_packed_mask.shape)}, F={F_list}, "
+                f"max_total_draft_tokens={self.max_total_draft_tokens}"
+            )
 
         # Set up hidden state capture buffer
         if self.layers_to_capture is not None and len(self.layers_to_capture) > 0:
@@ -82,6 +121,16 @@ class DFlashSpecMetadata(SpecMetadata):
             self.num_capture_layers = 0
             self._capture_layer_set = frozenset()
             self._layer_to_idx = {}
+
+    def get_tssd_packed_mask(self) -> Optional[torch.Tensor]:
+        """Return the §4.2 packed mask if T-SSD is active, else None.
+
+        Called by ``TrtllmAttentionMetadata.update_spec_dec_param`` to
+        populate ``spec_decoding_packed_mask``. Returning None falls
+        through to the standard Eagle3 tree branch (which would fail an
+        assert for DFlash mode).
+        """
+        return self._tssd_packed_mask
 
     def prepare(self):
         assert self.request_ids is not None

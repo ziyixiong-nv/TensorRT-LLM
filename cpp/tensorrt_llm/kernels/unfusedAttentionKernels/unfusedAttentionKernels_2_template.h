@@ -550,7 +550,11 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
 
             bool const useKVCache = params.kv_cache_buffer.data != nullptr;
             auto token_idx_in_kv_cache = token_idx_in_seq;
-            bool valid_kv_cache_pos = useKVCache;
+            // DFlash + T-SSD: optionally cap K/V append per request so
+            // candidate Q tokens do not pollute the paged cache.
+            bool const within_kv_append_cap
+                = (params.kv_append_lens == nullptr) || (token_idx_in_seq < params.kv_append_lens[batch_idx]);
+            bool valid_kv_cache_pos = useKVCache && within_kv_append_cap;
 
             // Make sure pairs of q or v vecs have been read before write.
             // One block will handle single head.
@@ -958,7 +962,11 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
 
         auto const channelIdx = head_dim_vec_idx;
         bool const useKVCache = GEN_PHASE || params.kv_cache_buffer.data != nullptr;
-        bool valid_kv_cache_pos = useKVCache;
+        // DFlash + T-SSD: optionally cap K/V append per request so
+        // candidate Q tokens do not pollute the paged cache.
+        bool const within_kv_append_cap
+            = (params.kv_append_lens == nullptr) || (token_idx_in_seq < params.kv_append_lens[batch_idx]);
+        bool valid_kv_cache_pos = useKVCache && within_kv_append_cap;
 
         auto kDst = useKVCache
             ? reinterpret_cast<TCache*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, token_idx_in_kv_cache))

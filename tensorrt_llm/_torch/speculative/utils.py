@@ -125,6 +125,9 @@ def get_spec_metadata(spec_config,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
             dtype=model_config.torch_dtype,
+            tssd_enabled=getattr(spec_config, "tssd_enabled", False),
+            tssd_F_total=int(getattr(spec_config, "tssd_F_total", 0)),
+            tssd_a_p=float(getattr(spec_config, "tssd_a_p", 0.78)),
         )
     if spec_config.spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelSpecMetadata(
@@ -341,6 +344,10 @@ def get_spec_worker(spec_config,
     if spec_dec_mode.is_pard():
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_dflash():
+        if getattr(spec_config, "tssd_enabled", False):
+            from .dflash_tssd import DFlashTSSDWorker
+            return DFlashTSSDWorker(spec_config, mapping,
+                                    use_separate_draft_kv_cache)
         return DFlashWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_sa():
         return SAWorker(spec_config, model_config)

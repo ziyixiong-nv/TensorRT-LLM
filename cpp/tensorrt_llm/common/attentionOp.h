@@ -124,6 +124,13 @@ public:
         float const* sage_attn_sfs_q = nullptr;
         float const* sage_attn_sfs_k = nullptr;
         float const* sage_attn_sfs_v = nullptr;
+
+        // DFlash + Target-Side SSD: optional per-request K/V append cap.
+        // When non-null, kv_append_lens[batch_idx] tokens append K/V; the
+        // remainder (token_idx_in_seq >= kv_append_lens[batch_idx])
+        // contribute Q to attention but do NOT write K/V to the paged
+        // cache. See DFLASH_TARGET_SIDE_SSD_DESIGN.md §5.1.
+        int32_t const* kv_append_lens = nullptr;
     };
 
     template <typename T>
