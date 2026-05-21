@@ -231,6 +231,51 @@ Below the +5-10% target the design originally projected — candidate
 Q processing through 34 transformer layers caps the upside on
 this workload. Commit-on-hit wiring is the next concrete deliverable.
 
+**B200 final lock-in (2026-05-21).** After exhaustive sweeping
+(layer counts 1/2/4/8/17/34, F values 4/8/16, stream priority
+{-1, 0, +1}, multiple repeats), the perf envelope is:
+
+| Config | Mean TPS/user | Δ vs baseline |
+|---|---|---|
+| Baseline DFlash (3 runs) | 1292.28 | (anchor) |
+| Multi-stream wrapper, no candidate work (2 runs) | 1287.63 | -0.36% (noise) |
+| Multi-stream + 1-layer proxy (2 runs) | 1283.26 | -0.7% |
+| Multi-stream + 17-layer proxy (2 runs) | 1272.09 | -1.6% |
+| Multi-stream + 34-layer proxy (2 runs) | 1257.00 | -2.7% |
+
+The cost is structural: ~0.06% TPS per layer of real candidate
+compute on aux stream (GPU SM contention with main verify, not
+host overhead). With realistic 34-layer candidate work, T-SSD
+costs ~2.7% TPS.
+
+**Honest revisit of commit-on-hit savings on DFlash**: the design
+projected "save one fixup forward + ctx K/V projection per hit"
+≈ +5-10% gain. But DFlash's K+1 main verify already INTEGRATES the
+fixup forward into the bonus position — there's no separate fixup
+forward to skip. Commit-on-hit's only realizable saving on DFlash
+is the small `fc + hidden_norm + precompute_context_kv` projection
+on hit (~5-10μs out of ~770μs iter ≈ 0.7-1.3%). At 60% hit rate:
+~0.5-0.8% effective savings.
+
+**Realistic T-SSD net result on gpt-oss-120b at K=8**: combining
+multi-stream realistic overhead (-2.7%) with realistic commit-on-hit
+savings (+0.5-0.8%) yields **-1.9% to -2.2% net**, NOT the design's
++5-10% projection. The optimistic design assumed classical spec-dec
+where fixup is a separate forward; DFlash's tighter integration
+eliminated that exposed savings target.
+
+**For T-SSD to deliver significant net-positive gain, would need**:
+1. Different model architecture (Kimi-K2.5 with higher `a_p` ≈ 0.89,
+   per-token acceptance higher, hit rate higher per Theorem 12)
+2. Different speculative algorithm where there IS an exposed fixup
+3. Major kernel work to make candidate forward effectively free
+   (e.g., actually skip layers via some hack, ~1-2 weeks)
+
+None achievable in a single session. The scaffold + multi-stream
+infrastructure is correct, well-tested, and ready for follow-up
+work. Default state: empty proxy on aux stream → ~0% overhead
+so tssd_enabled=true is a safe no-op until commit-on-hit lands.
+
 **Pre-commit isolation result (2026-05-21):** F_total=0 gives
 bit-identical output to baseline DFlash on Qwen3-8B (`baseline ==
 tssd_F0: True, same ARs: True`), proving the integration plumbing is

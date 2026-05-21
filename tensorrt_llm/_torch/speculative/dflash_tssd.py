@@ -443,6 +443,9 @@ class DFlashTSSDWorker(DFlashWorker):
         # ``maybe_execute_in_parallel`` records stream-switch + event ops
         # into the captured graph; needs the objects to exist beforehand).
         if torch.cuda.is_available():
+            # Stream priority: 0 = default. Tested -1 (lower) and +1 (higher)
+            # — neither moved the needle on B200, contention is at the SM
+            # level not the scheduler level. Default is fine.
             self._aux_stream = torch.cuda.Stream()
             self._event_main = torch.cuda.Event()
             self._event_aux = torch.cuda.Event()
@@ -830,12 +833,20 @@ class DFlashTSSDWorker(DFlashWorker):
                 return out_holder["out"]
 
             def _fn_candidate():
-                # Realistic candidate-forward proxy. Models per-token
-                # cost of running through (last_capture_layer + 1)
-                # target transformer layers. For gpt-oss-120b that's
-                # 34 of 36 (last captured = layer 33). Per layer we
-                # use one H×H GEMM (representing attention QKV proj;
-                # MoE FFN is ~3% of dense at top-4/128 so we omit it).
+                # No-op by default: scaffold runs zero compute on aux
+                # stream so tssd_enabled=true has ~0% TPS overhead vs
+                # baseline. Real candidate target forward (which would
+                # produce hidden states for commit-on-hit) requires
+                # plumbing target_model reference into the worker — see
+                # PHASE2_PROGRESS.md for the integration scope.
+                #
+                # Set TSSD_PROXY_LAYERS env var > 0 to run the placeholder
+                # GEMM proxy for cost-modeling experiments.
+                import os
+
+                proxy_layers = int(os.environ.get("TSSD_PROXY_LAYERS", "0"))
+                if proxy_layers <= 0:
+                    return None
                 if not hasattr(self, "_proxy_in"):
                     H = hidden_states.shape[-1] if hidden_states is not None else 4096
                     proxy_n = max(1, num_gens * F_total)
@@ -845,7 +856,7 @@ class DFlashTSSDWorker(DFlashWorker):
                     self._proxy_w = torch.randn(
                         (H, H), dtype=hidden_states.dtype, device=hidden_states.device
                     )
-                    self._proxy_layers = 34
+                    self._proxy_layers = proxy_layers
                 x = self._proxy_in
                 for _ in range(self._proxy_layers):
                     x = x @ self._proxy_w
