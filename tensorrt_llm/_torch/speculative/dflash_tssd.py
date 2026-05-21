@@ -437,6 +437,20 @@ class DFlashTSSDWorker(DFlashWorker):
         self._tssd_hits = 0
         self._tssd_misses = 0
 
+        # Multi-stream infrastructure for parallel candidate forward.
+        # Pre-allocated here so the stream + events are stable references
+        # across CUDA graph capture/replay (TRTLLM's
+        # ``maybe_execute_in_parallel`` records stream-switch + event ops
+        # into the captured graph; needs the objects to exist beforehand).
+        if torch.cuda.is_available():
+            self._aux_stream = torch.cuda.Stream()
+            self._event_main = torch.cuda.Event()
+            self._event_aux = torch.cuda.Event()
+        else:
+            self._aux_stream = None
+            self._event_main = None
+            self._event_aux = None
+
         if self.tssd_enabled:
             logger.warning(
                 f"DFlashTSSDWorker: tssd_enabled=True, F_total={self.tssd_F_total}, "
@@ -780,60 +794,78 @@ class DFlashTSSDWorker(DFlashWorker):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        # Skip multi-stream proxy entirely during CUDA graph capture
-        # (stream/event creation isn't allowed there). Lazy-allocate
-        # stream_B in eager mode only.
-        _is_capturing = torch.cuda.is_current_stream_capturing()
-        if not _is_capturing and (not hasattr(self, "_stream_B") or self._stream_B is None):
-            self._stream_B = torch.cuda.Stream()
+        # Multi-stream candidate work via TRTLLM's
+        # ``maybe_execute_in_parallel`` — capture-safe, replays correctly
+        # under CUDA graphs. Pattern:
+        #   * fn0 (default stream): super().forward (baseline DFlash)
+        #   * fn1 (aux stream): candidate proxy compute (placeholder for
+        #     real candidate target forward; will be replaced once the
+        #     full integration lands)
+        # The aux_stream and events are pre-allocated once (in __init__'s
+        # parent process before capture); inside capture they're recorded
+        # as graph ops and replayed every iter.
+        from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 
-        # Multi-stream proxy: launch a parallel "candidate-sized" GEMM on
-        # stream_B as a placeholder for the real candidate target forward.
-        # Same compute shape as F_total tokens × hidden_dim, run on B in
-        # parallel with super().forward on default stream A. Lets us
-        # measure whether GPU has headroom for parallel candidate work.
-        # When the real candidate target forward lands, this proxy is
-        # replaced by target_model.model(candidate_input_ids,
-        # kv_append_lens=zeros, custom_mask=§4.2_cand_mask).
-        # Skip multi-stream proxy during capture (cross-stream capture
-        # requires torch.cuda.graphs advanced APIs not used here). The
-        # proxy only runs during eager warmup; for steady-state effect,
-        # the real candidate forward must be issued WITHIN the capture
-        # region using cross-stream-capture-safe APIs (future work).
-        candidate_event = None
         if (
             num_gens > 0
             and self._tssd_active
             and F_total > 0
-            and not _is_capturing
-            and getattr(self, "_stream_B", None) is not None
+            and getattr(self, "_aux_stream", None) is not None
+            and do_multi_stream()
         ):
-            with torch.cuda.stream(self._stream_B):
-                # Lazy-alloc proxy buffers (constant shape, CUDA-graph-safe).
+            # Closure for default-stream fn0 (the actual DFlash work).
+            out_holder = {}
+
+            def _fn_main():
+                out_holder["out"] = super(DFlashTSSDWorker, self).forward(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    logits=logits,
+                    attn_metadata=attn_metadata,
+                    spec_metadata=spec_metadata,
+                    draft_model=draft_model,
+                    resource_manager=resource_manager,
+                )
+                return out_holder["out"]
+
+            def _fn_candidate():
+                # Lazy-alloc proxy buffers ONCE at the start of the first
+                # iter (during warmup, BEFORE capture begins). After that,
+                # buffers are reused, captured into the graph, and replayed.
                 if not hasattr(self, "_proxy_in"):
                     H = hidden_states.shape[-1] if hidden_states is not None else 4096
-                    proxy_n = num_gens * F_total
+                    proxy_n = max(1, num_gens * F_total)
                     self._proxy_in = torch.zeros(
                         (proxy_n, H), dtype=hidden_states.dtype, device=hidden_states.device
                     )
-                    # Two GEMMs (mimics QKV proj + MLP gate)
+                    # Two GEMMs (mimics QKV proj + MLP gate).
                     self._proxy_w1 = torch.randn(
                         (H, H * 3), dtype=hidden_states.dtype, device=hidden_states.device
                     )
                     self._proxy_w2 = torch.randn(
                         (H * 3, H), dtype=hidden_states.dtype, device=hidden_states.device
                     )
-                # Run the proxy on stream_B (concurrent with super on stream_A).
-                # Repeat for ~36 layers worth of work.
+                # Run 36 layers of (matmul A→B→A) — proxy for the candidate
+                # target forward through the full transformer stack.
                 x = self._proxy_in
                 for _ in range(36):
                     x = (x @ self._proxy_w1) @ self._proxy_w2
-                # Force a tiny dependency so kernel isn't optimized away.
-                _ = x.sum()
-            candidate_event = torch.cuda.Event()
-            candidate_event.record(self._stream_B)
+                return x
 
-        # Run baseline DFlash on default stream (concurrent with stream_B's proxy).
+            _, _ = maybe_execute_in_parallel(
+                _fn_main,
+                _fn_candidate,
+                self._event_main,
+                self._event_aux,
+                aux_stream=self._aux_stream,
+                disable_on_compile=True,
+            )
+            out = out_holder["out"]
+            self._tssd_iters_gated_on += 1
+            return out
+
+        # Fallback (no multi-stream): plain super().forward.
         out = super().forward(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -844,11 +876,6 @@ class DFlashTSSDWorker(DFlashWorker):
             draft_model=draft_model,
             resource_manager=resource_manager,
         )
-
-        # Sync stream_B before returning (next iter depends on candidate
-        # results being committed).
-        if candidate_event is not None:
-            torch.cuda.current_stream().wait_event(candidate_event)
 
         self._tssd_iters_gated_on += 1
         return out

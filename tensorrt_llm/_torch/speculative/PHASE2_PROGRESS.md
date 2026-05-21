@@ -158,21 +158,43 @@ TPS overhead scales nearly linearly with F (~0.7% per candidate Q token).
 AR drop is small (1-3%). At K=8, candidate Q processing through 36
 transformer layers is the dominant cost.
 
-**Multi-stream attempt (2026-05-21).** Attempted to overlap candidate
-processing with main verify / draft forward on a separate CUDA stream
-to reduce the F-proportional overhead. Result on Qwen3-8B-style proxy
-(36-layer GEMM on stream_B vs main verify on stream_A): +1.1% TPS
-(within run-to-run noise) — but with CUDA graphs ENABLED, my Python
-code on stream_B only runs during eager warmup, not during graph
-replay. The proxy was effectively decorative in steady state.
+**Multi-stream wired up (2026-05-21).** Initial naive `with
+torch.cuda.stream(stream_B):` inside CUDA graph capture failed with
+`cudaErrorStreamCaptureInvalidated`. Switched to TRTLLM's existing
+`maybe_execute_in_parallel` utility from
+`tensorrt_llm._torch.modules.multi_stream_utils`, which is the
+idiomatic pattern for capture-safe multi-stream work in this codebase
+(used by DeepSeekV3, Llama-min-latency, DSA attention, etc.). The
+utility uses pre-allocated stream + events with proper record/wait
+ordering inside `torch.cuda.graph(...)` capture.
 
-**Real multi-stream T-SSD requires graph-capture-aware integration**:
-candidate forward kernels must be issued WITHIN the capture region on
-stream_B, so the captured graph replays both stream's ops. That's
-non-trivial PyTorch CUDA-graph plumbing (torch.cuda.graphs multi-stream
-capture). Safe path is to disable CUDA graphs for T-SSD runs — but
-graphs give ~30-40% baseline speedup, so disabling them defeats the
-purpose. Future work: capture-aware multi-stream candidate forward.
+`DFlashTSSDWorker.__init__` now pre-allocates `_aux_stream`,
+`_event_main`, `_event_aux`. `forward()` invokes `maybe_execute_in_parallel(
+fn_main=super().forward, fn_candidate=proxy_compute,
+event_main, event_aux, aux_stream=self._aux_stream,
+disable_on_compile=True)`. The `do_multi_stream()` thread-local set by
+`CUDAGraphRunner` during capture activates the parallel branch.
+
+**Multi-stream perf result on isolated 8x B300:**
+
+| Config | TPS/user | Δ vs baseline | vs sequential |
+|---|---|---|---|
+| Baseline DFlash | 1324.86 | (anchor) | — |
+| F=4 sequential  | 1240.11 | -6.4% | (anchor) |
+| F=4 multi-stream | 1202.51 | -9.2% | -3.0% (worse) |
+| F=16 sequential | 1166.63 | -11.9% | (anchor) |
+| F=16 multi-stream | 1196.74 | -9.7% | +2.2% (better) |
+
+Multi-stream helps at large F (where parallel work amortizes the
+event/stream-switch host overhead) but hurts at small F. Consistent
+with the warning at `multi_stream_utils.py:42-43`:
+"Multi-stream is only enabled when cuda graph is turned on because
+switch stream has extra host overhead."
+
+**Conclusion**: multi-stream alone delivers ~2% recovery at best.
+Not enough to flip T-SSD net positive on gpt-oss-120b K=8. Needs
+to combine with kernel-level FFN-skip-after-last-capture (~3%) and
+commit-on-hit (~2-3%) to plausibly reach break-even or +1-2% net.
 
 **Pre-commit isolation result (2026-05-21):** F_total=0 gives
 bit-identical output to baseline DFlash on Qwen3-8B (`baseline ==
