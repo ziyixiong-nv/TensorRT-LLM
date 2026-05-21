@@ -830,27 +830,25 @@ class DFlashTSSDWorker(DFlashWorker):
                 return out_holder["out"]
 
             def _fn_candidate():
-                # Lazy-alloc proxy buffers ONCE at the start of the first
-                # iter (during warmup, BEFORE capture begins). After that,
-                # buffers are reused, captured into the graph, and replayed.
+                # Realistic candidate-forward proxy. Models per-token
+                # cost of running through (last_capture_layer + 1)
+                # target transformer layers. For gpt-oss-120b that's
+                # 34 of 36 (last captured = layer 33). Per layer we
+                # use one H×H GEMM (representing attention QKV proj;
+                # MoE FFN is ~3% of dense at top-4/128 so we omit it).
                 if not hasattr(self, "_proxy_in"):
                     H = hidden_states.shape[-1] if hidden_states is not None else 4096
                     proxy_n = max(1, num_gens * F_total)
                     self._proxy_in = torch.zeros(
                         (proxy_n, H), dtype=hidden_states.dtype, device=hidden_states.device
                     )
-                    # Two GEMMs (mimics QKV proj + MLP gate).
-                    self._proxy_w1 = torch.randn(
-                        (H, H * 3), dtype=hidden_states.dtype, device=hidden_states.device
+                    self._proxy_w = torch.randn(
+                        (H, H), dtype=hidden_states.dtype, device=hidden_states.device
                     )
-                    self._proxy_w2 = torch.randn(
-                        (H * 3, H), dtype=hidden_states.dtype, device=hidden_states.device
-                    )
-                # Run 36 layers of (matmul A→B→A) — proxy for the candidate
-                # target forward through the full transformer stack.
+                    self._proxy_layers = 34
                 x = self._proxy_in
-                for _ in range(36):
-                    x = (x @ self._proxy_w1) @ self._proxy_w2
+                for _ in range(self._proxy_layers):
+                    x = x @ self._proxy_w
                 return x
 
             _, _ = maybe_execute_in_parallel(

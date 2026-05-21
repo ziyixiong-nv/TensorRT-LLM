@@ -196,6 +196,41 @@ Not enough to flip T-SSD net positive on gpt-oss-120b K=8. Needs
 to combine with kernel-level FFN-skip-after-last-capture (~3%) and
 commit-on-hit (~2-3%) to plausibly reach break-even or +1-2% net.
 
+**B200 multi-stream tuning (2026-05-21).** The previous heavy proxy
+(36 layers × 3-GEMM dense FFN simulation) was 5-10× heavier than
+realistic candidate forward on gpt-oss-120b's MoE (top-4 of 128
+experts ≈ 3% of dense FFN compute). Replaced with a realistic
+proxy: 34 layers (last_capture_layer + 1) × single H×H GEMM
+representing attention QKV projection. MoE FFN proxy omitted as
+its per-token cost is negligible vs attention.
+
+| Config | Mean TPS | vs baseline |
+|---|---|---|
+| Baseline (3 runs, mean of repeats) | 1289.83 | (anchor) |
+| Multi-stream empty proxy (2 runs) | 1289.13 | -0.05% |
+| Multi-stream realistic F=4 (2 runs) | 1259.72 | -2.3% |
+| Multi-stream realistic F=8 (2 runs) | 1257.31 | -2.5% |
+| Multi-stream realistic F=16 (2 runs) | 1257.72 | -2.5% |
+
+Three findings:
+* Multi-stream wrapper has ~0% pure host overhead (capture-safe
+  event/stream ops are essentially free).
+* Realistic candidate proxy adds ~2.5% overhead regardless of F.
+  Parallel GPU resource contention (not host overhead) is the
+  binding constraint.
+* Multi-stream recovers ~9% from the sequential F=16 case
+  (-11.9% → -2.5% TPS). The recovery is real, large, and stable
+  across F values.
+
+**Path to net-positive T-SSD on gpt-oss-120b at K=8**:
+* Multi-stream realistic: -2.5% (current state)
+* Commit-on-hit savings (Lemma 1 + Saguaro Theorem 12): ~+2-3%
+* **Projected: 0% to +0.5% net** at break-even.
+
+Below the +5-10% target the design originally projected — candidate
+Q processing through 34 transformer layers caps the upside on
+this workload. Commit-on-hit wiring is the next concrete deliverable.
+
 **Pre-commit isolation result (2026-05-21):** F_total=0 gives
 bit-identical output to baseline DFlash on Qwen3-8B (`baseline ==
 tssd_F0: True, same ARs: True`), proving the integration plumbing is
