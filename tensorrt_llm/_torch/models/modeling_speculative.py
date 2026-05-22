@@ -1706,6 +1706,11 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
             if self.spec_worker is not None:
                 self.epilogue.append(self.spec_worker)
+                # T-SSD's extended verify needs to re-invoke the target model
+                # forward. Workers that don't use it (MTP, Eagle3, SA, baseline
+                # DFlash) ignore this hook.
+                if hasattr(self.spec_worker, "set_target_model"):
+                    self.spec_worker.set_target_model(self)
         self.layer_idx = -1
 
     def forward(
@@ -1719,6 +1724,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
+        # Pre-target hook: T-SSD's DFlashTSSDWorker uses this to populate
+        # candidate input slots with predicted tokens before target.model()
+        # consumes input_ids. Other workers (MTP, Eagle3, baseline DFlash)
+        # don't define the method → no-op.
+        if self.spec_worker is not None and hasattr(self.spec_worker,
+                                                    "prepare_target_inputs"):
+            self.spec_worker.prepare_target_inputs(input_ids, position_ids,
+                                                   attn_metadata, spec_metadata)
         hidden_states = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,

@@ -402,6 +402,10 @@ class DFlashTSSDWorker(DFlashWorker):
         self.tssd_enabled: bool = bool(getattr(spec_config, "tssd_enabled", False))
         self.tssd_F_total: int = int(getattr(spec_config, "tssd_F_total", 8))
         self.tssd_a_p: float = float(getattr(spec_config, "tssd_a_p", 0.78))
+        # Fused forward (Phase 2): per-gen Q grows from K+1 to K+1+F_total.
+        # Affects logits / accepted_tokens shape — worker must slice off
+        # the F_total candidate rows before delegating to the K+1 verify.
+        self.tssd_fused_forward: bool = bool(getattr(spec_config, "tssd_fused_forward", False))
         self.tssd_max_batch: int = int(getattr(spec_config, "tssd_max_batch", 2))
         self._extended_verify_fn: Optional[ExtendedVerifyFn] = extended_verify_fn
 
@@ -454,6 +458,141 @@ class DFlashTSSDWorker(DFlashWorker):
             self._event_main = None
             self._event_aux = None
 
+        # ---- Capture-safe hit-rate measurement state ----
+        # Top-F for hit-rate proxy. Picks F=4 (a representative T-SSD
+        # candidate width) so hit-rate ≈ "would top-4 candidates from the
+        # previous iter have covered the bonus token at this iter's k_star".
+        # Read TSSD_HIT_F env var to override.
+        import os as _os
+
+        self._tssd_hit_F = max(1, int(_os.environ.get("TSSD_HIT_F", "4")))
+        self._tssd_hit_enabled = (
+            torch.cuda.is_available()
+            and self.tssd_enabled
+            and bool(int(_os.environ.get("TSSD_MEASURE_HIT_RATE", "1")))
+        )
+
+        if self._tssd_hit_enabled:
+            K = self.max_draft_len
+            max_b = max(1, int(self.tssd_max_batch))
+            # Persistent counters (single-element int64 GPU tensors).
+            self._tssd_hits_gpu = torch.zeros(1, dtype=torch.int64, device="cuda")
+            self._tssd_total_gpu = torch.zeros(1, dtype=torch.int64, device="cuda")
+            self._tssd_inrange_gpu = torch.zeros(1, dtype=torch.int64, device="cuda")
+            # Phase 3 commit-on-hit eligibility counter: candidate INPUT
+            # equals iter t's bonus token (Lemma 1 input match).
+            self._tssd_input_match_gpu = torch.zeros(1, dtype=torch.int64, device="cuda")
+            # Last-iter top-F predicted tokens, per (gen request, slot, F).
+            # Init to -1 so first-iter compares miss naturally.
+            self._tssd_last_cands_gpu = torch.full(
+                (max_b, K + 1, self._tssd_hit_F),
+                fill_value=-1,
+                dtype=torch.int64,
+                device="cuda",
+            )
+            # Last iter's k_star per gen request. Init to K so first-iter
+            # target_slot = K + k_star_t + 1 > K → always out-of-range miss.
+            self._tssd_last_k_star_gpu = torch.full(
+                (max_b,), fill_value=K, dtype=torch.int64, device="cuda"
+            )
+            # Last-iter draft top-F predictions per (gen request, draft slot, F).
+            # Init to -1 so first-iter compares miss naturally.
+            #
+            # KNOWN ISSUE: under TRT-LLM's CUDA graph capture, this buffer's
+            # MEMORY behaves anomalously — writes via copy_ inside the
+            # captured graph don't visibly persist when the same address is
+            # read in subsequent replays (reads see 0 regardless of init or
+            # writes). The verify cache (`_tssd_last_cands_gpu`, allocated
+            # immediately before with the same dtype/device) works fine.
+            # Root cause not identified after extensive black-box investigation
+            # (see cache_debug runs in build/results/). Treat any draft-cache-
+            # based hit-rate or input-match measurement as broken until
+            # someone can dig into PyTorch CUDA graph allocator internals.
+            # Workaround: read candidate inputs directly from input_ids in
+            # the input-match measurement.
+            self._tssd_last_draft_cands_gpu = torch.full(
+                (max_b, K, self._tssd_hit_F),
+                fill_value=-1,
+                dtype=torch.int64,
+                device="cuda",
+            )
+
+            # Target-candidate cache for fused-forward Phase 2.
+            # Each group k of the §4.2 schedule contains F_k candidates;
+            # candidate at group k predicts sequence position B+k+2 (= one
+            # past where d_{k+1} would land). Store top-F_hit per candidate
+            # slot, indexed by flat candidate index (0..F_total-1). Lookup
+            # uses group→cand_idx map for sequence-position alignment.
+            # Init -1 so first-iter compares miss naturally.
+            f_tot = max(1, int(self.tssd_F_total))
+            self._tssd_last_target_cand_gpu = torch.full(
+                (max_b, f_tot, self._tssd_hit_F),
+                fill_value=-1,
+                dtype=torch.int64,
+                device="cuda",
+            )
+            # group_to_cand[k] = flat index of FIRST candidate in group k,
+            # or F_total (sentinel = out-of-range) if group k has F_k=0
+            # or k > K. Length K+2 so index K+1 is also a sentinel.
+            grp_map = [f_tot] * (K + 2)
+            running = 0
+            for k_idx, fk in enumerate(self._tssd_F_list):
+                if fk > 0 and k_idx <= K:
+                    grp_map[k_idx] = running
+                running += fk
+            self._tssd_group_to_cand_gpu = torch.tensor(grp_map, dtype=torch.int64, device="cuda")
+
+            # Inverse mappings: for each flat candidate index c in [0, F_total),
+            # which group does it belong to and what's its rank-within-group?
+            cand_to_group = []
+            cand_to_rank = []
+            for k_idx, fk in enumerate(self._tssd_F_list):
+                for r in range(fk):
+                    cand_to_group.append(k_idx)
+                    cand_to_rank.append(r)
+            assert len(cand_to_group) == f_tot, (
+                f"cand_to_group length {len(cand_to_group)} != F_total {f_tot}"
+            )
+            self._tssd_cand_to_group_gpu = torch.tensor(
+                cand_to_group, dtype=torch.int64, device="cuda"
+            )
+            self._tssd_cand_to_rank_gpu = torch.tensor(
+                cand_to_rank, dtype=torch.int64, device="cuda"
+            )
+
+        # ---- Phase 1 extended-verify infrastructure ----
+        # Pre-cache the §4.2 packed mask. Constant for the worker lifetime
+        # (K, F_list fixed at config time) so we build it once.
+        self._tssd_extended_verify_enabled = (
+            torch.cuda.is_available()
+            and self.tssd_enabled
+            and self.tssd_F_total > 0
+            and bool(int(_os.environ.get("TSSD_EXTENDED_VERIFY", "0")))
+        )
+        if self._tssd_extended_verify_enabled:
+            try:
+                self._tssd_packed_mask_gpu = build_tssd_packed_mask(
+                    K=self.max_draft_len,
+                    F=self._tssd_F_list,
+                    max_num_requests=max(1, int(self.tssd_max_batch)),
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"DFlashTSSDWorker: failed to build packed mask "
+                    f"(K={self.max_draft_len}, F={self._tssd_F_list}): {exc}. "
+                    f"Disabling extended verify."
+                )
+                self._tssd_extended_verify_enabled = False
+                self._tssd_packed_mask_gpu = None
+        else:
+            self._tssd_packed_mask_gpu = None
+
+        # Bound to the wrapping ModelForCausalLM via set_target_model() —
+        # gives extended verify a way to re-invoke the target forward.
+        # Stored as a weakref to avoid creating a cycle in nn.Module's
+        # child registry (parent → spec_worker → parent).
+        self._tssd_target_model_ref = None
+
         if self.tssd_enabled:
             logger.warning(
                 f"DFlashTSSDWorker: tssd_enabled=True, F_total={self.tssd_F_total}, "
@@ -486,6 +625,101 @@ class DFlashTSSDWorker(DFlashWorker):
         attention path."""
         self._extended_verify_fn = fn
 
+    def prepare_target_inputs(
+        self,
+        input_ids,
+        position_ids,
+        attn_metadata,
+        spec_metadata,
+    ) -> None:
+        """Pre-target hook (Phase 2.B fused-forward): populate the F_total
+        candidate slots of input_ids with previous iter's top-(rank+1)
+        draft model predictions per §4.2 group.
+
+        Layout per gen request: [bonus, d_1..d_K, cand_0..cand_{F-1}].
+        Candidate at flat index c belongs to group g(c) and has rank r(c)
+        within the group (precomputed in __init__). Its input token =
+        ``_tssd_last_draft_cands_gpu[gen_b, g(c), r(c)+1]`` — index r+1
+        skips top-1 (which is the actual draft token at slot g+1, already
+        present in input_ids) so candidates are *alternatives*.
+
+        Capture-safe: uses pre-allocated mapping tensors and scatter ops.
+        On the first iter the cache is -1 (sentinel); we clamp to 0 so
+        the candidate gets a valid (if noisy) token id. The §4.2 mask
+        prevents these candidate K/V from polluting verify regardless.
+
+        No-op when fused-forward is off, when measurement isn't running
+        (cache uninitialized), or for ctx-only batches.
+        """
+        if not (self.tssd_fused_forward and self.tssd_F_total > 0):
+            return
+        if input_ids is None:
+            return
+        if not getattr(self, "_tssd_hit_enabled", False):
+            return  # Cache not maintained → can't fill candidates safely.
+
+        K = self.max_draft_len
+        F_total = self.tssd_F_total
+        num_seqs = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        num_gens = num_seqs - num_contexts
+        if num_gens == 0:
+            return
+
+        per_gen = K + 1 + F_total
+        total_gen_tokens = num_gens * per_gen
+        # Gen tokens are contiguous at the end of input_ids[:num_tokens].
+        num_tokens = attn_metadata.num_tokens
+        gen_start = num_tokens - total_gen_tokens
+        if gen_start < 0:
+            return  # Sanity: shape mismatch, abort.
+
+        # Gather the candidate token at each flat cand index.
+        # Step 1: pick the (group, rank) cell from the cache per cand.
+        # Cache shape [max_b, K, F_hit].
+        last_draft = self._tssd_last_draft_cands_gpu[:num_gens]  # [num_gens, K, F_hit]
+        F_hit = self._tssd_hit_F
+        # rank_idx = rank+1, clamped so top-1 is skipped and we don't run
+        # past the cached width.
+        rank_idx = (self._tssd_cand_to_rank_gpu + 1).clamp(max=F_hit - 1)
+        grp_idx = self._tssd_cand_to_group_gpu  # [F_total], in [0, K]
+
+        # gather along dim=1 (group): [num_gens, F_total, F_hit]
+        gather_grp = grp_idx.view(1, F_total, 1).expand(num_gens, F_total, F_hit)
+        g1 = last_draft.gather(1, gather_grp)
+        # gather along dim=2 (rank): [num_gens, F_total, 1]
+        gather_rnk = rank_idx.view(1, F_total, 1).expand(num_gens, F_total, 1)
+        cand_tokens = g1.gather(2, gather_rnk).squeeze(2)  # [num_gens, F_total] int64
+        # First-iter sentinel: -1 → 0 (valid pad-equivalent token).
+        cand_tokens = cand_tokens.clamp(min=0)
+
+        # Compute target slots in input_ids. base_g = gen_start + g * per_gen,
+        # then K+1 + c for c=0..F_total-1.
+        g_idx = torch.arange(num_gens, device="cuda", dtype=torch.int64).unsqueeze(1)
+        c_idx = torch.arange(F_total, device="cuda", dtype=torch.int64).unsqueeze(0)
+        slot_idx = gen_start + g_idx * per_gen + (K + 1) + c_idx  # [num_gens, F_total]
+
+        # Scatter into input_ids (1D long tensor).
+        input_ids.view(-1).scatter_(
+            0, slot_idx.flatten(), cand_tokens.flatten().to(input_ids.dtype)
+        )
+
+    def set_target_model(self, target_model) -> None:
+        """Bind the target model wrapper (the ``*ForCausalLM`` instance the
+        worker is attached to). Phase 1 extended verify uses this handle to
+        re-invoke ``target_model.model(...)`` with the candidate Q after the
+        main verify completes. Called once at construction by
+        ``modeling_speculative.py``.
+
+        Stored via a weak reference so PyTorch's nn.Module child-walk
+        (``named_children``, recursive setattr) doesn't see the parent and
+        loop forever (parent already owns this worker as a child)."""
+        import weakref
+
+        self._tssd_target_model_ref = (
+            weakref.ref(target_model) if target_model is not None else None
+        )
+
     # ------------------------------------------------------------------ stats
     def stats(self) -> Dict[str, int]:
         out = dict(
@@ -498,9 +732,13 @@ class DFlashTSSDWorker(DFlashWorker):
         if hasattr(self, "_tssd_hits_gpu"):
             h = int(self._tssd_hits_gpu.item())
             t = int(self._tssd_total_gpu.item())
+            inr = int(self._tssd_inrange_gpu.item()) if hasattr(self, "_tssd_inrange_gpu") else 0
             out["hits_gpu"] = h
             out["total_gpu"] = t
+            out["inrange_gpu"] = inr
             out["hit_rate"] = h / t if t > 0 else 0.0
+            out["hit_rate_inrange"] = h / inr if inr > 0 else 0.0
+            out["inrange_frac"] = inr / t if t > 0 else 0.0
         return out
 
     def __del__(self):
@@ -509,12 +747,27 @@ class DFlashTSSDWorker(DFlashWorker):
             if hasattr(self, "_tssd_hits_gpu"):
                 h = int(self._tssd_hits_gpu.item())
                 t = int(self._tssd_total_gpu.item())
+                inr = (
+                    int(self._tssd_inrange_gpu.item()) if hasattr(self, "_tssd_inrange_gpu") else 0
+                )
+                im = (
+                    int(self._tssd_input_match_gpu.item())
+                    if hasattr(self, "_tssd_input_match_gpu")
+                    else 0
+                )
                 if t > 0:
                     import sys
 
                     rate = h / t
+                    rate_inr = h / inr if inr > 0 else 0.0
+                    inr_frac = inr / t
+                    im_rate = im / t
                     print(
-                        f"[T-SSD final] hits={h} / total={t} hit_rate={rate:.4f}",
+                        f"[T-SSD final] hits={h} / total={t} hit_rate={rate:.4f} "
+                        f"| inrange={inr} ({inr_frac:.3f}) hit_rate_inrange={rate_inr:.4f} "
+                        f"| input_match={im} ({im_rate:.4f}) "
+                        f"[NOTE: input_match unreliable due to draft cache "
+                        f"zeroing under CUDA graph; see code comment]",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -797,17 +1050,34 @@ class DFlashTSSDWorker(DFlashWorker):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        # Multi-stream candidate work via TRTLLM's
-        # ``maybe_execute_in_parallel`` — capture-safe, replays correctly
-        # under CUDA graphs. Pattern:
-        #   * fn0 (default stream): super().forward (baseline DFlash)
-        #   * fn1 (aux stream): candidate proxy compute (placeholder for
-        #     real candidate target forward; will be replaced once the
-        #     full integration lands)
-        # The aux_stream and events are pre-allocated once (in __init__'s
-        # parent process before capture); inside capture they're recorded
-        # as graph ops and replayed every iter.
-        from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
+        # Phase 2 fused-forward: model_engine assembled per-gen Q of size
+        # K+1+F_total, target ran with the §4.2 packed mask, gather_ids
+        # picked all K+1+F_total rows. Logits / hidden_states arrive with
+        # F_total candidate rows appended per gen request — slice them off
+        # so the K+1 verify path (sample_and_accept, mamba update, …) sees
+        # the original baseline shape. The candidate logits are stashed
+        # for hit-rate / commit-on-hit consumption later in this forward.
+        K_eff = self.max_draft_len
+        cand_logits_for_measurement = None
+        if self.tssd_fused_forward and self.tssd_F_total > 0 and num_gens > 0:
+            full = logits
+            verify_per_gen = K_eff + 1
+            cand_per_gen = self.tssd_F_total
+            total_per_gen = verify_per_gen + cand_per_gen
+            ctx_logits = full[:num_contexts]
+            gen_full = full[num_contexts : num_contexts + num_gens * total_per_gen]
+            gen_full = gen_full.view(num_gens, total_per_gen, -1)
+            verify_block = gen_full[:, :verify_per_gen, :].reshape(num_gens * verify_per_gen, -1)
+            cand_logits_for_measurement = gen_full[:, verify_per_gen:, :].contiguous()
+            logits = torch.cat([ctx_logits, verify_block], dim=0)
+
+        # Multi-stream split: target verify on default stream, draft prep
+        # on aux stream. Phases A/C run on default; phase B (draft) runs on
+        # aux. Aux waits on a verify_done event recorded after Phase A so
+        # draft cannot overtake target setup. Default stream then waits on
+        # an aux_done event before running Phase C (which needs the draft
+        # tokens). Capture-safe — events + streams are pre-allocated.
+        from ..modules.multi_stream_utils import do_multi_stream
 
         if (
             num_gens > 0
@@ -816,61 +1086,170 @@ class DFlashTSSDWorker(DFlashWorker):
             and getattr(self, "_aux_stream", None) is not None
             and do_multi_stream()
         ):
-            # Closure for default-stream fn0 (the actual DFlash work).
-            out_holder = {}
-
-            def _fn_main():
-                out_holder["out"] = super(DFlashTSSDWorker, self).forward(
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    hidden_states=hidden_states,
-                    logits=logits,
-                    attn_metadata=attn_metadata,
-                    spec_metadata=spec_metadata,
-                    draft_model=draft_model,
-                    resource_manager=resource_manager,
-                )
-                return out_holder["out"]
-
-            def _fn_candidate():
-                # No-op by default: scaffold runs zero compute on aux
-                # stream so tssd_enabled=true has ~0% TPS overhead vs
-                # baseline. Real candidate target forward (which would
-                # produce hidden states for commit-on-hit) requires
-                # plumbing target_model reference into the worker — see
-                # PHASE2_PROGRESS.md for the integration scope.
-                #
-                # Set TSSD_PROXY_LAYERS env var > 0 to run the placeholder
-                # GEMM proxy for cost-modeling experiments.
-                import os
-
-                proxy_layers = int(os.environ.get("TSSD_PROXY_LAYERS", "0"))
-                if proxy_layers <= 0:
-                    return None
-                if not hasattr(self, "_proxy_in"):
-                    H = hidden_states.shape[-1] if hidden_states is not None else 4096
-                    proxy_n = max(1, num_gens * F_total)
-                    self._proxy_in = torch.zeros(
-                        (proxy_n, H), dtype=hidden_states.dtype, device=hidden_states.device
-                    )
-                    self._proxy_w = torch.randn(
-                        (H, H), dtype=hidden_states.dtype, device=hidden_states.device
-                    )
-                    self._proxy_layers = proxy_layers
-                x = self._proxy_in
-                for _ in range(self._proxy_layers):
-                    x = x @ self._proxy_w
-                return x
-
-            _, _ = maybe_execute_in_parallel(
-                _fn_main,
-                _fn_candidate,
-                self._event_main,
-                self._event_aux,
-                aux_stream=self._aux_stream,
-                disable_on_compile=True,
+            # Phase A on default stream.
+            state = super(DFlashTSSDWorker, self)._forward_target_phase(
+                input_ids,
+                position_ids,
+                hidden_states,
+                logits,
+                attn_metadata,
+                spec_metadata,
+                draft_model,
+                resource_manager,
             )
-            out = out_holder["out"]
+            # Mark the end of Phase A on default stream so aux can sync.
+            self._event_main.record()
+
+            # Phase B on aux stream.
+            with torch.cuda.stream(self._aux_stream):
+                self._event_main.wait()
+                gen_draft_tokens = super(DFlashTSSDWorker, self)._forward_draft_phase(
+                    state, attn_metadata, draft_model
+                )
+                self._event_aux.record()
+
+            # Default stream waits for draft compute to land.
+            self._event_aux.wait()
+
+            # Phase C on default stream.
+            out = super(DFlashTSSDWorker, self)._forward_finalize_phase(
+                state, gen_draft_tokens, attn_metadata, spec_metadata
+            )
+
+            # ---- Capture-safe hit-rate measurement ----
+            # Two-cache lookup at sequence-aligned positions:
+            #   target verify cache:  K+1 slots predicting positions
+            #       A_{t-1}+1..A_{t-1}+K+1
+            #     match slot = k_star_{t-1} + k_star_t + 1   (≤ K_eff)
+            #   draft model cache:    K slots predicting positions
+            #       A_{t-1}+k_star_{t-1}+2..A_{t-1}+k_star_{t-1}+1+K
+            #     match slot = k_star_t                       (< K_eff)
+            # Combined hit / inrange = (target OR draft). Tensor-only ops +
+            # persistent buffers so it replays correctly under CUDA graphs.
+            if self._tssd_hit_enabled and num_gens > 0:
+                K_eff = self.max_draft_len
+                F = self._tssd_hit_F
+                accepted = out["new_tokens"]  # [B, K+1] int32
+                n_acc = out["new_tokens_lens"]  # [B] int32
+                cur_logits = logits  # [num_ctx + num_gens*(K+1), V]
+
+                gen_accept = accepted[
+                    num_contexts : num_contexts + num_gens
+                ].long()  # [num_gens, K+1]
+                gen_n_acc = n_acc[num_contexts : num_contexts + num_gens].long()  # [num_gens]
+                k_star = (gen_n_acc - 1).clamp(min=0, max=K_eff)  # [num_gens]
+                x_star = gen_accept.gather(1, k_star.unsqueeze(1)).squeeze(1).long()  # [num_gens]
+
+                # ---- target verify cache lookup ----
+                last_k_star = self._tssd_last_k_star_gpu[:num_gens]
+                target_slot = last_k_star + k_star + 1
+                inrange_t = target_slot <= K_eff  # [num_gens] bool
+                target_slot_safe = target_slot.clamp(min=0, max=K_eff)
+                last_cands = self._tssd_last_cands_gpu[:num_gens]
+                idx_t = target_slot_safe.view(num_gens, 1, 1).expand(num_gens, 1, F)
+                cands_t = last_cands.gather(1, idx_t).squeeze(1)
+                match_t = (cands_t == x_star.unsqueeze(1)).any(dim=1)
+                hit_t = match_t & inrange_t
+
+                # ---- draft model cache lookup ----
+                # Draft slot j == k_star_t covers iter t's bonus position.
+                # Always in [0, K_eff-1] when k_star_t < K_eff.
+                inrange_d = k_star < K_eff
+                draft_slot_safe = k_star.clamp(min=0, max=K_eff - 1)
+                last_draft = self._tssd_last_draft_cands_gpu[:num_gens]  # [num_gens, K, F]
+                idx_d = draft_slot_safe.view(num_gens, 1, 1).expand(num_gens, 1, F)
+                cands_d = last_draft.gather(1, idx_d).squeeze(1)
+                match_d = (cands_d == x_star.unsqueeze(1)).any(dim=1)
+                hit_d = match_d & inrange_d
+
+                # ---- target candidate cache lookup (fused-forward only) ----
+                # Candidate at group k predicts sequence position B+k+2 of
+                # next iter, i.e., bonus position when k = k_star_{t-1}+k_star_t.
+                # Group→cand_idx map sentinel = F_total when out-of-range.
+                if self.tssd_fused_forward and self.tssd_F_total > 0:
+                    f_tot = self.tssd_F_total
+                    target_group = (last_k_star + k_star).clamp(min=0, max=K_eff + 1)
+                    target_cand_idx = self._tssd_group_to_cand_gpu[target_group]
+                    inrange_c = target_cand_idx < f_tot  # [num_gens] bool
+                    cand_idx_safe = target_cand_idx.clamp(min=0, max=f_tot - 1)
+                    last_cand_t = self._tssd_last_target_cand_gpu[
+                        :num_gens
+                    ]  # [num_gens, F_total, F]
+                    idx_c = cand_idx_safe.view(num_gens, 1, 1).expand(num_gens, 1, F)
+                    cands_c = last_cand_t.gather(1, idx_c).squeeze(1)
+                    match_c = (cands_c == x_star.unsqueeze(1)).any(dim=1)
+                    hit_c = match_c & inrange_c
+
+                    # ---- Phase 3 input-match: candidate INPUT == iter t's bonus ----
+                    # Workaround for the draft-cache zeroing pathology:
+                    # read the candidate input directly from input_ids (which
+                    # is the model's input buffer, definitely persistent
+                    # across capture/replay). Candidate at group k_star_t sits
+                    # at input_ids slot gen_start + K + 1 + k_star_t per gen.
+                    # In-range: k_star_t < K (cand groups span 0..K-1 for
+                    # F=[1,...,1,0]; group K has F_K=0 → no candidate).
+                    inrange_im = k_star < K_eff  # [num_gens] bool
+                    if input_ids is not None and self.tssd_F_total > 0:
+                        per_gen = K_eff + 1 + self.tssd_F_total
+                        num_tokens = input_ids.shape[0]
+                        gen_start_im = num_tokens - num_gens * per_gen
+                        if gen_start_im >= 0:
+                            # Per-gen slot offset:
+                            # gen_start + g*per_gen + (K+1) + k_star_g
+                            g_idx_im = torch.arange(num_gens, device="cuda", dtype=torch.int64)
+                            slot_idx_im = (
+                                gen_start_im
+                                + g_idx_im * per_gen
+                                + (K_eff + 1)
+                                + k_star.clamp(min=0, max=K_eff - 1)
+                            )
+                            cand_input_tok = input_ids.view(-1)[slot_idx_im].long()
+                            match_im = cand_input_tok == x_star
+                            hit_im = match_im & inrange_im
+                        else:
+                            hit_im = torch.zeros_like(hit_c)
+                    else:
+                        hit_im = torch.zeros_like(hit_c)
+                else:
+                    hit_c = torch.zeros_like(hit_t)
+                    inrange_c = torch.zeros_like(inrange_t)
+                    hit_im = torch.zeros_like(hit_t)
+
+                # Combined.
+                inrange = inrange_t | inrange_d | inrange_c
+                hit_per_req = hit_t | hit_d | hit_c
+                self._tssd_hits_gpu.add_(hit_per_req.long().sum())
+                self._tssd_inrange_gpu.add_(inrange.long().sum())
+                self._tssd_total_gpu.add_(num_gens)
+                # Phase 3 commit-on-hit eligibility: candidate INPUT == bonus.
+                self._tssd_input_match_gpu.add_(hit_im.long().sum())
+
+                # ---- update target cache (this iter's verify top-F) ----
+                gen_logits = cur_logits[num_contexts : num_contexts + num_gens * (K_eff + 1)]
+                gen_logits = gen_logits.reshape(num_gens, K_eff + 1, -1)
+                _, topF_t = gen_logits.topk(F, dim=-1)  # [num_gens, K+1, F]
+                self._tssd_last_cands_gpu[:num_gens].copy_(topF_t.long())
+
+                # ---- update draft cache (this iter's draft top-F) ----
+                # NOTE: writes here don't reliably persist for capture-replay
+                # reads. See _tssd_last_draft_cands_gpu allocation comment.
+                draft_logits = state.get("_draft_logits", None)
+                if draft_logits is not None:
+                    _, topF_d = draft_logits.topk(F, dim=-1)  # [num_gens, K, F]
+                    self._tssd_last_draft_cands_gpu[:num_gens].copy_(topF_d.long())
+
+                # ---- update target candidate cache (fused-forward only) ----
+                if (
+                    self.tssd_fused_forward
+                    and self.tssd_F_total > 0
+                    and cand_logits_for_measurement is not None
+                ):
+                    _, topF_c = cand_logits_for_measurement.topk(F, dim=-1)
+                    # topF_c shape [num_gens, F_total, F] int64
+                    self._tssd_last_target_cand_gpu[:num_gens].copy_(topF_c.long())
+
+                self._tssd_last_k_star_gpu[:num_gens].copy_(k_star)
+
             self._tssd_iters_gated_on += 1
             return out
 

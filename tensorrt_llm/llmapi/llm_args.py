@@ -1824,24 +1824,43 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "show catastrophic attention overhead (>130%%) at B>=4 across all "
         "tested prefix lengths.")
 
+    tssd_fused_forward: bool = Field(
+        default=False,
+        description=
+        "Phase 2 (fused single target forward): grow per-gen verify Q from "
+        "K+1 to K+1+F_total so candidate tokens share the main-verify forward "
+        "via the §4.2 packed mask. Disabled by default to keep older "
+        "measurement-only T-SSD configurations (multi-stream + draft-cache "
+        "hit-rate proxy) running on the K+1 Q layout. Requires "
+        "tssd_enabled=True and tssd_F_total>0 to take effect.")
+
     decoding_type: Literal["DFlash"] = "DFlash"
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
-        # Baseline DFlash and multi-stream T-SSD both use K main draft +
-        # 1 bonus = K+1 tokens per gen in main target verify. T-SSD
-        # candidates are processed via a SEPARATE target forward call on
-        # a parallel stream; they don't enter main verify shape.
-        self.max_total_draft_tokens = self.max_draft_len
+        # Baseline DFlash and measurement-only T-SSD: K main draft +
+        # 1 bonus = K+1 tokens / gen.
+        # Fused-forward T-SSD (Phase 2): K main draft + 1 bonus + F_total
+        # candidate tokens = K+1+F_total per gen. The candidate tokens
+        # share the main-verify forward via the §4.2 packed mask
+        # (attn_metadata.spec_decoding_packed_mask), so they enter the
+        # main verify shape and grow max_total_draft_tokens accordingly.
+        if self.tssd_enabled and self.tssd_fused_forward and self.tssd_F_total > 0:
+            self.max_total_draft_tokens = self.max_draft_len + self.tssd_F_total
+        else:
+            self.max_total_draft_tokens = self.max_draft_len
         return self
 
     @property
     def tokens_per_gen_step(self) -> int:
-        """DFlash main-verify tokens per gen request (K drafts + 1 bonus).
+        """DFlash main-verify tokens per gen request.
 
-        T-SSD candidates run on a separate stream — see
-        DFLASH_TARGET_SIDE_SSD_DESIGN.md §7.2 (multi-stream design).
+        Baseline / measurement-only T-SSD: K drafts + 1 bonus = K+1.
+        Fused-forward T-SSD: K drafts + 1 bonus + F_total candidates.
+        See DFLASH_TARGET_SIDE_SSD_DESIGN.md §4.2.
         """
+        if self.tssd_enabled and self.tssd_fused_forward and self.tssd_F_total > 0:
+            return self.max_draft_len + 1 + self.tssd_F_total
         return self.max_draft_len + 1
 
     def supports_backend(self, backend: str) -> bool:

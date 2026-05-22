@@ -427,6 +427,35 @@ class DFlashWorker(SpecWorkerBase):
         draft_model,
         resource_manager=None,
     ):
+        state = self._forward_target_phase(
+            input_ids,
+            position_ids,
+            hidden_states,
+            logits,
+            attn_metadata,
+            spec_metadata,
+            draft_model,
+            resource_manager,
+        )
+        gen_draft_tokens = self._forward_draft_phase(state, attn_metadata, draft_model)
+        return self._forward_finalize_phase(state, gen_draft_tokens, attn_metadata, spec_metadata)
+
+    def _forward_target_phase(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+        resource_manager,
+    ):
+        """Phase A: input prep, target verify (sample+accept), mamba update,
+        attn-metadata munging for the draft pass, prefill-context capture,
+        and prepare_1st_drafter_inputs. Returns a state dict consumed by
+        the draft and finalize phases.
+        """
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
@@ -440,8 +469,7 @@ class DFlashWorker(SpecWorkerBase):
 
         # Save context lengths before warmup to prevent accumulation
         is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
-        if is_warmup:
-            saved_ctx_len = self._ctx_len.clone()
+        saved_ctx_len = self._ctx_len.clone() if is_warmup else None
 
         self._execute_guided_decoder_if_present(logits)
 
@@ -509,6 +537,32 @@ class DFlashWorker(SpecWorkerBase):
 
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
+        return {
+            "batch_size": batch_size,
+            "num_contexts": num_contexts,
+            "num_gens": num_gens,
+            "K": K,
+            "raw_logits": raw_logits,
+            "is_warmup": is_warmup,
+            "saved_ctx_len": saved_ctx_len,
+            "accepted_tokens": accepted_tokens,
+            "num_accepted_tokens": num_accepted_tokens,
+            "position_ids": position_ids,
+            "inputs": inputs,
+            "draft_kv_cache_manager": draft_kv_cache_manager,
+        }
+
+    def _forward_draft_phase(self, state, attn_metadata, draft_model):
+        """Phase B: draft model forward + LM-head + argmax → gen_draft_tokens.
+
+        Reads only state from Phase A; safe to launch on a non-default
+        CUDA stream as long as the caller has synchronized with Phase A.
+        """
+        num_gens = state["num_gens"]
+        K = state["K"]
+        inputs = state["inputs"]
+        draft_kv_cache_manager = state["draft_kv_cache_manager"]
+
         if num_gens > 0:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
                 hidden_states_out = draft_model.dflash_forward(
@@ -536,6 +590,10 @@ class DFlashWorker(SpecWorkerBase):
                 vocab_size = gen_logits.shape[-1]
                 gen_logits = gen_logits.reshape(num_gens, self.max_draft_len, vocab_size)
 
+                # Expose draft logits to subclass extensions (e.g., T-SSD
+                # hit-rate proxy uses them as extended-verify predictions).
+                state["_draft_logits"] = gen_logits
+
                 d2t = getattr(draft_model.model, "d2t", None)
                 gen_draft_tokens = torch.argmax(gen_logits, dim=-1, keepdim=False).long()
 
@@ -543,9 +601,22 @@ class DFlashWorker(SpecWorkerBase):
                     gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
 
                 gen_draft_tokens = gen_draft_tokens.type(torch.int32)
-
         else:
             gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
+
+        return gen_draft_tokens
+
+    def _forward_finalize_phase(self, state, gen_draft_tokens, attn_metadata, spec_metadata):
+        """Phase C: cat ctx+gen draft tokens, restore attn metadata, KV
+        rewind, prepare_next_new_tokens, restore ctx_len under warmup.
+        Returns the final output dict.
+        """
+        num_contexts = state["num_contexts"]
+        num_gens = state["num_gens"]
+        K = state["K"]
+        accepted_tokens = state["accepted_tokens"]
+        num_accepted_tokens = state["num_accepted_tokens"]
+        batch_size = state["batch_size"]
 
         if num_contexts > 0 and num_gens > 0:
             ctx_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
@@ -567,11 +638,11 @@ class DFlashWorker(SpecWorkerBase):
         )
 
         # Restore context lengths after warmup
-        if is_warmup:
-            self._ctx_len.copy_(saved_ctx_len)
+        if state["is_warmup"]:
+            self._ctx_len.copy_(state["saved_ctx_len"])
 
         return {
-            "logits": raw_logits,
+            "logits": state["raw_logits"],
             "new_tokens": accepted_tokens,
             "new_tokens_lens": num_accepted_tokens,
             "next_draft_tokens": next_draft_tokens,
