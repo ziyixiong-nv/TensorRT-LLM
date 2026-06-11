@@ -145,6 +145,8 @@ def get_spec_metadata(spec_config,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
             dtype=model_config.torch_dtype,
+            use_dynamic_tree=getattr(spec_config, 'use_dynamic_tree', False),
+            spec_resource_manager=spec_resource_manager,
         )
     if spec_config.spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelSpecMetadata(
@@ -270,6 +272,10 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_tokens,
         )
     if spec_dec_mode.is_parallel_draft():
+        if spec_dec_mode.is_dflash() and getattr(spec_config,
+                                                 'use_dynamic_tree', False):
+            from .dflash import DFlashTreeResourceManager
+            return DFlashTreeResourceManager(spec_config, max_num_requests)
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
             return SuffixAutomatonManager(sa_cfg, max_num_requests, max_seq_len)

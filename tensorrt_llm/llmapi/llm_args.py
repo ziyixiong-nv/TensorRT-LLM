@@ -2009,21 +2009,58 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "for cross-attention in the draft model. If None, read from the draft "
         "model config (dflash_config.target_layer_ids).")
 
+    ddtree_node_budget: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Enables DDTree (Diffusion Draft Tree) for DFlash. When set, the per-position "
+        "marginal distributions from the single drafter forward are assembled into a "
+        "draft tree with this many nodes (the budget B) instead of a single linear "
+        "chain, so the target can verify multiple continuations in one forward pass. "
+        "If None, DFlash uses the original linear-chain drafting.")
+
+    ddtree_max_topk: PositiveInt = Field(
+        default=8,
+        description=
+        "Per-position vocabulary fan-out cap for DDTree construction. Bounds how many "
+        "of the highest-probability tokens at each block position may enter the draft "
+        "tree, which limits the branching factor of the best-first search.")
+
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
+
+    @property
+    def use_dynamic_tree(self) -> bool:
+        """DDTree builds a per-request dynamic tree from the drafter marginals."""
+        return self.ddtree_node_budget is not None
+
+    @functools.cached_property
+    def is_linear_tree(self) -> bool:
+        # The base definition (max_draft_len == max_total_draft_tokens) is True
+        # for DDTree whenever B == K (e.g. the V=1 forcing trick).  That would
+        # let model_engine reclassify gens with drafts as chunked-context
+        # requests (extend_ctx), routing the target through the causal context
+        # kernel and bypassing the dynamic-tree custom-mask FMHA path that
+        # `is_spec_dec_dynamic_tree` is supposed to select.
+        if self.use_dynamic_tree:
+            return False
+        return self.max_draft_len == self.max_total_draft_tokens
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
-        self.max_total_draft_tokens = self.max_draft_len
+        if self.ddtree_node_budget is not None:
+            self.max_total_draft_tokens = self.ddtree_node_budget
+        else:
+            self.max_total_draft_tokens = self.max_draft_len
         return self
 
     @property
     def tokens_per_gen_step(self) -> int:
-        """DFlash only needs K+1 tokens per gen request (K drafts + 1 bonus).
+        """Tokens the target verifies per gen request: drafts + 1 bonus.
 
-        The draft produces its own mask queries internally; passing mask
-        fillers through the target is pure wasted work at large batch size.
+        Linear DFlash needs K+1 (K drafts + 1 bonus); the draft produces its
+        own mask queries internally, so passing mask fillers through the
+        target is pure wasted work. DDTree needs B+1 (B tree nodes + bonus).
         """
-        return self.max_draft_len + 1
+        return self.max_total_draft_tokens + 1
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"

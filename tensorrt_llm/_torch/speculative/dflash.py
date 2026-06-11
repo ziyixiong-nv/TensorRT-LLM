@@ -20,17 +20,63 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 from torch import nn
 
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
+from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager
+from .ddtree_ops import (
+    _ddtree_build_candidates,
+    _ddtree_post_scatter,
+    _ddtree_pre_init,
+    _ddtree_slot_scatter,
+    _ddtree_topk,
+    build_ddtree,
+)
+from .dynamic_tree_ops import DynamicTreeOpsConverter
 from .interface import SpecMetadata, SpecWorkerBase
+from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DFlashDecodingConfig
+
+
+class DFlashTreeResourceManager(BaseResourceManager):
+    """Lightweight resource manager for DFlash DDTree (dynamic tree) mode.
+
+    Owns a :class:`SpecTreeManager` configured for dynamic trees so the model
+    engine, attention backend, and DFlash worker can share per-slot tree
+    storage for tree attention setup and verification routing. Mirrors
+    :class:`Eagle3OneModelDynamicTreeResourceManager`.
+    """
+
+    def __init__(self, config: "DFlashDecodingConfig", max_num_requests: int):
+        self.max_num_requests = max_num_requests
+        self.spec_tree_manager = SpecTreeManager(
+            max_num_requests=max_num_requests,
+            use_dynamic_tree=True,
+            max_draft_len=config.max_draft_len,
+            max_total_draft_tokens=config.max_total_draft_tokens,
+            eagle_choices=None,
+            dynamic_tree_max_topK=config.ddtree_max_topk,
+        )
+
+    def free_resources(self, request: LlmRequest):
+        """Clear tree validity for the freed request slot."""
+        if request.py_seq_slot is not None:
+            self.spec_tree_manager.slot_storage.mark_invalid(request.py_seq_slot)
+
+    def add_dummy_requests(self, request_ids: List[int]):
+        """CUDA graph dummies use the spec_tree_manager dummy slot; no-op."""
+
+    def get_max_resource_count(self) -> int:
+        return self.max_num_requests
+
+    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
+        return 0
 
 
 @dataclass
@@ -44,6 +90,11 @@ class DFlashSpecMetadata(SpecMetadata):
 
     batch_indices_cuda: Optional[torch.Tensor] = None
     spec_resource_manager: Optional[BaseResourceManager] = None
+
+    # DDTree (dynamic tree) mode. When True, the worker expands DFlash's
+    # per-position marginals into a draft tree and verifies it with tree
+    # attention instead of the linear argmax chain.
+    use_dynamic_tree: bool = False
 
     # Hidden state capture fields
     layers_to_capture: Optional[List[int]] = None
@@ -59,8 +110,14 @@ class DFlashSpecMetadata(SpecMetadata):
             device="cuda",
         )
 
-        self.is_spec_dec_tree = False
-        self.is_spec_dec_dynamic_tree = False
+        # DDTree is a dynamic per-request tree; the linear DFlash path keeps
+        # both flags False so the attention backend uses the causal chain.
+        import os as _os
+
+        _dbg_causal = _os.environ.get("DFLASH_DBG_CAUSAL") == "1"
+        self.is_spec_dec_tree = self.use_dynamic_tree and not _dbg_causal
+        self.is_spec_dec_dynamic_tree = self.use_dynamic_tree and not _dbg_causal
+        self.spec_tree_manager = getattr(self.spec_resource_manager, "spec_tree_manager", None)
 
         # Set up hidden state capture buffer
         if self.layers_to_capture is not None and len(self.layers_to_capture) > 0:
@@ -181,23 +238,396 @@ class DFlashWorker(SpecWorkerBase):
         self._req_to_slot = {}  # request_id -> slot index
         self._free_slots = deque()  # available slot indices
 
+        # DDTree state (resolved lazily on the first tree-mode forward).
+        self.spec_tree_manager = None
+        self._tree_ops_converter = None
+        self._tree_accepted_indices = None
+        self._kv_head_dim_bytes = None
+
         logger.info(
             f"DFlashWorker initialized with use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
         )
+
+    def _ensure_tree_ops(self, resource_manager, max_num_requests):
+        """Lazily resolve the spec_tree_manager and tree-verify converter."""
+        if self._tree_ops_converter is not None:
+            return
+        if self.spec_tree_manager is None and resource_manager is not None:
+            from ..pyexecutor.resource_manager import ResourceManagerType
+
+            spec_rm = resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER
+            )
+            if spec_rm is not None and hasattr(spec_rm, "spec_tree_manager"):
+                self.spec_tree_manager = spec_rm.spec_tree_manager
+        # Tree depth is K (DFlash max_draft_len), so the accepted path is at
+        # most K+1 nodes (root bonus + one token per draft position). The
+        # node budget B sets the verify candidate count N = B+1.
+        self._tree_ops_converter = DynamicTreeOpsConverter(
+            dynamic_tree_max_topK=self.vocab_fanout,
+            max_draft_len=self.max_draft_len,
+            max_total_draft_tokens=self.node_budget,
+            max_batch_size=max_num_requests,
+            device=torch.device("cuda"),
+        )
+        # Tree-node index (0-based into the B drafted nodes) of each accepted
+        # draft token per request; -1 = no token. Consumed by KV relocation
+        # and the ctx-branch feature append. K columns = max accepted drafts.
+        self._tree_accepted_indices = torch.full(
+            (max_num_requests, self.max_draft_len),
+            -1,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        # Position (0-based into the B+1 target tokens) of each node on the
+        # accepted branch, root included; root=0. Used to gather the accepted
+        # branch's captured hidden states for the ctx-feature append.
+        self._tree_accept_path = torch.zeros(
+            (max_num_requests, self.max_draft_len + 1),
+            dtype=torch.long,
+            device="cuda",
+        )
+        # Pre-allocated verify scratch (mirrors Eagle3OneModelDynamicTreeWorker).
+        # Avoids per-iteration tensor allocs in _sample_and_accept_ddtree, which
+        # at BS=1 turns into a measurable fraction of the step budget.
+        N = self.node_budget + 1
+        max_path_len = self.max_draft_len + 1
+        self._accepted_tokens_buf = torch.zeros(
+            (max_num_requests, max_path_len), dtype=torch.int32, device="cuda"
+        )
+        self._num_accepted_tokens_buf = torch.ones(
+            max_num_requests, dtype=torch.int32, device="cuda"
+        )
+        self._target_predict_buf = torch.zeros(
+            (max_num_requests, N), dtype=torch.int32, device="cuda"
+        )
+        self._candidates_buf = torch.zeros((max_num_requests, N), dtype=torch.int32, device="cuda")
+        self._tree_valid_buf = torch.zeros(max_num_requests, dtype=torch.bool, device="cuda")
+        # Worst-case target token count: num_contexts + num_gens * N <=
+        # max_num_requests * N, so this also covers the all-context case.
+        self._target_tokens_buf = torch.zeros(
+            max_num_requests * N, dtype=torch.int64, device="cuda"
+        )
+
+        # Persistent build_ddtree scratch: 3 heap-expansion outputs +
+        # 6 finalize outputs. Reusing these saves 9 ``torch.empty`` dispatches
+        # per gen step (~40us at TP=8 in profile traces). Sized for the
+        # full batch; ``_build_tree_draft_tokens`` slices the leading G rows.
+        n_dt = N
+        n_words = (n_dt + 31) // 32
+        self._heap_out_parent_buf = torch.empty(
+            (max_num_requests, n_dt), dtype=torch.int64, device="cuda"
+        )
+        self._heap_out_token_buf = torch.empty(
+            (max_num_requests, n_dt), dtype=torch.int64, device="cuda"
+        )
+        self._heap_out_depth_buf = torch.empty(
+            (max_num_requests, n_dt), dtype=torch.int64, device="cuda"
+        )
+        self._fin_draft_tokens_buf = torch.empty(
+            (max_num_requests, self.node_budget), dtype=torch.int32, device="cuda"
+        )
+        self._fin_retrieve_index_buf = torch.empty(
+            (max_num_requests, n_dt), dtype=torch.int32, device="cuda"
+        )
+        self._fin_retrieve_next_token_buf = torch.empty(
+            (max_num_requests, n_dt), dtype=torch.int32, device="cuda"
+        )
+        self._fin_retrieve_next_sibling_buf = torch.empty(
+            (max_num_requests, n_dt), dtype=torch.int32, device="cuda"
+        )
+        self._fin_positions_buf = torch.empty(
+            (max_num_requests, n_dt), dtype=torch.int32, device="cuda"
+        )
+        self._fin_packed_mask_buf = torch.empty(
+            (max_num_requests, n_dt, n_words), dtype=torch.int32, device="cuda"
+        )
+
+    def _resolve_kv_head_dim_bytes(self, cache_mgr):
+        """Bytes per KV head row, needed by the relocation kernel."""
+        if self._kv_head_dim_bytes is not None:
+            return self._kv_head_dim_bytes
+        from tensorrt_llm.bindings import DataType
+
+        _dtype_bytes = {
+            DataType.HALF: 2,
+            DataType.BF16: 2,
+            DataType.FLOAT: 4,
+            DataType.FP8: 1,
+            DataType.INT8: 1,
+            DataType.NVFP4: 0.5,
+        }
+        self._kv_head_dim_bytes = int(cache_mgr.head_dim * _dtype_bytes.get(cache_mgr.dtype, 0.5))
+        return self._kv_head_dim_bytes
+
+    def _relocate_target_kv(self, attn_metadata, num_accepted_tokens, batch_size):
+        """Compact the accepted tree-branch KV into linear cache positions.
+
+        The target wrote KV for all B+1 tree nodes per gen request. Only the
+        accepted branch survives; this moves those rows to contiguous linear
+        positions so subsequent steps read a flat history (mirrors
+        ``Eagle3OneModelDynamicTreeWorker._relocate_kv_eagerly``).
+        """
+        cache_mgr = getattr(attn_metadata, "kv_cache_manager", None)
+        if cache_mgr is None:
+            return
+        assert len(set(cache_mgr.num_kv_heads_per_layer)) == 1, (
+            "update_kv_cache_draft_token_location_2d requires uniform "
+            f"num_kv_heads across all layers, got {cache_mgr.num_kv_heads_per_layer}"
+        )
+        head_dim_bytes = self._resolve_kv_head_dim_bytes(cache_mgr)
+        torch.ops.tensorrt_llm.update_kv_cache_draft_token_location_2d(
+            self._tree_accepted_indices[:batch_size],
+            num_accepted_tokens[:batch_size],
+            attn_metadata.kv_lens_cuda[:batch_size],
+            True,
+            cache_mgr.num_layers,
+            cache_mgr.num_kv_heads_per_layer[0],
+            head_dim_bytes,
+            cache_mgr.max_total_draft_tokens,
+            cache_mgr.max_attention_window_vec[0],
+            cache_mgr.kv_cache_pool_pointers,
+            attn_metadata.kv_cache_block_offsets,
+            cache_mgr.max_blocks_per_seq,
+            cache_mgr.tokens_per_block,
+            None,
+        )
+
+    @nvtx_range("ddtree_sample_and_accept")
+    def _sample_and_accept_ddtree(
+        self, logits, draft_tokens, num_contexts, batch_size, spec_metadata
+    ):
+        """Greedy tree verification for DDTree (temperature 0).
+
+        Mirrors ``Eagle3OneModelDynamicTreeWorker._sample_and_accept_dynamic_tree``
+        for the greedy / packed path. ``draft_tokens`` is ``[num_gens, B]`` in
+        tree-node order matching the retrieve indices stored per slot.
+
+        Returns ``accepted_tokens`` ``[batch_size, K+1]`` and
+        ``num_accepted_tokens`` ``[batch_size]`` to match the linear path so
+        downstream input prep stays unchanged. Side effect: fills
+        ``self._tree_accepted_indices`` for KV relocation / ctx-branch append.
+        """
+        num_gens = batch_size - num_contexts
+        K = self.max_draft_len
+        max_path_len = K + 1
+        N = self.node_budget + 1
+
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+
+        # Reset views into the pre-allocated scratch buffers. Sized at
+        # _ensure_tree_ops so reuse is safe across iterations and CUDA-graph
+        # capture sees the same backing storage every step. Fused into a
+        # single Triton launch (3 separate fills -> 1 kernel).
+        _ddtree_pre_init(
+            self._accepted_tokens_buf,
+            self._num_accepted_tokens_buf,
+            self._tree_accepted_indices,
+            batch_size,
+            max_path_len,
+            K,
+        )
+        accepted_tokens = self._accepted_tokens_buf[:batch_size]
+        num_accepted_tokens = self._num_accepted_tokens_buf[:batch_size]
+
+        num_flat_tokens = logits.shape[0]
+        torch.argmax(logits, dim=-1, out=self._target_tokens_buf[:num_flat_tokens])
+        target_tokens = self._target_tokens_buf[:num_flat_tokens]
+
+        # Context requests accept only the sampled (bonus) token.
+        if num_contexts > 0:
+            accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts].to(torch.int32)
+
+        if num_gens == 0:
+            return accepted_tokens, num_accepted_tokens
+
+        spec_tree_manager = self.spec_tree_manager
+        target_predict = self._target_predict_buf[:num_gens]
+
+        if spec_tree_manager is None:
+            # CUDA graph warmup: no tree built yet, accept only the bonus.
+            target_predict.copy_(target_tokens[num_contexts:].reshape(num_gens, N))
+            accepted_tokens[num_contexts:batch_size, 0] = target_predict[:, 0]
+            return accepted_tokens, num_accepted_tokens
+
+        slot_storage = spec_tree_manager.slot_storage
+        gen_slot_ids = slot_storage.all_ids_buf[num_contexts : num_contexts + num_gens]
+        # Fuse target_predict copy + candidates assembly + tree_valid lookup
+        # into one Triton launch.
+        candidates = self._candidates_buf[:num_gens]
+        tree_valid = self._tree_valid_buf[:num_gens]
+        _ddtree_build_candidates(
+            self._target_predict_buf,
+            self._candidates_buf,
+            self._tree_valid_buf,
+            target_tokens,
+            draft_tokens,
+            slot_storage.has_tree,
+            gen_slot_ids,
+            num_contexts=num_contexts,
+            num_gens=num_gens,
+            N=N,
+        )
+        retrieve_packed = slot_storage.pack_retrieve_from_slots(gen_slot_ids, num_gens)
+
+        accept_index, accept_token_num, accept_token = (
+            self._tree_ops_converter.verify_dynamic_tree_greedy_out_packed(
+                candidates,
+                retrieve_packed,
+                target_predict,
+                num_gens,
+                max_path_len,
+                tree_valid=tree_valid,
+            )
+        )
+
+        # Fused post-verify scatter (4 ops -> 1 Triton launch). Behavior:
+        #   num_accepted_tokens[ctx:bs] = accept_token_num + 1 (int32)
+        #   accepted_tokens[ctx:bs]    = accept_token (int32)
+        #   tree_accepted_indices[ctx:bs] = accept_index[:, 1:K+1] - 1 (int32)
+        #   tree_accept_path[ctx:bs]   = accept_index[:, :K+1] (int64)
+        # accept_index stores root at slot 0; subtract 1 so root/padding -> -1.
+        # accept_index padding holds 0 (root) which is harmless: the ctx
+        # append masks columns beyond num_accepted via write_mask.
+        _ddtree_post_scatter(
+            self._accepted_tokens_buf,
+            self._num_accepted_tokens_buf,
+            self._tree_accepted_indices,
+            self._tree_accept_path,
+            accept_token,
+            accept_token_num,
+            accept_index,
+            num_contexts=num_contexts,
+            num_gens=num_gens,
+            max_path_len=max_path_len,
+            max_draft_len=K,
+        )
+
+        num_accepted_tokens = self._apply_force_accepted_tokens(
+            num_accepted_tokens, num_contexts, K
+        )
+
+        import os
+
+        if os.environ.get("DFLASH_DBG_FORCE_BONUS") == "1":
+            # Debug: accept only the bonus (target argmax) token. Tree topology
+            # is irrelevant; this isolates whether the target's tree-attention
+            # forward produces a correct bonus token.
+            num_accepted_tokens[num_contexts:batch_size] = 1
+            accepted_tokens[num_contexts:batch_size, 0] = target_predict[:, 0]
+            self._tree_accepted_indices[num_contexts:batch_size].fill_(-1)
+            self._tree_accept_path[num_contexts:batch_size].zero_()
+        return accepted_tokens, num_accepted_tokens
+
+    @nvtx_range("ddtree_build_tree_draft_tokens")
+    def _build_tree_draft_tokens(self, gen_logits, d2t, num_gens, num_contexts):
+        """Expand per-position marginals into a DDTree and store it per slot.
+
+        Args:
+            gen_logits: ``[num_gens, K, vocab]`` drafter logits per position.
+            d2t: optional draft->target vocab offset table.
+            num_gens / num_contexts: batch partition.
+
+        Returns ``[num_gens, B]`` int32 tree-node draft tokens in the order
+        consumed by ``_sample_and_accept_ddtree`` next step. Side effect:
+        scatters the per-request tree topology (mask / positions / retrieve
+        links) into the spec-tree slot storage keyed by gen slot id.
+        """
+        V = self.vocab_fanout
+        B = self.node_budget
+
+        with nvtx_range("ddtree_topk"):
+            # Single Triton launch fuses log_softmax + top-V + d2t gather.
+            # Replaces 4 dispatches (and a [G,K,vocab] fp32 materialization)
+            # with one CTA per (g, k) row that streams the vocab once.
+            topk_log_vals, topk_ids = _ddtree_topk(gen_logits, d2t, V)
+
+        # Slice the persistent buffers to leading num_gens rows so the kernels
+        # write into stable storage across iterations (CUDA-graph safe).
+        heap_buffers = {
+            "out_parent": self._heap_out_parent_buf[:num_gens],
+            "out_token": self._heap_out_token_buf[:num_gens],
+            "out_depth": self._heap_out_depth_buf[:num_gens],
+        }
+        finalize_buffers = {
+            "draft_tokens": self._fin_draft_tokens_buf[:num_gens],
+            "retrieve_index": self._fin_retrieve_index_buf[:num_gens],
+            "retrieve_next_token": self._fin_retrieve_next_token_buf[:num_gens],
+            "retrieve_next_sibling": self._fin_retrieve_next_sibling_buf[:num_gens],
+            "positions": self._fin_positions_buf[:num_gens],
+            "packed_mask": self._fin_packed_mask_buf[:num_gens],
+        }
+        tree = build_ddtree(
+            topk_log_vals=topk_log_vals,
+            topk_ids=topk_ids,
+            node_budget=B,
+            max_draft_len=self.max_draft_len,
+            vocab_fanout=V,
+            heap_buffers=heap_buffers,
+            finalize_buffers=finalize_buffers,
+        )
+
+        import os as _os
+
+        if _os.environ.get("DFLASH_DBG_TREE") == "1" and num_gens > 0:
+            pm = tree["packed_mask"][0]
+            pm_str = "\n    ".join(" ".join(f"{int(w):08x}" for w in row.tolist()) for row in pm)
+            print(
+                f"[DDTDBG-TREE] positions={tree['positions'][0].tolist()}\n"
+                f"  next_token={tree['retrieve_next_token'][0].tolist()}\n"
+                f"  next_sibling={tree['retrieve_next_sibling'][0].tolist()}\n"
+                f"  packed_mask=\n    {pm_str}\n"
+                f"  draft_tokens={tree['draft_tokens'][0].tolist()}",
+                flush=True,
+            )
+
+        with nvtx_range("ddtree_scatter_slot_storage"):
+            spec_tree_manager = self.spec_tree_manager
+            if spec_tree_manager is not None:
+                # Single-launch fused scatter: skips the 5 intermediate
+                # ``spec_tree_manager.*`` work-buf copies (no consumer on the
+                # DDTree path) AND fuses the 5 ``index_copy_`` + ``index_fill_``
+                # in :py:meth:`scatter_to_slot_storage` into one Triton kernel.
+                slot_storage = spec_tree_manager.slot_storage
+                gen_slots = slot_storage.all_ids_buf[num_contexts : num_contexts + num_gens]
+                _ddtree_slot_scatter(
+                    slot_storage, tree, gen_slots, num_gens, slot_storage.dummy_slot_id
+                )
+
+        # build_ddtree already emits int32 draft_tokens; no-op cast was 1 dispatch.
+        return tree["draft_tokens"]
 
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
     @property
-    def _draft_tokens_per_req(self) -> int:
-        """Target-forward tokens per gen request: K drafts + 1 bonus.
+    def use_dynamic_tree(self) -> bool:
+        return getattr(self.spec_config, "use_dynamic_tree", False)
 
-        Previously this was 2K (K+1 accepted + K-1 mask fillers), but the
-        fillers contribute nothing beyond the K+1 prefix the acceptance
-        check and context store consume, so carrying them through every
-        target layer is wasted work that dominates step time at large batch.
+    @property
+    def node_budget(self) -> int:
+        """B — number of DDTree nodes per gen request (excludes the root)."""
+        return self.spec_config.max_total_draft_tokens
+
+    @property
+    def vocab_fanout(self) -> int:
+        """V — per-position branching cap for DDTree expansion."""
+        return getattr(self.spec_config, "ddtree_max_topk", 8)
+
+    @property
+    def _draft_tokens_per_req(self) -> int:
+        """Target-forward tokens per gen request: prefix + 1 bonus.
+
+        Linear DFlash carries K drafts + 1 bonus. DDTree carries B tree nodes
+        + 1 bonus (root). Previously the linear path used 2K (K+1 accepted +
+        K-1 mask fillers), but the fillers contribute nothing beyond the K+1
+        prefix the acceptance check and context store consume, so carrying
+        them through every target layer is wasted work.
         """
+        if self.use_dynamic_tree:
+            return self.node_budget + 1
         return self.max_draft_len + 1
 
     def _lazy_init_ctx_buffers(self, draft_model, spec_metadata, attn_metadata):
@@ -384,10 +814,15 @@ class DFlashWorker(SpecWorkerBase):
 
         raw_logits = logits
         K = self.max_draft_len
+        use_tree = self.use_dynamic_tree
+        # Per-gen-request drafted-token count: B tree nodes, or K linear drafts.
+        drafts_per_req = self.node_budget if use_tree else K
 
         # Lazy init buffers and attach worker reference for prepare()
         self._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata)
         spec_metadata._dflash_worker = self
+        if use_tree:
+            self._ensure_tree_ops(resource_manager, spec_metadata.max_num_requests)
 
         # Save context lengths before warmup to prevent accumulation
         is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
@@ -396,18 +831,45 @@ class DFlashWorker(SpecWorkerBase):
 
         self._execute_guided_decoder_if_present(logits)
 
-        # Target now emits K+1 logits per gen request and the previous step
-        # stored K draft tokens per gen request (no filler padding).
+        # The previous step stored drafts_per_req draft tokens per gen request
+        # (B tree nodes in tree mode, K linear drafts otherwise).
         if num_gens > 0:
-            draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, K)
+            draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, drafts_per_req)
         else:
-            draft_tokens = spec_metadata.draft_tokens.reshape(0, K)
+            draft_tokens = spec_metadata.draft_tokens.reshape(0, drafts_per_req)
 
         logits_for_accept = logits
 
-        accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
-            logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
-        )
+        if use_tree:
+            accepted_tokens, num_accepted_tokens = self._sample_and_accept_ddtree(
+                logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
+            )
+            import os as _os
+
+            if _os.environ.get("DFLASH_DBG_KVLEN") == "1" and num_gens > 0:
+                _kl = (
+                    attn_metadata.kv_lens_cuda[:batch_size].tolist()
+                    if hasattr(attn_metadata, "kv_lens_cuda")
+                    else None
+                )
+                logger.info(
+                    f"[DDTDBG] num_acc={num_accepted_tokens[:batch_size].tolist()} "
+                    f"kv_lens(pre-reloc)={_kl} nc={num_contexts} bs={batch_size} "
+                    f"acc_idx={self._tree_accepted_indices[:batch_size].tolist()}"
+                )
+            if num_gens > 0:
+                self._relocate_target_kv(attn_metadata, num_accepted_tokens, batch_size)
+                if _os.environ.get("DFLASH_DBG_KVLEN") == "1":
+                    _kl2 = (
+                        attn_metadata.kv_lens_cuda[:batch_size].tolist()
+                        if hasattr(attn_metadata, "kv_lens_cuda")
+                        else None
+                    )
+                    logger.info(f"[DDTDBG] kv_lens(post-reloc)={_kl2}")
+        else:
+            accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
+                logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
+            )
 
         # Update GDN/Mamba recurrent states to the accepted token's state.
         if num_gens > 0 and isinstance(attn_metadata.kv_cache_manager, MambaHybridCacheManager):
@@ -488,21 +950,30 @@ class DFlashWorker(SpecWorkerBase):
                 gen_logits = gen_logits.reshape(num_gens, self.max_draft_len, vocab_size)
 
                 d2t = getattr(draft_model.model, "d2t", None)
-                gen_draft_tokens = torch.argmax(gen_logits, dim=-1, keepdim=False).long()
+                if use_tree:
+                    gen_draft_tokens = self._build_tree_draft_tokens(
+                        gen_logits, d2t, num_gens, num_contexts
+                    )
+                else:
+                    gen_draft_tokens = torch.argmax(gen_logits, dim=-1, keepdim=False).long()
 
-                if d2t is not None:
-                    gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
+                    if d2t is not None:
+                        gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
 
-                gen_draft_tokens = gen_draft_tokens.type(torch.int32)
+                    gen_draft_tokens = gen_draft_tokens.type(torch.int32)
 
         else:
-            gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
+            gen_draft_tokens = torch.empty((0, drafts_per_req), dtype=torch.int32, device="cuda")
 
         if num_contexts > 0 and num_gens > 0:
-            ctx_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
+            ctx_draft_tokens = torch.zeros(
+                (num_contexts, drafts_per_req), dtype=torch.int32, device="cuda"
+            )
             next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
         elif num_contexts > 0:
-            next_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
+            next_draft_tokens = torch.zeros(
+                (num_contexts, drafts_per_req), dtype=torch.int32, device="cuda"
+            )
         else:
             next_draft_tokens = gen_draft_tokens
 
@@ -628,9 +1099,19 @@ class DFlashWorker(SpecWorkerBase):
             # Accumulate new accepted features into context buffers
             if has_target_features:
                 gen_start = attn_metadata.num_ctx_tokens
-                # Target now processes exactly K+1 tokens per gen req, so the
-                # captured slice is already the full set we need to project.
+                # Linear DFlash: target processes K+1 tokens per gen req in
+                # accepted order, so the captured slice IS the set to project.
+                # DDTree: target processes B+1 tree nodes; only the accepted
+                # branch (root + accepted children, given by the per-request
+                # accept path) becomes linear history, so gather those rows
+                # first. The gather is identity for the linear path.
                 gen_hs = captured_hs[gen_start : gen_start + num_gens * total_tokens_per_req]
+                if self.use_dynamic_tree:
+                    h = gen_hs.shape[-1]
+                    gen_hs = gen_hs.reshape(num_gens, total_tokens_per_req, h)
+                    accept_path = self._tree_accept_path[num_contexts : num_contexts + num_gens]
+                    gather_idx = accept_path.unsqueeze(-1).expand(-1, -1, h)
+                    gen_hs = torch.gather(gen_hs, 1, gather_idx)
                 gen_hs_to_project = gen_hs.reshape(-1, gen_hs.shape[-1])
                 projected_to_store = draft_model.fc(
                     gen_hs_to_project.to(draft_model.fc.weight.dtype)

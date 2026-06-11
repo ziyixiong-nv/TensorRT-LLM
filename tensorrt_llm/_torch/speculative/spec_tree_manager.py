@@ -90,15 +90,19 @@ class DynamicTreeSlotStorage:
         self.retrieve_next_sibling[slot_id] = -1
 
     def pack_retrieve_from_slots(self, slot_ids, count):
-        """Pack retrieve data into [count, n_dt, 3] staging buffer."""
+        """Pack retrieve data into [count, n_dt, 3] staging buffer.
+
+        Fused 3-buffer gather (one Triton launch instead of 3 fancy-indexed
+        copies) — the staging output is also already contiguous in the layout
+        ``verify_dynamic_tree_greedy_out_packed_op`` expects.
+        """
         if count == 0:
             return self._verify_staging[:0]
-        ids = slot_ids[:count]
-        staging = self._verify_staging[:count]
-        staging[:, :, 0] = self.retrieve_index[ids]
-        staging[:, :, 1] = self.retrieve_next_token[ids]
-        staging[:, :, 2] = self.retrieve_next_sibling[ids]
-        return staging
+        from .ddtree_ops import _ddtree_pack_retrieve
+        return _ddtree_pack_retrieve(self.retrieve_index,
+                                     self.retrieve_next_token,
+                                     self.retrieve_next_sibling, slot_ids,
+                                     count, self._verify_staging)
 
     def next_links_from_slots(self, slot_ids, count):
         """Gather next-token and next-sibling links into contiguous staging buffers."""
