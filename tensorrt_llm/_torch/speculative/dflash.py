@@ -309,21 +309,14 @@ class DFlashWorker(SpecWorkerBase):
             max_num_requests * N, dtype=torch.int64, device="cuda"
         )
 
-        # Persistent build_ddtree scratch: 3 heap-expansion outputs +
-        # 6 finalize outputs. Reusing these saves 9 ``torch.empty`` dispatches
-        # per gen step (~40us at TP=8 in profile traces). Sized for the
-        # full batch; ``_build_tree_draft_tokens`` slices the leading G rows.
+        # Persistent build_ddtree scratch: 6 finalize outputs (the prior 3
+        # int64 heap-scratch tensors are gone now that heap+finalize share one
+        # kernel and pass the parent/token/depth row through registers).
+        # Reusing these saves 6 ``torch.empty`` dispatches per gen step.
+        # Sized for the full batch; ``_build_tree_draft_tokens`` slices the
+        # leading G rows.
         n_dt = N
         n_words = (n_dt + 31) // 32
-        self._heap_out_parent_buf = torch.empty(
-            (max_num_requests, n_dt), dtype=torch.int64, device="cuda"
-        )
-        self._heap_out_token_buf = torch.empty(
-            (max_num_requests, n_dt), dtype=torch.int64, device="cuda"
-        )
-        self._heap_out_depth_buf = torch.empty(
-            (max_num_requests, n_dt), dtype=torch.int64, device="cuda"
-        )
         self._fin_draft_tokens_buf = torch.empty(
             (max_num_requests, self.node_budget), dtype=torch.int32, device="cuda"
         )
@@ -543,13 +536,8 @@ class DFlashWorker(SpecWorkerBase):
             # with one CTA per (g, k) row that streams the vocab once.
             topk_log_vals, topk_ids = _ddtree_topk(gen_logits, d2t, V)
 
-        # Slice the persistent buffers to leading num_gens rows so the kernels
-        # write into stable storage across iterations (CUDA-graph safe).
-        heap_buffers = {
-            "out_parent": self._heap_out_parent_buf[:num_gens],
-            "out_token": self._heap_out_token_buf[:num_gens],
-            "out_depth": self._heap_out_depth_buf[:num_gens],
-        }
+        # Slice the persistent finalize buffers to leading num_gens rows so the
+        # kernel writes into stable storage across iterations (CUDA-graph safe).
         finalize_buffers = {
             "draft_tokens": self._fin_draft_tokens_buf[:num_gens],
             "retrieve_index": self._fin_retrieve_index_buf[:num_gens],
@@ -564,7 +552,6 @@ class DFlashWorker(SpecWorkerBase):
             node_budget=B,
             max_draft_len=self.max_draft_len,
             vocab_fanout=V,
-            heap_buffers=heap_buffers,
             finalize_buffers=finalize_buffers,
         )
 

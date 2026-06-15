@@ -20,13 +20,12 @@ via argmax. DDTree (https://arxiv.org/pdf/2604.12989) instead expands the K
 independent marginals into a best-first draft tree under a node budget B, letting
 the target verify many continuations in one forward pass.
 
-This module implements DDTree Algorithm 1 (greedy / temperature 0). The B-step
-heap expansion is a hand-written Triton kernel (one persistent CTA per request,
-frontier in register-tile of size ``next_pow2(1+2B)``); the downstream tree
-finalize (first-child/next-sibling pointers + bit-packed ancestor mask) stays
-in torch under ``torch.compile`` since it's already a handful of shape-static
-broadcasts. All outputs are statically shaped for fixed ``(B, K, V)`` so the
-whole routine captures cleanly into an outer CUDA graph.
+This module implements DDTree Algorithm 1 (greedy / temperature 0). Heap
+expansion AND tree finalize are fused into a single Triton kernel (one
+persistent CTA per request) so the parent/token/depth row never lands in
+global memory between the two phases. All outputs are statically shaped for
+fixed ``(B, K, V)`` so the whole routine captures cleanly into an outer
+CUDA graph.
 
 The output contract matches ``DynamicTreeOpsConverter.build_dynamic_tree``:
 ``retrieve_index`` (identity, root at index 0), ``retrieve_next_token`` (first-child
@@ -700,44 +699,52 @@ def _ddtree_post_scatter(
 
 
 @triton.jit
-def _ddtree_heap_kernel(
+def _ddtree_build_kernel(
     topk_log_vals_ptr,  # [G, K, V] float32
     topk_ids_ptr,  # [G, K, V] int64
-    out_parent_ptr,  # [G, n_dt] int64
-    out_token_ptr,  # [G, n_dt] int64
-    out_depth_ptr,  # [G, n_dt] int64
-    G: tl.constexpr,
+    draft_tokens_ptr,  # [G, B] int32
+    retrieve_index_ptr,  # [G, n_dt] int32
+    retrieve_next_token_ptr,  # [G, n_dt] int32
+    retrieve_next_sibling_ptr,  # [G, n_dt] int32
+    positions_ptr,  # [G, n_dt] int32
+    packed_mask_ptr,  # [G, n_dt, n_words] int32
     B: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
+    n_words: tl.constexpr,
     BLOCK_CAP: tl.constexpr,  # next_pow2(1 + 2*B)
+    BLOCK_DT: tl.constexpr,  # next_pow2(n_dt)
+    BLOCK_W: tl.constexpr,  # next_pow2(n_words)
 ):
-    """One persistent CTA per request runs the entire B-step heap expansion.
+    """Single-launch DDTree build: heap expansion + finalize fused into one CTA per request.
 
-    Frontier (score/depth/rank/parent/token) is held as ``[BLOCK_CAP]`` register
-    tiles inside the program. Each iteration:
-      1) ``argmax`` over the frontier → pop best prefix
-      2) write ``out_parent / out_token / out_depth[node_idx]``
-      3) overwrite popped slot with -inf, push next-sibling at ``1+2t`` and
-         first-child at ``2+2t``
-    No global atomics, no inter-CTA syncs; one launch replaces the B serial
-    Inductor-generated kernels the original torch path produced.
+    The original pipeline ran two Triton kernels back-to-back:
+
+      1) heap_kernel  grid (G,)      ->  writes [G, n_dt] int64 parent/token/depth scratch
+      2) finalize     grid (G, n_dt) ->  reads scratch, emits first-child / next-sibling /
+                                         positions / packed_mask / draft_tokens
+
+    With G typically 1-8 (BS<=batch), the launches sit at <0.1% wave occupancy and
+    most of the cost is host dispatch + the int64 round-trip. Folding both into a
+    single CTA keeps parent/token/depth row in registers ([BLOCK_DT] register tiles)
+    and runs the finalize work as 2D-broadcast register reductions. Net effect: 1
+    launch, 0 intermediate global stores, all heap+finalize work parallelized
+    over BLOCK_DT lanes within the same warp.
     """
     g = tl.program_id(0)
 
     NEG_INF = -1.0e30
     n_dt = B + 1
     cap_arange = tl.arange(0, BLOCK_CAP)
+    dt_arange = tl.arange(0, BLOCK_DT)
+    dt_mask = dt_arange < n_dt
 
     # Strides (row-major contiguous):
     #   topk_log_vals[g, k, v] -> ptr + g*(K*V) + k*V + v  (float32)
     #   topk_ids     [g, k, v] -> ptr + g*(K*V) + k*V + v  (int64)
-    #   out_*[g, i]            -> ptr + g*n_dt + i
     base_kv = g * K * V
 
-    # Frontier registers; slot 0 seeded with the (depth=1, rank=0) root child.
-    # Slots 1..BLOCK_CAP-1 are NEG_INF, which already covers the inactive tail
-    # past cap = 1 + 2*B (those slots are never selected by argmax).
+    # ---- Heap frontier registers (slot 0 = root child; rest = -inf) ----
     root_log = tl.load(topk_log_vals_ptr + base_kv + 0).to(tl.float32)
     root_id = tl.load(topk_ids_ptr + base_kv + 0)
     f_score = tl.where(cap_arange == 0, root_log, tl.full((BLOCK_CAP,), NEG_INF, tl.float32))
@@ -748,11 +755,11 @@ def _ddtree_heap_kernel(
     f_parent = tl.zeros((BLOCK_CAP,), tl.int32)
     f_token = tl.where(cap_arange == 0, root_id, tl.zeros((BLOCK_CAP,), root_id.dtype))
 
-    out_base = g * n_dt
-    # Root: parent=-1, token=0, depth=0.
-    tl.store(out_parent_ptr + out_base + 0, tl.full((), -1, tl.int64))
-    tl.store(out_token_ptr + out_base + 0, tl.zeros((), tl.int64))
-    tl.store(out_depth_ptr + out_base + 0, tl.zeros((), tl.int64))
+    # ---- Output rows in registers (replaces the old global parent/token/depth scratch) ----
+    # Root: parent=-1, token=0, depth=0. Invalid slots also default to parent=-1.
+    parent_row = tl.full((BLOCK_DT,), -1, tl.int32)
+    token_row = tl.zeros((BLOCK_DT,), root_id.dtype)
+    depth_row = tl.zeros((BLOCK_DT,), tl.int32)
 
     for t in tl.static_range(B):
         node_idx = t + 1
@@ -768,12 +775,15 @@ def _ddtree_heap_kernel(
         ptoken = tl.sum(tl.where(sel, f_token, tl.zeros_like(f_token)), axis=0)
 
         pvalid = pscore > NEG_INF
-        out_parent_val = tl.where(pvalid, pparent.to(tl.int64), tl.full((), -1, tl.int64))
-        out_token_val = tl.where(pvalid, ptoken.to(tl.int64), tl.zeros((), tl.int64))
-        out_depth_val = tl.where(pvalid, pdepth.to(tl.int64), tl.zeros((), tl.int64))
-        tl.store(out_parent_ptr + out_base + node_idx, out_parent_val)
-        tl.store(out_token_ptr + out_base + node_idx, out_token_val)
-        tl.store(out_depth_ptr + out_base + node_idx, out_depth_val)
+        out_parent_val = tl.where(pvalid, pparent.to(tl.int32), tl.full((), -1, tl.int32))
+        out_token_val = tl.where(pvalid, ptoken, tl.zeros_like(ptoken))
+        out_depth_val = tl.where(pvalid, pdepth.to(tl.int32), tl.zeros((), tl.int32))
+
+        # Update parent/token/depth row at slot node_idx (in registers).
+        slot_sel = dt_arange == node_idx
+        parent_row = tl.where(slot_sel, out_parent_val, parent_row)
+        token_row = tl.where(slot_sel, out_token_val, token_row)
+        depth_row = tl.where(slot_sel, out_depth_val, depth_row)
 
         # Mark popped slot as -inf so it can never be re-selected.
         f_score = tl.where(sel, tl.full((BLOCK_CAP,), NEG_INF, tl.float32), f_score)
@@ -825,171 +835,105 @@ def _ddtree_heap_kernel(
         f_parent = tl.where(child_sel, tl.full((BLOCK_CAP,), node_idx, f_parent.dtype), f_parent)
         f_token = tl.where(child_sel, child_token.to(f_token.dtype), f_token)
 
+    # =========================================================================
+    # Finalize phase: derive first-child / next-sibling / packed_mask from
+    # parent_row (register tile). All work is parallel over BLOCK_DT lanes.
+    # =========================================================================
 
-def _ddtree_heap_expand(
+    # valid_row[i]: true iff slot i holds a real tree node (i==0 or parent>=0).
+    # parent_row is -1-initialized for slots >= n_dt and only slots 1..n_dt-1
+    # are written by the heap loop, so valid_row already implies dt_mask.
+    valid_row = (dt_arange == 0) | (parent_row >= 0)
+
+    out_off = g * n_dt + dt_arange
+
+    # positions = depth_row, retrieve_index = identity. draft_tokens[g, i-1] = token_row[i].
+    tl.store(positions_ptr + out_off, depth_row, mask=dt_mask)
+    tl.store(retrieve_index_ptr + out_off, dt_arange.to(tl.int32), mask=dt_mask)
+    tl.store(
+        draft_tokens_ptr + g * (n_dt - 1) + (dt_arange - 1),
+        token_row.to(tl.int32),
+        mask=dt_mask & (dt_arange >= 1),
+    )
+
+    # next-sibling[i] = smallest j > i with parent_row[j] == parent_row[i] (and >= 0).
+    # first-child[i]  = smallest j with parent_row[j] == i.
+    # 2D-broadcast register reductions over BLOCK_DT * BLOCK_DT (1024 i32 at typical sizes).
+    BIG = n_dt
+    j_grid = dt_arange[None, :]  # [1, BLOCK_DT]
+    i_grid = dt_arange[:, None]  # [BLOCK_DT, 1]
+    pj = parent_row[None, :]  # [1, BLOCK_DT] — parent of slot j
+    pi = parent_row[:, None]  # [BLOCK_DT, 1] — parent of slot i
+
+    valid_j_grid = ((j_grid == 0) | (pj >= 0)) & (j_grid < n_dt)
+
+    sib_cand = valid_j_grid & (pj == pi) & (pi >= 0) & (j_grid > i_grid)
+    sib_min = tl.min(tl.where(sib_cand, j_grid, tl.full(sib_cand.shape, BIG, tl.int32)), axis=1)
+    sib_out = tl.where(valid_row & (sib_min < BIG), sib_min, tl.full((BLOCK_DT,), -1, tl.int32))
+    tl.store(retrieve_next_sibling_ptr + out_off, sib_out, mask=dt_mask)
+
+    fc_cand = valid_j_grid & (pj == i_grid)
+    fc_min = tl.min(tl.where(fc_cand, j_grid, tl.full(fc_cand.shape, BIG, tl.int32)), axis=1)
+    fc_out = tl.where(valid_row & (fc_min < BIG), fc_min, tl.full((BLOCK_DT,), -1, tl.int32))
+    tl.store(retrieve_next_token_ptr + out_off, fc_out, mask=dt_mask)
+
+    # ---- bit-packed ancestor mask ----
+    # mask[i, w]: bit (c%32) of word (c//32) is set iff i attends to col c
+    # (where c is i itself or any ancestor of i along the parent chain).
+    w_arange = tl.arange(0, BLOCK_W)
+    w_mask = w_arange < n_words
+
+    # Self-bit per row: bit (i%32) of word (i//32) -- only for valid rows.
+    self_word_2d = i_grid // 32  # [BLOCK_DT, 1]
+    self_bit_2d = i_grid % 32  # [BLOCK_DT, 1]
+    self_w_2d = w_arange[None, :]  # [1, BLOCK_W]
+    self_set = (self_w_2d == self_word_2d).to(tl.int32) * (1 << self_bit_2d)
+    valid_i_2d = valid_row[:, None]  # [BLOCK_DT, 1]
+    mask_words = tl.where(valid_i_2d, self_set, tl.zeros((BLOCK_DT, BLOCK_W), tl.int32))
+
+    # Walk parent chain at most K steps. cur[i] = current ancestor of row i.
+    cur = dt_arange.to(tl.int32)  # [BLOCK_DT]
+    for _ in tl.static_range(K):
+        # Gather parent_row[cur[i]] in registers via where-broadcast:
+        # cur_eq[i, j] = (j == cur[i]); for each i exactly one j matches (or none if cur[i] >= n_dt).
+        cur_eq = j_grid == cur[:, None]
+        cur_parent = tl.sum(tl.where(cur_eq, pj, tl.zeros((BLOCK_DT, BLOCK_DT), tl.int32)), axis=1)
+        has_parent = cur_parent >= 0
+        safe_parent = tl.maximum(cur_parent, 0)
+        p_word = (safe_parent // 32)[:, None]  # [BLOCK_DT, 1]
+        p_bit = (safe_parent % 32)[:, None]  # [BLOCK_DT, 1]
+        bit_set = (w_arange[None, :] == p_word).to(tl.int32) * (1 << p_bit)
+        bit_set = tl.where(has_parent[:, None], bit_set, tl.zeros((BLOCK_DT, BLOCK_W), tl.int32))
+        mask_words = mask_words | bit_set
+        cur = tl.where(has_parent, safe_parent, cur)
+
+    pm_off = g * n_dt * n_words + i_grid * n_words + w_arange[None, :]
+    pm_store_mask = dt_mask[:, None] & w_mask[None, :]
+    tl.store(packed_mask_ptr + pm_off, mask_words, mask=pm_store_mask)
+
+
+def _ddtree_build_triton(
     topk_log_vals: torch.Tensor,
     topk_ids: torch.Tensor,
     B: int,
     K: int,
     V: int,
-    out_parent: torch.Tensor | None = None,
-    out_token: torch.Tensor | None = None,
-    out_depth: torch.Tensor | None = None,
-):
-    """Run the heap-expansion Triton kernel; return (out_parent, out_token, out_depth).
-
-    The three outputs may be passed in pre-allocated (sliced from worker
-    persistent buffers) so the caller can avoid 3 dispatches per step.
-    """
-    G = topk_log_vals.shape[0]
-    n_dt = B + 1
-    device = topk_log_vals.device
-
-    if out_parent is None:
-        out_parent = torch.empty((G, n_dt), dtype=torch.int64, device=device)
-    if out_token is None:
-        out_token = torch.empty((G, n_dt), dtype=torch.int64, device=device)
-    if out_depth is None:
-        out_depth = torch.empty((G, n_dt), dtype=torch.int64, device=device)
-
-    cap = 1 + 2 * B
-    BLOCK_CAP = max(16, triton.next_power_of_2(cap))
-
-    log_vals_f32 = topk_log_vals.to(torch.float32, copy=False).contiguous()
-    ids_i64 = topk_ids.to(torch.int64, copy=False).contiguous()
-
-    _ddtree_heap_kernel[(G,)](
-        log_vals_f32,
-        ids_i64,
-        out_parent,
-        out_token,
-        out_depth,
-        G=G,
-        B=B,
-        K=K,
-        V=V,
-        BLOCK_CAP=BLOCK_CAP,
-        num_warps=1,
-        num_stages=1,
-    )
-    return out_parent, out_token, out_depth
-
-
-@triton.jit
-def _ddtree_finalize_kernel(
-    out_parent_ptr,  # [G, n_dt] int64
-    out_token_ptr,  # [G, n_dt] int64
-    out_depth_ptr,  # [G, n_dt] int64
-    draft_tokens_ptr,  # [G, B] int32
-    retrieve_index_ptr,  # [G, n_dt] int32
-    retrieve_next_token_ptr,  # [G, n_dt] int32
-    retrieve_next_sibling_ptr,  # [G, n_dt] int32
-    positions_ptr,  # [G, n_dt] int32
-    packed_mask_ptr,  # [G, n_dt, n_words] int32
-    n_dt: tl.constexpr,
-    n_words: tl.constexpr,
-    K: tl.constexpr,
-    BLOCK_DT: tl.constexpr,  # next_pow2(n_dt)
-    BLOCK_W: tl.constexpr,  # next_pow2(n_words)
-):
-    """Per-row finalize: one block per (request g, node row i).
-
-    Computes first-child / next-sibling pointers (min-j search over a
-    register-tile of the parent row) and bit-packs the ancestor mask via a
-    K-step parent-chain walk. Replaces the torch.compile path (~50 fused
-    Inductor kernels per call) with a single launch.
-    """
-    g = tl.program_id(0)
-    i = tl.program_id(1)
-
-    parent_row_off = g * n_dt
-    j = tl.arange(0, BLOCK_DT)
-    j_in_range = j < n_dt
-
-    # Load this request's parent row once into a register tile.
-    parent_row = tl.load(out_parent_ptr + parent_row_off + j, mask=j_in_range, other=-1).to(
-        tl.int32
-    )
-    valid_j = j_in_range & ((j == 0) | (parent_row >= 0))
-
-    pi = tl.load(out_parent_ptr + parent_row_off + i).to(tl.int32)
-    valid_i = (i == 0) | (pi >= 0)
-
-    BIG = n_dt  # sentinel beyond any valid index
-
-    # next-sibling: smallest j > i with parent_row[j] == pi (and pi >= 0).
-    sib_cand = valid_j & (parent_row == pi) & (pi >= 0) & (j > i)
-    sib_min = tl.min(tl.where(sib_cand, j, BIG), axis=0)
-    sib_out = tl.where(valid_i & (sib_min < BIG), sib_min, -1).to(tl.int32)
-
-    # first-child: smallest j with parent_row[j] == i.
-    fc_cand = valid_j & (parent_row == i)
-    fc_min = tl.min(tl.where(fc_cand, j, BIG), axis=0)
-    fc_out = tl.where(valid_i & (fc_min < BIG), fc_min, -1).to(tl.int32)
-
-    out_off = g * n_dt + i
-    tl.store(retrieve_next_sibling_ptr + out_off, sib_out)
-    tl.store(retrieve_next_token_ptr + out_off, fc_out)
-    tl.store(retrieve_index_ptr + out_off, i)
-
-    depth_i = tl.load(out_depth_ptr + out_off).to(tl.int32)
-    tl.store(positions_ptr + out_off, depth_i)
-
-    # draft_tokens[g, i-1] = out_token[g, i] for i >= 1.
-    if i >= 1:
-        tok = tl.load(out_token_ptr + out_off).to(tl.int32)
-        tl.store(draft_tokens_ptr + g * (n_dt - 1) + (i - 1), tok)
-
-    # ---- bit-packed ancestor mask ----
-    w = tl.arange(0, BLOCK_W)
-    w_in_range = w < n_words
-    mask_words = tl.zeros((BLOCK_W,), tl.int32)
-
-    # Self-bit: row i attends col i (only if valid).
-    if valid_i:
-        self_word = i // 32
-        self_bit = i % 32
-        mask_words = tl.where(w == self_word, (1 << self_bit).to(tl.int32), mask_words)
-
-    # Walk parent chain at most K steps (max depth from any node to root <= K).
-    cur = i
-    for _ in tl.static_range(K):
-        cur_parent = tl.load(out_parent_ptr + parent_row_off + cur).to(tl.int32)
-        has_parent = cur_parent >= 0
-        safe_parent = tl.maximum(cur_parent, 0)
-        p_word = safe_parent // 32
-        p_bit = safe_parent % 32
-        bit_vec = tl.where(w == p_word, (1 << p_bit).to(tl.int32), tl.zeros((BLOCK_W,), tl.int32))
-        if has_parent:
-            mask_words = mask_words | bit_vec
-            cur = safe_parent
-
-    pm_off = g * n_dt * n_words + i * n_words + w
-    tl.store(packed_mask_ptr + pm_off, mask_words, mask=w_in_range)
-
-
-def _ddtree_finalize_triton(
-    out_parent: torch.Tensor,
-    out_token: torch.Tensor,
-    out_depth: torch.Tensor,
-    B: int,
-    K: int,
     buffers: dict | None = None,
 ):
-    """Run the single-launch Triton finalize kernel.
+    """Single-launch heap-expand + finalize. Replaces the previous two-kernel
+    pipeline (`_ddtree_heap_expand` + `_ddtree_finalize_triton`).
 
     Returns ``(draft_tokens, retrieve_index, retrieve_next_token,
     retrieve_next_sibling, positions, packed_mask)`` — all int32, on the same
-    device as ``out_parent``.
-
-    If ``buffers`` is provided it must contain the same keys as the return
-    tuple, each sliced to the leading G/G*n_dt rows; using persistent buffers
-    saves 6 ``torch.empty`` dispatches per step.
+    device as the inputs. If ``buffers`` is provided it must contain the same
+    keys (each sliced to leading G rows); using persistent buffers saves 6
+    ``torch.empty`` dispatches per step and keeps storage stable across
+    iterations for CUDA-graph capture.
     """
-    G = out_parent.shape[0]
+    G = topk_log_vals.shape[0]
     n_dt = B + 1
     n_words = (n_dt + 31) // 32
-    device = out_parent.device
+    device = topk_log_vals.device
 
     if buffers is None:
         draft_tokens = torch.empty((G, B), dtype=torch.int32, device=device)
@@ -1006,22 +950,28 @@ def _ddtree_finalize_triton(
         positions = buffers["positions"]
         packed_mask = buffers["packed_mask"]
 
+    cap = 1 + 2 * B
+    BLOCK_CAP = max(16, triton.next_power_of_2(cap))
     BLOCK_DT = max(16, triton.next_power_of_2(n_dt))
     BLOCK_W = max(1, triton.next_power_of_2(n_words))
 
-    _ddtree_finalize_kernel[(G, n_dt)](
-        out_parent,
-        out_token,
-        out_depth,
+    log_vals_f32 = topk_log_vals.to(torch.float32, copy=False).contiguous()
+    ids_i64 = topk_ids.to(torch.int64, copy=False).contiguous()
+
+    _ddtree_build_kernel[(G,)](
+        log_vals_f32,
+        ids_i64,
         draft_tokens,
         retrieve_index,
         retrieve_next_token,
         retrieve_next_sibling,
         positions,
         packed_mask,
-        n_dt=n_dt,
-        n_words=n_words,
+        B=B,
         K=K,
+        V=V,
+        n_words=n_words,
+        BLOCK_CAP=BLOCK_CAP,
         BLOCK_DT=BLOCK_DT,
         BLOCK_W=BLOCK_W,
         num_warps=1,
@@ -1045,7 +995,6 @@ def build_ddtree(
     node_budget: int,
     max_draft_len: int,
     vocab_fanout: int,
-    heap_buffers: dict | None = None,
     finalize_buffers: dict | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Build a DDTree draft tree from per-position top-k log marginals.
@@ -1084,27 +1033,14 @@ def build_ddtree(
     V = vocab_fanout
     B = node_budget
 
-    # 1) Heap expansion: a single Triton launch (one persistent CTA per request)
-    #    runs the full B-step pop/push loop in registers. Replaces the 30..254
-    #    serialized Inductor-generated kernels the torch.compile path emitted.
-    with nvtx_range("ddtree_heap_expand"):
-        if heap_buffers is None:
-            hp = ht = hd = None
-        else:
-            hp = heap_buffers["out_parent"]
-            ht = heap_buffers["out_token"]
-            hd = heap_buffers["out_depth"]
-        out_parent, out_token, out_depth = _ddtree_heap_expand(
-            topk_log_vals, topk_ids, B, K, V, out_parent=hp, out_token=ht, out_depth=hd
-        )
-
-    # 2) Finalize: parent pointers -> first-child / next-sibling / packed mask.
-    #    Single Triton launch with grid (G, n_dt); each block produces one
-    #    output row (sibling/first-child via min-j over the parent row, plus a
-    #    K-step parent-chain walk for the bit-packed ancestor mask). Replaces
-    #    the previous torch.compile path (~50 fused Inductor kernels per call,
-    #    each paying full python/CUDA dispatch overhead at TP=8).
-    with nvtx_range("ddtree_finalize"):
+    # Single-launch fused build: heap expansion + finalize fused into one Triton
+    # kernel with grid (G,). Each persistent CTA per request keeps the
+    # parent/token/depth row in registers (BLOCK_DT lanes) and runs the
+    # finalize work as 2D-broadcast register reductions. Replaces the previous
+    # two-kernel pipeline that wrote/read [G, n_dt] int64 scratch tensors and
+    # paid one extra launch boundary (visible at BS=1 where each launch is
+    # under-occupied).
+    with nvtx_range("ddtree_build"):
         (
             draft_tokens,
             retrieve_index,
@@ -1112,9 +1048,7 @@ def build_ddtree(
             retrieve_next_sibling,
             positions,
             packed_mask,
-        ) = _ddtree_finalize_triton(
-            out_parent, out_token, out_depth, B, K, buffers=finalize_buffers
-        )
+        ) = _ddtree_build_triton(topk_log_vals, topk_ids, B, K, V, buffers=finalize_buffers)
 
     return {
         "draft_tokens": draft_tokens,
