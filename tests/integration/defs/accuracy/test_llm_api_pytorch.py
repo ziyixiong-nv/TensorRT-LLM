@@ -5160,6 +5160,48 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.parametrize("ddtree_max_topk", [2, 4, 8],
+                             ids=["v2", "v4", "v8"])
+    def test_dflash_ddtree_8gpus(self, ddtree_max_topk, mocker):
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+
+        pytorch_config = dict(
+            max_batch_size=8,
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=8,
+                                              enable_padding=True),
+            moe_config=MoeConfig(backend="CUTLASS"),
+        )
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+        dflash_model_dir = f"{llm_models_root()}/gpt-oss-120b-DFlash"
+        target_model_dir = self.MODEL_PATH
+
+        max_draft_len = 16
+        spec_config = DFlashDecodingConfig(
+            max_draft_len=max_draft_len,
+            speculative_model=dflash_model_dir,
+            ddtree_node_budget=max_draft_len,
+            ddtree_max_topk=ddtree_max_topk,
+        )
+
+        llm = LLM(model=target_model_dir,
+                  tensor_parallel_size=8,
+                  pipeline_parallel_size=1,
+                  moe_expert_parallel_size=1,
+                  kv_cache_config=kv_cache_config,
+                  speculative_config=spec_config,
+                  **pytorch_config)
+
+        with llm:
+            model_name = "GPT-OSS/120B-MXFP4"
+            task = GSM8K(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
         "kv_cache_dtype",
