@@ -33,6 +33,7 @@ pointer), ``retrieve_next_sibling`` (next-sibling pointer), ``positions`` (= dep
 a bit-packed ancestor mask, and the flat per-node draft tokens ``[num_gens, B]``.
 """
 
+import os
 from typing import Dict
 
 import torch
@@ -40,6 +41,13 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._utils import nvtx_range
+
+# When DDTREE_HELPERS_BACKEND=torch, the five small launch-bound helpers
+# (pre_init / post_scatter / pack_retrieve / slot_scatter / build_candidates)
+# fall back to pure-PyTorch implementations. The two heavyweight kernels
+# (_ddtree_topk and _ddtree_build_kernel) stay Triton regardless. Used to
+# A/B benchmark whether the helper Triton fusions are still worth it.
+_HELPERS_BACKEND = os.environ.get("DDTREE_HELPERS_BACKEND", "triton").lower()
 
 # Sentinel score for inactive / invalid frontier slots. Large-negative but finite
 # so arithmetic (score + log q) never produces NaN.
@@ -309,6 +317,27 @@ def _ddtree_pack_retrieve_kernel(
     tl.store(out_ptr + base + 2, rns, mask=dt_mask)
 
 
+def _ddtree_pack_retrieve_torch(
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    slot_ids: torch.Tensor,
+    count: int,
+    out: torch.Tensor,
+):
+    """Pure-PyTorch equivalent of :func:`_ddtree_pack_retrieve`.
+
+    3 fancy-indexed gathers + a stack into ``out[:, :, 0|1|2]``. Faster than
+    the Triton kernel only at large G; at low batch each fancy index is its
+    own dispatch.
+    """
+    ids = slot_ids[:count]
+    out[:count, :, 0] = retrieve_index.index_select(0, ids)
+    out[:count, :, 1] = retrieve_next_token.index_select(0, ids)
+    out[:count, :, 2] = retrieve_next_sibling.index_select(0, ids)
+    return out[:count]
+
+
 def _ddtree_pack_retrieve(
     retrieve_index: torch.Tensor,
     retrieve_next_token: torch.Tensor,
@@ -322,6 +351,15 @@ def _ddtree_pack_retrieve(
     """
     if count == 0:
         return out[:0]
+    if _HELPERS_BACKEND == "torch":
+        return _ddtree_pack_retrieve_torch(
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            slot_ids,
+            count,
+            out,
+        )
     n_dt = retrieve_index.shape[1]
     BLOCK_DT = max(16, triton.next_power_of_2(n_dt))
     _ddtree_pack_retrieve_kernel[(count,)](
@@ -396,6 +434,24 @@ def _ddtree_slot_scatter_kernel(
     tl.store(ss_has_tree_ptr + slot, tl.full((), 1, tl.int8))
 
 
+def _ddtree_slot_scatter_torch(
+    slot_storage, tree_dict, slot_ids: torch.Tensor, num_gens: int, dummy_slot_id: int
+):
+    """Pure-PyTorch equivalent of :func:`_ddtree_slot_scatter`.
+
+    5 ``index_copy_`` + 1 ``index_fill_`` + 1 dummy-slot reset (7 dispatches
+    vs the Triton 1+1).
+    """
+    ids = slot_ids[:num_gens]
+    slot_storage.packed_mask.index_copy_(0, ids, tree_dict["packed_mask"])
+    slot_storage.position_offsets.index_copy_(0, ids, tree_dict["positions"])
+    slot_storage.retrieve_index.index_copy_(0, ids, tree_dict["retrieve_index"])
+    slot_storage.retrieve_next_token.index_copy_(0, ids, tree_dict["retrieve_next_token"])
+    slot_storage.retrieve_next_sibling.index_copy_(0, ids, tree_dict["retrieve_next_sibling"])
+    slot_storage.has_tree.index_fill_(0, ids, True)
+    slot_storage.has_tree.narrow(0, dummy_slot_id, 1).fill_(False)
+
+
 def _ddtree_slot_scatter(
     slot_storage, tree_dict, slot_ids: torch.Tensor, num_gens: int, dummy_slot_id: int
 ):
@@ -413,6 +469,14 @@ def _ddtree_slot_scatter(
     """
     if num_gens == 0:
         return
+    if _HELPERS_BACKEND == "torch":
+        return _ddtree_slot_scatter_torch(
+            slot_storage,
+            tree_dict,
+            slot_ids,
+            num_gens,
+            dummy_slot_id,
+        )
     n_dt = tree_dict["packed_mask"].shape[1]
     n_words = tree_dict["packed_mask"].shape[2]
     BLOCK_DT = max(16, triton.next_power_of_2(n_dt))
@@ -496,6 +560,34 @@ def _ddtree_build_candidates_kernel(
     tl.store(tree_valid_ptr + g_off, tv, mask=g_mask)
 
 
+def _ddtree_build_candidates_torch(
+    target_predict: torch.Tensor,
+    candidates: torch.Tensor,
+    tree_valid: torch.Tensor,
+    target_tokens: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    has_tree: torch.Tensor,
+    slot_ids: torch.Tensor,
+    num_contexts: int,
+    num_gens: int,
+    N: int,
+):
+    """Pure-PyTorch equivalent of :func:`_ddtree_build_candidates`.
+
+    4 dispatches: target_predict copy, candidates[:, 0] from tp, candidates[:, 1:]
+    from draft_tokens, tree_valid index_select.
+    """
+    tp_view = target_predict[:num_gens]
+    # Match the Triton kernel's index: target_tokens[(num_contexts + g) * N + n].
+    # In practice num_contexts == 0 during the gen path, so this collapses to
+    # target_tokens[g*N + n] — the same as the warmup branch in dflash.py.
+    start = num_contexts * N
+    tp_view.copy_(target_tokens[start : start + num_gens * N].view(num_gens, N).to(torch.int32))
+    candidates[:num_gens, 0] = tp_view[:, 0]
+    candidates[:num_gens, 1:N] = draft_tokens[:num_gens]
+    torch.index_select(has_tree, 0, slot_ids[:num_gens], out=tree_valid[:num_gens])
+
+
 def _ddtree_build_candidates(
     target_predict: torch.Tensor,
     candidates: torch.Tensor,
@@ -511,6 +603,19 @@ def _ddtree_build_candidates(
     """One Triton launch fuses the pre-verify staging chain."""
     if num_gens == 0:
         return
+    if _HELPERS_BACKEND == "torch":
+        return _ddtree_build_candidates_torch(
+            target_predict,
+            candidates,
+            tree_valid,
+            target_tokens,
+            draft_tokens,
+            has_tree,
+            slot_ids,
+            num_contexts,
+            num_gens,
+            N,
+        )
     BLOCK_G = max(8, triton.next_power_of_2(num_gens))
     BLOCK_N = max(16, triton.next_power_of_2(N))
     _ddtree_build_candidates_kernel[(1,)](
@@ -568,6 +673,24 @@ def _ddtree_pre_init_kernel(
     )
 
 
+def _ddtree_pre_init_torch(
+    accepted_tokens: torch.Tensor,
+    num_accepted: torch.Tensor,
+    tree_accepted_indices: torch.Tensor,
+    batch_size: int,
+    max_path_len: int,
+    max_draft_len: int,
+):
+    """Pure-PyTorch equivalent of :func:`_ddtree_pre_init`. 3 dispatches.
+
+    Slices to ``[:max_path_len]`` / ``[:max_draft_len]`` to match the
+    Triton kernel's column masking when callers pass wider scratch buffers.
+    """
+    accepted_tokens[:batch_size, :max_path_len].zero_()
+    num_accepted[:batch_size].fill_(1)
+    tree_accepted_indices[:batch_size, :max_draft_len].fill_(-1)
+
+
 def _ddtree_pre_init(
     accepted_tokens: torch.Tensor,
     num_accepted: torch.Tensor,
@@ -585,6 +708,15 @@ def _ddtree_pre_init(
     """
     if batch_size == 0:
         return
+    if _HELPERS_BACKEND == "torch":
+        return _ddtree_pre_init_torch(
+            accepted_tokens,
+            num_accepted,
+            tree_accepted_indices,
+            batch_size,
+            max_path_len,
+            max_draft_len,
+        )
     BLOCK_B = max(8, triton.next_power_of_2(batch_size))
     BLOCK_P = max(16, triton.next_power_of_2(max_path_len))
     BLOCK_K = max(16, triton.next_power_of_2(max_draft_len))
@@ -662,6 +794,29 @@ def _ddtree_post_scatter_kernel(
     )
 
 
+def _ddtree_post_scatter_torch(
+    accepted_tokens: torch.Tensor,
+    num_accepted: torch.Tensor,
+    tree_accepted_indices: torch.Tensor,
+    tree_accept_path: torch.Tensor,
+    accept_token: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_contexts: int,
+    num_gens: int,
+    max_path_len: int,
+    max_draft_len: int,
+):
+    """Pure-PyTorch equivalent of :func:`_ddtree_post_scatter`. 4 dispatches."""
+    P = max_path_len
+    K = max_draft_len
+    end = num_contexts + num_gens
+    accepted_tokens[num_contexts:end] = accept_token[:num_gens]
+    num_accepted[num_contexts:end] = accept_token_num[:num_gens] + 1
+    tree_accepted_indices[num_contexts:end, :K] = accept_index[:num_gens, 1 : K + 1] - 1
+    tree_accept_path[num_contexts:end, :P] = accept_index[:num_gens, :P].to(torch.int64)
+
+
 def _ddtree_post_scatter(
     accepted_tokens: torch.Tensor,
     num_accepted: torch.Tensor,
@@ -678,6 +833,20 @@ def _ddtree_post_scatter(
     """Fused post-verify scatter (4 kernels → 1)."""
     if num_gens == 0:
         return
+    if _HELPERS_BACKEND == "torch":
+        return _ddtree_post_scatter_torch(
+            accepted_tokens,
+            num_accepted,
+            tree_accepted_indices,
+            tree_accept_path,
+            accept_token,
+            accept_token_num,
+            accept_index,
+            num_contexts,
+            num_gens,
+            max_path_len,
+            max_draft_len,
+        )
     BLOCK_G = max(8, triton.next_power_of_2(num_gens))
     BLOCK_P = max(16, triton.next_power_of_2(max_path_len))
     _ddtree_post_scatter_kernel[(1,)](
