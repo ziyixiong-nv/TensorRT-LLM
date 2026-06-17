@@ -20,24 +20,26 @@ class DynamicTreeSlotStorage:
         S = num_slots + 1
         self.dummy_slot_id = num_slots
 
-        # Slot buffers — C++ kernel writes directly via slotIds
+        # Per-slot dynamic-tree fields, scattered each gen step by
+        # `_ddtree_slot_scatter` (Triton or torch fallback) keyed on slot id.
         self.packed_mask = torch.zeros((S, n_dt, mask_width),
                                        dtype=torch.int32,
                                        device='cuda')
-        self.position_offsets = torch.zeros((S, n_dt),
-                                            dtype=torch.int32,
-                                            device='cuda')
-        self.retrieve_index = torch.zeros((S, n_dt),
-                                          dtype=torch.int32,
-                                          device='cuda')
-        self.retrieve_next_token = torch.full((S, n_dt),
-                                              -1,
-                                              dtype=torch.int32,
-                                              device='cuda')
-        self.retrieve_next_sibling = torch.full((S, n_dt),
-                                                -1,
-                                                dtype=torch.int32,
-                                                device='cuda')
+        # Stack the 4 same-shape [S, n_dt] int32 fields into one backing tensor
+        # so the torch fallback of `_ddtree_slot_scatter` can fuse 4 separate
+        # `index_copy_` calls into one (dim=1 scatter over the stacked tensor).
+        # Per-field views over rows 0..3 are exposed under the named attributes
+        # used by the Triton kernel arg list and other consumers.
+        # Row order: [position_offsets, retrieve_index, retrieve_next_token, retrieve_next_sibling]
+        self._slot_stack = torch.empty((4, S, n_dt),
+                                       dtype=torch.int32,
+                                       device='cuda')
+        self._slot_stack[:2].zero_()
+        self._slot_stack[2:].fill_(-1)
+        self.position_offsets = self._slot_stack[0]
+        self.retrieve_index = self._slot_stack[1]
+        self.retrieve_next_token = self._slot_stack[2]
+        self.retrieve_next_sibling = self._slot_stack[3]
         self.has_tree = torch.zeros(S, dtype=torch.bool, device='cuda')
 
         # Slot-ID buffers
@@ -99,10 +101,17 @@ class DynamicTreeSlotStorage:
         if count == 0:
             return self._verify_staging[:0]
         from .ddtree_ops import _ddtree_pack_retrieve
+
+        # _slot_stack[1:4] aliases [retrieve_index, retrieve_next_token,
+        # retrieve_next_sibling] as one [3, S, n_dt] tensor; the torch fallback
+        # uses it to fuse 3 gathers into 1.
         return _ddtree_pack_retrieve(self.retrieve_index,
                                      self.retrieve_next_token,
-                                     self.retrieve_next_sibling, slot_ids,
-                                     count, self._verify_staging)
+                                     self.retrieve_next_sibling,
+                                     slot_ids,
+                                     count,
+                                     self._verify_staging,
+                                     stacked_src=self._slot_stack[1:4])
 
     def next_links_from_slots(self, slot_ids, count):
         """Gather next-token and next-sibling links into contiguous staging buffers."""

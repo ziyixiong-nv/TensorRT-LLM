@@ -324,17 +324,23 @@ def _ddtree_pack_retrieve_torch(
     slot_ids: torch.Tensor,
     count: int,
     out: torch.Tensor,
+    stacked_src: torch.Tensor | None = None,
 ):
     """Pure-PyTorch equivalent of :func:`_ddtree_pack_retrieve`.
 
-    3 fancy-indexed gathers + a stack into ``out[:, :, 0|1|2]``. Faster than
-    the Triton kernel only at large G; at low batch each fancy index is its
-    own dispatch.
+    When ``stacked_src`` is provided (the ``[3, S, n_dt]`` view aliasing the
+    three retrieve fields), do one ``index_select(dim=1, ids)`` plus one
+    permuted copy into ``out`` (2 dispatches). Otherwise fall back to 3
+    separate fancy gathers (6 dispatches).
     """
     ids = slot_ids[:count]
-    out[:count, :, 0] = retrieve_index.index_select(0, ids)
-    out[:count, :, 1] = retrieve_next_token.index_select(0, ids)
-    out[:count, :, 2] = retrieve_next_sibling.index_select(0, ids)
+    if stacked_src is not None:
+        gathered = stacked_src.index_select(1, ids)  # [3, count, n_dt]
+        out[:count].copy_(gathered.permute(1, 2, 0))
+    else:
+        out[:count, :, 0] = retrieve_index.index_select(0, ids)
+        out[:count, :, 1] = retrieve_next_token.index_select(0, ids)
+        out[:count, :, 2] = retrieve_next_sibling.index_select(0, ids)
     return out[:count]
 
 
@@ -345,9 +351,14 @@ def _ddtree_pack_retrieve(
     slot_ids: torch.Tensor,
     count: int,
     out: torch.Tensor,
+    stacked_src: torch.Tensor | None = None,
 ):
     """One Triton launch fuses 3 fancy-indexed gather+copy + makes the result
     contiguous for the verify op. ``out`` must be ``[>=count, n_dt, 3]`` int32.
+
+    ``stacked_src`` is the optional ``[3, S, n_dt]`` view aliasing the 3
+    retrieve fields; only the torch fallback uses it (to fuse 3 gathers into
+    1).
     """
     if count == 0:
         return out[:0]
@@ -359,6 +370,7 @@ def _ddtree_pack_retrieve(
             slot_ids,
             count,
             out,
+            stacked_src=stacked_src,
         )
     n_dt = retrieve_index.shape[1]
     BLOCK_DT = max(16, triton.next_power_of_2(n_dt))
@@ -439,15 +451,16 @@ def _ddtree_slot_scatter_torch(
 ):
     """Pure-PyTorch equivalent of :func:`_ddtree_slot_scatter`.
 
-    5 ``index_copy_`` + 1 ``index_fill_`` + 1 dummy-slot reset (7 dispatches
-    vs the Triton 1+1).
+    Both the slot storage and the build-side finalize buffers stack the 4
+    same-shape ``[*, n_dt]`` int32 fields (positions, retrieve_index,
+    retrieve_next_token, retrieve_next_sibling) onto a leading axis, so one
+    ``index_copy_(dim=1, ...)`` scatters all four at once.
+    Total: 1 stacked scatter + 1 packed_mask scatter + index_fill_ + dummy reset
+    (4 dispatches vs the Triton 1+1).
     """
     ids = slot_ids[:num_gens]
     slot_storage.packed_mask.index_copy_(0, ids, tree_dict["packed_mask"])
-    slot_storage.position_offsets.index_copy_(0, ids, tree_dict["positions"])
-    slot_storage.retrieve_index.index_copy_(0, ids, tree_dict["retrieve_index"])
-    slot_storage.retrieve_next_token.index_copy_(0, ids, tree_dict["retrieve_next_token"])
-    slot_storage.retrieve_next_sibling.index_copy_(0, ids, tree_dict["retrieve_next_sibling"])
+    slot_storage._slot_stack.index_copy_(1, ids, tree_dict["_stack"])
     slot_storage.has_tree.index_fill_(0, ids, True)
     slot_storage.has_tree.narrow(0, dummy_slot_id, 1).fill_(False)
 
@@ -574,18 +587,22 @@ def _ddtree_build_candidates_torch(
 ):
     """Pure-PyTorch equivalent of :func:`_ddtree_build_candidates`.
 
-    4 dispatches: target_predict copy, candidates[:, 0] from tp, candidates[:, 1:]
-    from draft_tokens, tree_valid index_select.
+    4 dispatches with no temp allocs:
+      * ``copy_`` absorbs the int64 → int32 cast on the source slice.
+      * ``candidates[:, 0]`` is filled from the same int64 slice via ``copy_``
+        rather than reading back ``tp_view`` (saves a redundant int32 write
+        path; PyTorch fuses the gather into the destination dtype).
     """
-    tp_view = target_predict[:num_gens]
+    G = num_gens
+    tp_view = target_predict[:G]
     # Match the Triton kernel's index: target_tokens[(num_contexts + g) * N + n].
-    # In practice num_contexts == 0 during the gen path, so this collapses to
-    # target_tokens[g*N + n] — the same as the warmup branch in dflash.py.
+    # In practice num_contexts == 0 during the gen path.
     start = num_contexts * N
-    tp_view.copy_(target_tokens[start : start + num_gens * N].view(num_gens, N).to(torch.int32))
-    candidates[:num_gens, 0] = tp_view[:, 0]
-    candidates[:num_gens, 1:N] = draft_tokens[:num_gens]
-    torch.index_select(has_tree, 0, slot_ids[:num_gens], out=tree_valid[:num_gens])
+    src_2d = target_tokens[start : start + G * N].view(G, N)
+    tp_view.copy_(src_2d)  # int64 -> int32, no temp tensor
+    candidates[:G, 0].copy_(src_2d[:, 0])  # int64 -> int32, no temp tensor
+    candidates[:G, 1:N].copy_(draft_tokens[:G])
+    torch.index_select(has_tree, 0, slot_ids[:G], out=tree_valid[:G])
 
 
 def _ddtree_build_candidates(
@@ -807,14 +824,24 @@ def _ddtree_post_scatter_torch(
     max_path_len: int,
     max_draft_len: int,
 ):
-    """Pure-PyTorch equivalent of :func:`_ddtree_post_scatter`. 4 dispatches."""
+    """Pure-PyTorch equivalent of :func:`_ddtree_post_scatter`.
+
+    4 dispatches with no temp allocs:
+      * ``copy_`` instead of ``.to(int64)`` — writes through the destination's
+        int64 view and skips a temp allocation.
+      * ``add_(1)`` / ``sub_(1)`` are fused with the destination write by first
+        copying the source slice and then adjusting in-place.
+    """
     P = max_path_len
     K = max_draft_len
     end = num_contexts + num_gens
-    accepted_tokens[num_contexts:end] = accept_token[:num_gens]
-    num_accepted[num_contexts:end] = accept_token_num[:num_gens] + 1
-    tree_accepted_indices[num_contexts:end, :K] = accept_index[:num_gens, 1 : K + 1] - 1
-    tree_accept_path[num_contexts:end, :P] = accept_index[:num_gens, :P].to(torch.int64)
+    accepted_tokens[num_contexts:end].copy_(accept_token[:num_gens])
+    # num_accepted slice = accept_token_num[:G] + 1 — copy then in-place add.
+    num_accepted[num_contexts:end].copy_(accept_token_num[:num_gens]).add_(1)
+    # tree_accepted_indices slice = accept_index[:G, 1:K+1] - 1 — copy then sub_.
+    tree_accepted_indices[num_contexts:end, :K].copy_(accept_index[:num_gens, 1 : K + 1]).sub_(1)
+    # int64 dest absorbs the int32 cast via copy_ (no temp tensor).
+    tree_accept_path[num_contexts:end, :P].copy_(accept_index[:num_gens, :P])
 
 
 def _ddtree_post_scatter(

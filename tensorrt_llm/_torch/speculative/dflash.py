@@ -320,18 +320,18 @@ class DFlashWorker(SpecWorkerBase):
         self._fin_draft_tokens_buf = torch.empty(
             (max_num_requests, self.node_budget), dtype=torch.int32, device="cuda"
         )
-        self._fin_retrieve_index_buf = torch.empty(
-            (max_num_requests, n_dt), dtype=torch.int32, device="cuda"
+        # Stack the 4 same-shape [max_num_requests, n_dt] int32 finalize buffers
+        # into one backing tensor so the torch fallback of `_ddtree_slot_scatter`
+        # can fuse 4 `index_copy_` calls into one over the stacked dim.
+        # Row order matches `DynamicTreeSlotStorage._slot_stack`:
+        # [positions, retrieve_index, retrieve_next_token, retrieve_next_sibling]
+        self._fin_stack_buf = torch.empty(
+            (4, max_num_requests, n_dt), dtype=torch.int32, device="cuda"
         )
-        self._fin_retrieve_next_token_buf = torch.empty(
-            (max_num_requests, n_dt), dtype=torch.int32, device="cuda"
-        )
-        self._fin_retrieve_next_sibling_buf = torch.empty(
-            (max_num_requests, n_dt), dtype=torch.int32, device="cuda"
-        )
-        self._fin_positions_buf = torch.empty(
-            (max_num_requests, n_dt), dtype=torch.int32, device="cuda"
-        )
+        self._fin_positions_buf = self._fin_stack_buf[0]
+        self._fin_retrieve_index_buf = self._fin_stack_buf[1]
+        self._fin_retrieve_next_token_buf = self._fin_stack_buf[2]
+        self._fin_retrieve_next_sibling_buf = self._fin_stack_buf[3]
         self._fin_packed_mask_buf = torch.empty(
             (max_num_requests, n_dt, n_words), dtype=torch.int32, device="cuda"
         )
@@ -538,12 +538,16 @@ class DFlashWorker(SpecWorkerBase):
 
         # Slice the persistent finalize buffers to leading num_gens rows so the
         # kernel writes into stable storage across iterations (CUDA-graph safe).
+        # Stacked view: shape [4, num_gens, n_dt]; per-field views alias into it
+        # so a single `index_copy_(dim=1, ...)` over the stack scatters all 4
+        # fields at once in the torch fallback.
+        fin_stack = self._fin_stack_buf[:, :num_gens]
         finalize_buffers = {
             "draft_tokens": self._fin_draft_tokens_buf[:num_gens],
-            "retrieve_index": self._fin_retrieve_index_buf[:num_gens],
-            "retrieve_next_token": self._fin_retrieve_next_token_buf[:num_gens],
-            "retrieve_next_sibling": self._fin_retrieve_next_sibling_buf[:num_gens],
-            "positions": self._fin_positions_buf[:num_gens],
+            "positions": fin_stack[0],
+            "retrieve_index": fin_stack[1],
+            "retrieve_next_token": fin_stack[2],
+            "retrieve_next_sibling": fin_stack[3],
             "packed_mask": self._fin_packed_mask_buf[:num_gens],
         }
         tree = build_ddtree(
@@ -554,6 +558,9 @@ class DFlashWorker(SpecWorkerBase):
             vocab_fanout=V,
             finalize_buffers=finalize_buffers,
         )
+        # Expose the stacked alias so `_ddtree_slot_scatter_torch` can do one
+        # scatter over the [4, G, n_dt] backing tensor instead of four.
+        tree["_stack"] = fin_stack
 
         import os as _os
 
