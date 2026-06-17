@@ -321,8 +321,8 @@ class DFlashWorker(SpecWorkerBase):
             (max_num_requests, self.node_budget), dtype=torch.int32, device="cuda"
         )
         # Stack the 4 same-shape [max_num_requests, n_dt] int32 finalize buffers
-        # into one backing tensor so the torch fallback of `_ddtree_slot_scatter`
-        # can fuse 4 `index_copy_` calls into one over the stacked dim.
+        # into one backing tensor so `_ddtree_slot_scatter` can fuse 4
+        # `index_copy_` calls into one over the stacked dim.
         # Row order matches `DynamicTreeSlotStorage._slot_stack`:
         # [positions, retrieve_index, retrieve_next_token, retrieve_next_sibling]
         self._fin_stack_buf = torch.empty(
@@ -558,7 +558,7 @@ class DFlashWorker(SpecWorkerBase):
             vocab_fanout=V,
             finalize_buffers=finalize_buffers,
         )
-        # Expose the stacked alias so `_ddtree_slot_scatter_torch` can do one
+        # Expose the stacked alias so `_ddtree_slot_scatter` can do one
         # scatter over the [4, G, n_dt] backing tensor instead of four.
         tree["_stack"] = fin_stack
 

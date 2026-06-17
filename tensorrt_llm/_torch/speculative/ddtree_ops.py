@@ -33,7 +33,6 @@ pointer), ``retrieve_next_sibling`` (next-sibling pointer), ``positions`` (= dep
 a bit-packed ancestor mask, and the flat per-node draft tokens ``[num_gens, B]``.
 """
 
-import os
 from typing import Dict
 
 import torch
@@ -41,13 +40,6 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._utils import nvtx_range
-
-# When DDTREE_HELPERS_BACKEND=torch, the five small launch-bound helpers
-# (pre_init / post_scatter / pack_retrieve / slot_scatter / build_candidates)
-# fall back to pure-PyTorch implementations. The two heavyweight kernels
-# (_ddtree_topk and _ddtree_build_kernel) stay Triton regardless. Used to
-# A/B benchmark whether the helper Triton fusions are still worth it.
-_HELPERS_BACKEND = os.environ.get("DDTREE_HELPERS_BACKEND", "triton").lower()
 
 # Sentinel score for inactive / invalid frontier slots. Large-negative but finite
 # so arithmetic (score + log q) never produces NaN.
@@ -287,37 +279,7 @@ def _ddtree_topk(gen_logits: torch.Tensor, d2t: torch.Tensor | None, V: int):
     return topk_log_vals, topk_ids
 
 
-@triton.jit
-def _ddtree_pack_retrieve_kernel(
-    out_ptr,  # [count, n_dt, 3] int32
-    retrieve_index_ptr,  # [S, n_dt] int32
-    retrieve_next_token_ptr,  # [S, n_dt] int32
-    retrieve_next_sibling_ptr,  # [S, n_dt] int32
-    slot_ids_ptr,  # [count] int64
-    n_dt: tl.constexpr,
-    BLOCK_DT: tl.constexpr,
-):
-    """One CTA per (gen, sub-tile). Replaces 3 fancy-indexed slice copies.
-
-    Layout of ``out``: out[g, i, 0|1|2] = retrieve_*[slot_ids[g], i].
-    """
-    g = tl.program_id(0)
-    slot = tl.load(slot_ids_ptr + g)  # int64
-    dt_off = tl.arange(0, BLOCK_DT)
-    dt_mask = dt_off < n_dt
-
-    src_off = slot * n_dt + dt_off
-    ri = tl.load(retrieve_index_ptr + src_off, mask=dt_mask, other=0)
-    rnt = tl.load(retrieve_next_token_ptr + src_off, mask=dt_mask, other=-1)
-    rns = tl.load(retrieve_next_sibling_ptr + src_off, mask=dt_mask, other=-1)
-
-    base = g * n_dt * 3 + dt_off * 3
-    tl.store(out_ptr + base + 0, ri, mask=dt_mask)
-    tl.store(out_ptr + base + 1, rnt, mask=dt_mask)
-    tl.store(out_ptr + base + 2, rns, mask=dt_mask)
-
-
-def _ddtree_pack_retrieve_torch(
+def _ddtree_pack_retrieve(
     retrieve_index: torch.Tensor,
     retrieve_next_token: torch.Tensor,
     retrieve_next_sibling: torch.Tensor,
@@ -326,13 +288,16 @@ def _ddtree_pack_retrieve_torch(
     out: torch.Tensor,
     stacked_src: torch.Tensor | None = None,
 ):
-    """Pure-PyTorch equivalent of :func:`_ddtree_pack_retrieve`.
+    """Pack ``retrieve_*[slot_ids[:count]]`` into a contiguous ``[count, n_dt, 3]``
+    int32 tile for the verify op.
 
     When ``stacked_src`` is provided (the ``[3, S, n_dt]`` view aliasing the
     three retrieve fields), do one ``index_select(dim=1, ids)`` plus one
     permuted copy into ``out`` (2 dispatches). Otherwise fall back to 3
-    separate fancy gathers (6 dispatches).
+    separate fancy gathers.
     """
+    if count == 0:
+        return out[:0]
     ids = slot_ids[:count]
     if stacked_src is not None:
         gathered = stacked_src.index_select(1, ids)  # [3, count, n_dt]
@@ -344,265 +309,26 @@ def _ddtree_pack_retrieve_torch(
     return out[:count]
 
 
-def _ddtree_pack_retrieve(
-    retrieve_index: torch.Tensor,
-    retrieve_next_token: torch.Tensor,
-    retrieve_next_sibling: torch.Tensor,
-    slot_ids: torch.Tensor,
-    count: int,
-    out: torch.Tensor,
-    stacked_src: torch.Tensor | None = None,
-):
-    """One Triton launch fuses 3 fancy-indexed gather+copy + makes the result
-    contiguous for the verify op. ``out`` must be ``[>=count, n_dt, 3]`` int32.
-
-    ``stacked_src`` is the optional ``[3, S, n_dt]`` view aliasing the 3
-    retrieve fields; only the torch fallback uses it (to fuse 3 gathers into
-    1).
-    """
-    if count == 0:
-        return out[:0]
-    if _HELPERS_BACKEND == "torch":
-        return _ddtree_pack_retrieve_torch(
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            slot_ids,
-            count,
-            out,
-            stacked_src=stacked_src,
-        )
-    n_dt = retrieve_index.shape[1]
-    BLOCK_DT = max(16, triton.next_power_of_2(n_dt))
-    _ddtree_pack_retrieve_kernel[(count,)](
-        out,
-        retrieve_index,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        slot_ids,
-        n_dt=n_dt,
-        BLOCK_DT=BLOCK_DT,
-        num_warps=1,
-    )
-    return out[:count]
-
-
-@triton.jit
-def _ddtree_slot_scatter_kernel(
-    # Slot storage (destination):
-    ss_packed_mask_ptr,  # [S, n_dt, n_words] int32
-    ss_pos_offsets_ptr,  # [S, n_dt] int32
-    ss_retrieve_index_ptr,  # [S, n_dt] int32
-    ss_retrieve_next_token_ptr,  # [S, n_dt] int32
-    ss_retrieve_next_sibling_ptr,  # [S, n_dt] int32
-    ss_has_tree_ptr,  # [S] bool (uint8)
-    # build_ddtree outputs (source):
-    src_packed_mask_ptr,  # [G, n_dt, n_words] int32
-    src_pos_offsets_ptr,  # [G, n_dt] int32
-    src_retrieve_index_ptr,  # [G, n_dt] int32
-    src_retrieve_next_token_ptr,  # [G, n_dt] int32
-    src_retrieve_next_sibling_ptr,  # [G, n_dt] int32
-    # Slot ids (source row -> dst row mapping):
-    slot_ids_ptr,  # [G] int64
-    n_dt: tl.constexpr,
-    n_words: tl.constexpr,
-    BLOCK_DT: tl.constexpr,
-    BLOCK_W: tl.constexpr,
-):
-    """Single launch fuses 5 ``index_copy_`` + 1 ``index_fill_`` (= 6 kernels)
-    in :py:meth:`SpecTreeManager.scatter_to_slot_storage` plus the 5 work-buf
-    ``.copy_()`` it previously stage into. Grid: (G,). Each CTA scatters one
-    request's tree row into ``slot_storage[slot_id]``.
-    """
-    g = tl.program_id(0)
-    slot = tl.load(slot_ids_ptr + g)  # int64
-
-    dt_off = tl.arange(0, BLOCK_DT)
-    dt_mask = dt_off < n_dt
-
-    # ----- 1D-rank rows (4 of them: pos_offsets / retrieve_index / next_token / next_sibling)
-    src_row = g * n_dt + dt_off
-    dst_row = slot * n_dt + dt_off
-
-    po = tl.load(src_pos_offsets_ptr + src_row, mask=dt_mask, other=0)
-    ri = tl.load(src_retrieve_index_ptr + src_row, mask=dt_mask, other=0)
-    rnt = tl.load(src_retrieve_next_token_ptr + src_row, mask=dt_mask, other=-1)
-    rns = tl.load(src_retrieve_next_sibling_ptr + src_row, mask=dt_mask, other=-1)
-    tl.store(ss_pos_offsets_ptr + dst_row, po, mask=dt_mask)
-    tl.store(ss_retrieve_index_ptr + dst_row, ri, mask=dt_mask)
-    tl.store(ss_retrieve_next_token_ptr + dst_row, rnt, mask=dt_mask)
-    tl.store(ss_retrieve_next_sibling_ptr + dst_row, rns, mask=dt_mask)
-
-    # ----- 2D rows for packed_mask: [n_dt, n_words]
-    w_off = tl.arange(0, BLOCK_W)
-    w_mask = w_off < n_words
-    mask_idx_src = (g * n_dt + dt_off[:, None]) * n_words + w_off[None, :]
-    mask_idx_dst = (slot * n_dt + dt_off[:, None]) * n_words + w_off[None, :]
-    pm_load_mask = dt_mask[:, None] & w_mask[None, :]
-    pm = tl.load(src_packed_mask_ptr + mask_idx_src, mask=pm_load_mask, other=0)
-    tl.store(ss_packed_mask_ptr + mask_idx_dst, pm, mask=pm_load_mask)
-
-    # ----- has_tree[slot] = True (1 byte each)
-    tl.store(ss_has_tree_ptr + slot, tl.full((), 1, tl.int8))
-
-
-def _ddtree_slot_scatter_torch(
+def _ddtree_slot_scatter(
     slot_storage, tree_dict, slot_ids: torch.Tensor, num_gens: int, dummy_slot_id: int
 ):
-    """Pure-PyTorch equivalent of :func:`_ddtree_slot_scatter`.
+    """Scatter per-request DDTree build outputs into ``slot_storage[slot_ids]``.
 
     Both the slot storage and the build-side finalize buffers stack the 4
     same-shape ``[*, n_dt]`` int32 fields (positions, retrieve_index,
     retrieve_next_token, retrieve_next_sibling) onto a leading axis, so one
-    ``index_copy_(dim=1, ...)`` scatters all four at once.
-    Total: 1 stacked scatter + 1 packed_mask scatter + index_fill_ + dummy reset
-    (4 dispatches vs the Triton 1+1).
+    ``index_copy_(dim=1, ...)`` scatters all four at once. Total: 1 stacked
+    scatter + 1 packed_mask scatter + 1 ``index_fill_`` + 1 dummy-slot reset
+    (the dummy reset keeps ``has_tree[dummy_slot]`` False for CUDA-graph
+    dummy iters).
     """
+    if num_gens == 0:
+        return
     ids = slot_ids[:num_gens]
     slot_storage.packed_mask.index_copy_(0, ids, tree_dict["packed_mask"])
     slot_storage._slot_stack.index_copy_(1, ids, tree_dict["_stack"])
     slot_storage.has_tree.index_fill_(0, ids, True)
     slot_storage.has_tree.narrow(0, dummy_slot_id, 1).fill_(False)
-
-
-def _ddtree_slot_scatter(
-    slot_storage, tree_dict, slot_ids: torch.Tensor, num_gens: int, dummy_slot_id: int
-):
-    """Fuse the 11-dispatch ``ddtree_scatter_slot_storage`` chain into one
-    Triton launch:
-
-      * 5 work-buf ``.copy_()`` (eliminated — never written; nothing reads them
-        on the DDTree path)
-      * 5 ``index_copy_`` into ``slot_storage.{packed_mask, position_offsets,
-        retrieve_index, retrieve_next_token, retrieve_next_sibling}``
-      * 1 ``index_fill_`` for ``has_tree[ids] = True``
-
-    The dummy-slot reset (``has_tree[dummy_slot] = False``) stays as a small
-    scalar write since it doesn't depend on per-request data.
-    """
-    if num_gens == 0:
-        return
-    if _HELPERS_BACKEND == "torch":
-        return _ddtree_slot_scatter_torch(
-            slot_storage,
-            tree_dict,
-            slot_ids,
-            num_gens,
-            dummy_slot_id,
-        )
-    n_dt = tree_dict["packed_mask"].shape[1]
-    n_words = tree_dict["packed_mask"].shape[2]
-    BLOCK_DT = max(16, triton.next_power_of_2(n_dt))
-    BLOCK_W = max(8, triton.next_power_of_2(n_words))
-    _ddtree_slot_scatter_kernel[(num_gens,)](
-        slot_storage.packed_mask,
-        slot_storage.position_offsets,
-        slot_storage.retrieve_index,
-        slot_storage.retrieve_next_token,
-        slot_storage.retrieve_next_sibling,
-        slot_storage.has_tree,
-        tree_dict["packed_mask"],
-        tree_dict["positions"],
-        tree_dict["retrieve_index"],
-        tree_dict["retrieve_next_token"],
-        tree_dict["retrieve_next_sibling"],
-        slot_ids,
-        n_dt=n_dt,
-        n_words=n_words,
-        BLOCK_DT=BLOCK_DT,
-        BLOCK_W=BLOCK_W,
-        num_warps=2,
-    )
-    # Keep dummy slot invalid for CUDA-graph dummy iters.
-    slot_storage.has_tree.narrow(0, dummy_slot_id, 1).fill_(False)
-
-
-@triton.jit
-def _ddtree_build_candidates_kernel(
-    target_predict_ptr,  # [G, N] int32 — out
-    candidates_ptr,  # [G, N] int32 — out
-    tree_valid_ptr,  # [G] bool/int8 — out
-    target_tokens_ptr,  # [num_flat] int64 — in (already argmaxed)
-    draft_tokens_ptr,  # [G, B] int32 — in (B = N - 1)
-    has_tree_ptr,  # [S] int8 — in
-    slot_ids_ptr,  # [G] int64 — in (gen_slot_ids = all_ids_buf[ctx:ctx+G])
-    num_contexts: tl.constexpr,
-    G: tl.constexpr,
-    N: tl.constexpr,
-    BLOCK_G: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    """Fuse 4 small ops:
-    1. ``target_predict[:G] = target_tokens[ctx:ctx+G*N].view(G,N).int()``
-    2. ``candidates[:G, 0]   = target_predict[:G, 0]``
-    3. ``candidates[:G, 1:]  = draft_tokens[:G]``
-    4. ``tree_valid[:G]      = has_tree[slot_ids[:G]]``
-    """
-    g_off = tl.arange(0, BLOCK_G)
-    g_mask = g_off < G
-    n_off = tl.arange(0, BLOCK_N)
-    n_mask = n_off < N
-
-    # 1) target_predict[g, n] = (int32) target_tokens[num_contexts*N + g*N + n]
-    src_idx = (num_contexts + g_off[:, None]) * N + n_off[None, :]
-    src_mask = g_mask[:, None] & n_mask[None, :]
-    tp = tl.load(target_tokens_ptr + src_idx, mask=src_mask, other=0).to(tl.int32)
-
-    dst_idx = g_off[:, None] * N + n_off[None, :]
-    tl.store(target_predict_ptr + dst_idx, tp, mask=src_mask)
-
-    # 2 + 3) candidates[g, 0] = tp[g, 0];  candidates[g, 1:] = draft_tokens[g, n-1]
-    # Build candidate tile: col 0 from tp[:, 0]; col n>=1 from draft_tokens[:, n-1].
-    is_col0 = n_off == 0
-    # Broadcast tp's column 0 across the row.
-    tp_col0 = tl.where(n_off[None, :] == 0, tp, 0)
-    # Sum across n axis to get [G] vector then broadcast back so col 0 holds it.
-    tp_first = tl.sum(tp_col0, axis=1, keep_dims=True)  # [G, 1]
-    # Load draft_tokens[g, n-1] for n>=1; safe index when n==0.
-    dn = tl.maximum(n_off - 1, 0)
-    dt_idx = g_off[:, None] * (N - 1) + dn[None, :]
-    dt_load_mask = g_mask[:, None] & (n_off[None, :] >= 1) & ((n_off[None, :] - 1) < (N - 1))
-    dt = tl.load(draft_tokens_ptr + dt_idx, mask=dt_load_mask, other=0)
-
-    cand = tl.where(is_col0[None, :], tp_first, dt)
-    tl.store(candidates_ptr + dst_idx, cand, mask=src_mask)
-
-    # 4) tree_valid[g] = has_tree[slot_ids[g]]
-    slot = tl.load(slot_ids_ptr + g_off, mask=g_mask, other=0)
-    tv = tl.load(has_tree_ptr + slot, mask=g_mask, other=0)
-    tl.store(tree_valid_ptr + g_off, tv, mask=g_mask)
-
-
-def _ddtree_build_candidates_torch(
-    target_predict: torch.Tensor,
-    candidates: torch.Tensor,
-    tree_valid: torch.Tensor,
-    target_tokens: torch.Tensor,
-    draft_tokens: torch.Tensor,
-    has_tree: torch.Tensor,
-    slot_ids: torch.Tensor,
-    num_contexts: int,
-    num_gens: int,
-    N: int,
-):
-    """Pure-PyTorch equivalent of :func:`_ddtree_build_candidates`.
-
-    4 dispatches with no temp allocs:
-      * ``copy_`` absorbs the int64 → int32 cast on the source slice.
-      * ``candidates[:, 0]`` is filled from the same int64 slice via ``copy_``
-        rather than reading back ``tp_view`` (saves a redundant int32 write
-        path; PyTorch fuses the gather into the destination dtype).
-    """
-    G = num_gens
-    tp_view = target_predict[:G]
-    # Match the Triton kernel's index: target_tokens[(num_contexts + g) * N + n].
-    # In practice num_contexts == 0 during the gen path.
-    start = num_contexts * N
-    src_2d = target_tokens[start : start + G * N].view(G, N)
-    tp_view.copy_(src_2d)  # int64 -> int32, no temp tensor
-    candidates[:G, 0].copy_(src_2d[:, 0])  # int64 -> int32, no temp tensor
-    candidates[:G, 1:N].copy_(draft_tokens[:G])
-    torch.index_select(has_tree, 0, slot_ids[:G], out=tree_valid[:G])
 
 
 def _ddtree_build_candidates(
@@ -617,95 +343,26 @@ def _ddtree_build_candidates(
     num_gens: int,
     N: int,
 ):
-    """One Triton launch fuses the pre-verify staging chain."""
+    """Stage the verify-time inputs (target_predict, candidates, tree_valid).
+
+    4 dispatches with no temp allocs:
+      * ``copy_`` absorbs the int64 → int32 cast on the source slice.
+      * ``candidates[:, 0]`` is filled from the same int64 slice via ``copy_``
+        rather than reading back ``tp_view`` (saves a redundant int32 write
+        path; PyTorch fuses the gather into the destination dtype).
+    """
     if num_gens == 0:
         return
-    if _HELPERS_BACKEND == "torch":
-        return _ddtree_build_candidates_torch(
-            target_predict,
-            candidates,
-            tree_valid,
-            target_tokens,
-            draft_tokens,
-            has_tree,
-            slot_ids,
-            num_contexts,
-            num_gens,
-            N,
-        )
-    BLOCK_G = max(8, triton.next_power_of_2(num_gens))
-    BLOCK_N = max(16, triton.next_power_of_2(N))
-    _ddtree_build_candidates_kernel[(1,)](
-        target_predict,
-        candidates,
-        tree_valid,
-        target_tokens,
-        draft_tokens,
-        has_tree,
-        slot_ids,
-        num_contexts=num_contexts,
-        G=num_gens,
-        N=N,
-        BLOCK_G=BLOCK_G,
-        BLOCK_N=BLOCK_N,
-        num_warps=2,
-    )
-
-
-@triton.jit
-def _ddtree_pre_init_kernel(
-    accepted_tokens_ptr,  # [B, P] int32
-    num_accepted_ptr,  # [B] int32
-    tree_accepted_indices_ptr,  # [B, K] int32
-    batch_size: tl.constexpr,
-    P: tl.constexpr,  # max_path_len = K+1
-    K: tl.constexpr,  # max_draft_len
-    BLOCK_B: tl.constexpr,
-    BLOCK_P: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    """Single launch replaces 3 separate ``zero_/fill_`` kernels.
-    Sized for small batches (BLOCK_B >= batch_size); one CTA covers all rows.
-    """
-    b_off = tl.arange(0, BLOCK_B)
-    b_mask = b_off < batch_size
-
-    # accepted_tokens[:B, :P] = 0
-    p_off = tl.arange(0, BLOCK_P)
-    p_mask = p_off < P
-    at_idx = b_off[:, None] * P + p_off[None, :]
-    at_mask = b_mask[:, None] & p_mask[None, :]
-    tl.store(accepted_tokens_ptr + at_idx, tl.zeros((BLOCK_B, BLOCK_P), tl.int32), mask=at_mask)
-
-    # num_accepted[:B] = 1
-    tl.store(num_accepted_ptr + b_off, tl.full((BLOCK_B,), 1, tl.int32), mask=b_mask)
-
-    # tree_accepted_indices[:B, :K] = -1
-    k_off = tl.arange(0, BLOCK_K)
-    k_mask = k_off < K
-    tk_idx = b_off[:, None] * K + k_off[None, :]
-    tk_mask = b_mask[:, None] & k_mask[None, :]
-    tl.store(
-        tree_accepted_indices_ptr + tk_idx, tl.full((BLOCK_B, BLOCK_K), -1, tl.int32), mask=tk_mask
-    )
-
-
-def _ddtree_pre_init_torch(
-    accepted_tokens: torch.Tensor,
-    num_accepted: torch.Tensor,
-    tree_accepted_indices: torch.Tensor,
-    batch_size: int,
-    max_path_len: int,
-    max_draft_len: int,
-):
-    """Pure-PyTorch equivalent of :func:`_ddtree_pre_init`. 3 dispatches.
-
-    Slices to ``[:max_path_len]`` / ``[:max_draft_len]`` to match the
-    Triton kernel's column masking when callers pass wider scratch buffers.
-    """
-    accepted_tokens[:batch_size, :max_path_len].zero_()
-    num_accepted[:batch_size].fill_(1)
-    tree_accepted_indices[:batch_size, :max_draft_len].fill_(-1)
+    G = num_gens
+    tp_view = target_predict[:G]
+    # Match target_tokens[(num_contexts + g) * N + n]. In practice
+    # num_contexts == 0 during the gen path.
+    start = num_contexts * N
+    src_2d = target_tokens[start : start + G * N].view(G, N)
+    tp_view.copy_(src_2d)  # int64 -> int32, no temp tensor
+    candidates[:G, 0].copy_(src_2d[:, 0])  # int64 -> int32, no temp tensor
+    candidates[:G, 1:N].copy_(draft_tokens[:G])
+    torch.index_select(has_tree, 0, slot_ids[:G], out=tree_valid[:G])
 
 
 def _ddtree_pre_init(
@@ -716,132 +373,15 @@ def _ddtree_pre_init(
     max_path_len: int,
     max_draft_len: int,
 ):
-    """Fused 3-buffer pre-init for ``_sample_and_accept_ddtree``.
-
-    Replaces ``accepted_tokens[:B].zero_(); num_accepted[:B].fill_(1);
-    tree_accepted_indices[:B].fill_(-1)`` (3 dispatches → 1).
-    Caller supplies the underlying full-rank tensors; in-place writes are
-    done on the leading B rows.
+    """Pre-init the 3 verify-output buffers for ``_sample_and_accept_ddtree``
+    on the leading ``batch_size`` rows. Slices match column masking even when
+    callers pass wider scratch buffers.
     """
     if batch_size == 0:
         return
-    if _HELPERS_BACKEND == "torch":
-        return _ddtree_pre_init_torch(
-            accepted_tokens,
-            num_accepted,
-            tree_accepted_indices,
-            batch_size,
-            max_path_len,
-            max_draft_len,
-        )
-    BLOCK_B = max(8, triton.next_power_of_2(batch_size))
-    BLOCK_P = max(16, triton.next_power_of_2(max_path_len))
-    BLOCK_K = max(16, triton.next_power_of_2(max_draft_len))
-    _ddtree_pre_init_kernel[(1,)](
-        accepted_tokens,
-        num_accepted,
-        tree_accepted_indices,
-        batch_size=batch_size,
-        P=max_path_len,
-        K=max_draft_len,
-        BLOCK_B=BLOCK_B,
-        BLOCK_P=BLOCK_P,
-        BLOCK_K=BLOCK_K,
-        num_warps=2,
-    )
-
-
-@triton.jit
-def _ddtree_post_scatter_kernel(
-    accepted_tokens_ptr,  # [B, P] int32
-    num_accepted_ptr,  # [B] int32
-    tree_accepted_indices_ptr,  # [B, K] int32
-    tree_accept_path_ptr,  # [B, P] int64
-    accept_token_ptr,  # [num_gens, P] int32
-    accept_token_num_ptr,  # [num_gens] int32
-    accept_index_ptr,  # [num_gens, P] int32
-    num_contexts: tl.constexpr,
-    num_gens: tl.constexpr,
-    P: tl.constexpr,  # max_path_len
-    K: tl.constexpr,  # max_draft_len
-    BLOCK_G: tl.constexpr,
-    BLOCK_P: tl.constexpr,
-):
-    """Fuse the post-verify scatter chain (4 small kernels → 1)."""
-    g_off = tl.arange(0, BLOCK_G)
-    g_mask = g_off < num_gens
-
-    p_off = tl.arange(0, BLOCK_P)
-    p_mask = p_off < P
-    k_mask = p_off < K
-
-    src_idx = g_off[:, None] * P + p_off[None, :]
-    src_mask = g_mask[:, None] & p_mask[None, :]
-
-    # Load accept_token / accept_index into a [G, P] tile.
-    acc_tok = tl.load(accept_token_ptr + src_idx, mask=src_mask, other=0)
-    acc_idx = tl.load(accept_index_ptr + src_idx, mask=src_mask, other=0)
-    acc_num = tl.load(accept_token_num_ptr + g_off, mask=g_mask, other=0)  # int32
-
-    dst_b = num_contexts + g_off
-    dst_idx_p = dst_b[:, None] * P + p_off[None, :]
-    dst_idx_k = dst_b[:, None] * K + p_off[None, :]
-
-    # accepted_tokens[ctx:ctx+G] = acc_tok
-    tl.store(accepted_tokens_ptr + dst_idx_p, acc_tok, mask=g_mask[:, None] & p_mask[None, :])
-    # num_accepted[ctx:ctx+G] = acc_num + 1
-    tl.store(num_accepted_ptr + dst_b, acc_num + 1, mask=g_mask)
-    # tree_accepted_indices[ctx:ctx+G, :K] = acc_idx[:, 1:K+1] - 1
-    # Load shifted column and subtract 1.
-    src_shift_idx = g_off[:, None] * P + (p_off[None, :] + 1)
-    src_shift_mask = g_mask[:, None] & ((p_off[None, :] + 1) < P) & k_mask[None, :]
-    acc_idx_shift = tl.load(
-        accept_index_ptr + src_shift_idx, mask=src_shift_mask, other=1
-    )  # other=1 -> stored as 0 after -1
-    tl.store(
-        tree_accepted_indices_ptr + dst_idx_k,
-        acc_idx_shift - 1,
-        mask=g_mask[:, None] & k_mask[None, :],
-    )
-    # tree_accept_path[ctx:ctx+G, :P] = acc_idx (cast to int64)
-    tl.store(
-        tree_accept_path_ptr + dst_idx_p,
-        acc_idx.to(tl.int64),
-        mask=g_mask[:, None] & p_mask[None, :],
-    )
-
-
-def _ddtree_post_scatter_torch(
-    accepted_tokens: torch.Tensor,
-    num_accepted: torch.Tensor,
-    tree_accepted_indices: torch.Tensor,
-    tree_accept_path: torch.Tensor,
-    accept_token: torch.Tensor,
-    accept_token_num: torch.Tensor,
-    accept_index: torch.Tensor,
-    num_contexts: int,
-    num_gens: int,
-    max_path_len: int,
-    max_draft_len: int,
-):
-    """Pure-PyTorch equivalent of :func:`_ddtree_post_scatter`.
-
-    4 dispatches with no temp allocs:
-      * ``copy_`` instead of ``.to(int64)`` — writes through the destination's
-        int64 view and skips a temp allocation.
-      * ``add_(1)`` / ``sub_(1)`` are fused with the destination write by first
-        copying the source slice and then adjusting in-place.
-    """
-    P = max_path_len
-    K = max_draft_len
-    end = num_contexts + num_gens
-    accepted_tokens[num_contexts:end].copy_(accept_token[:num_gens])
-    # num_accepted slice = accept_token_num[:G] + 1 — copy then in-place add.
-    num_accepted[num_contexts:end].copy_(accept_token_num[:num_gens]).add_(1)
-    # tree_accepted_indices slice = accept_index[:G, 1:K+1] - 1 — copy then sub_.
-    tree_accepted_indices[num_contexts:end, :K].copy_(accept_index[:num_gens, 1 : K + 1]).sub_(1)
-    # int64 dest absorbs the int32 cast via copy_ (no temp tensor).
-    tree_accept_path[num_contexts:end, :P].copy_(accept_index[:num_gens, :P])
+    accepted_tokens[:batch_size, :max_path_len].zero_()
+    num_accepted[:batch_size].fill_(1)
+    tree_accepted_indices[:batch_size, :max_draft_len].fill_(-1)
 
 
 def _ddtree_post_scatter(
@@ -857,41 +397,26 @@ def _ddtree_post_scatter(
     max_path_len: int,
     max_draft_len: int,
 ):
-    """Fused post-verify scatter (4 kernels → 1)."""
+    """Scatter verify outputs into the per-batch destination buffers.
+
+    4 dispatches with no temp allocs:
+      * ``copy_`` instead of ``.to(int64)`` — writes through the destination's
+        int64 view and skips a temp allocation.
+      * ``add_(1)`` / ``sub_(1)`` are fused with the destination write by first
+        copying the source slice and then adjusting in-place.
+    """
     if num_gens == 0:
         return
-    if _HELPERS_BACKEND == "torch":
-        return _ddtree_post_scatter_torch(
-            accepted_tokens,
-            num_accepted,
-            tree_accepted_indices,
-            tree_accept_path,
-            accept_token,
-            accept_token_num,
-            accept_index,
-            num_contexts,
-            num_gens,
-            max_path_len,
-            max_draft_len,
-        )
-    BLOCK_G = max(8, triton.next_power_of_2(num_gens))
-    BLOCK_P = max(16, triton.next_power_of_2(max_path_len))
-    _ddtree_post_scatter_kernel[(1,)](
-        accepted_tokens,
-        num_accepted,
-        tree_accepted_indices,
-        tree_accept_path,
-        accept_token,
-        accept_token_num,
-        accept_index,
-        num_contexts=num_contexts,
-        num_gens=num_gens,
-        P=max_path_len,
-        K=max_draft_len,
-        BLOCK_G=BLOCK_G,
-        BLOCK_P=BLOCK_P,
-        num_warps=2,
-    )
+    P = max_path_len
+    K = max_draft_len
+    end = num_contexts + num_gens
+    accepted_tokens[num_contexts:end].copy_(accept_token[:num_gens])
+    # num_accepted slice = accept_token_num[:G] + 1 — copy then in-place add.
+    num_accepted[num_contexts:end].copy_(accept_token_num[:num_gens]).add_(1)
+    # tree_accepted_indices slice = accept_index[:G, 1:K+1] - 1 — copy then sub_.
+    tree_accepted_indices[num_contexts:end, :K].copy_(accept_index[:num_gens, 1 : K + 1]).sub_(1)
+    # int64 dest absorbs the int32 cast via copy_ (no temp tensor).
+    tree_accept_path[num_contexts:end, :P].copy_(accept_index[:num_gens, :P])
 
 
 @triton.jit

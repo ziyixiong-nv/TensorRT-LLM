@@ -21,15 +21,14 @@ class DynamicTreeSlotStorage:
         self.dummy_slot_id = num_slots
 
         # Per-slot dynamic-tree fields, scattered each gen step by
-        # `_ddtree_slot_scatter` (Triton or torch fallback) keyed on slot id.
+        # `_ddtree_slot_scatter` keyed on slot id.
         self.packed_mask = torch.zeros((S, n_dt, mask_width),
                                        dtype=torch.int32,
                                        device='cuda')
         # Stack the 4 same-shape [S, n_dt] int32 fields into one backing tensor
-        # so the torch fallback of `_ddtree_slot_scatter` can fuse 4 separate
-        # `index_copy_` calls into one (dim=1 scatter over the stacked tensor).
-        # Per-field views over rows 0..3 are exposed under the named attributes
-        # used by the Triton kernel arg list and other consumers.
+        # so `_ddtree_slot_scatter` can fuse 4 separate `index_copy_` calls into
+        # one (dim=1 scatter over the stacked tensor). Per-field views over
+        # rows 0..3 are exposed under the named attributes used by consumers.
         # Row order: [position_offsets, retrieve_index, retrieve_next_token, retrieve_next_sibling]
         self._slot_stack = torch.empty((4, S, n_dt),
                                        dtype=torch.int32,
