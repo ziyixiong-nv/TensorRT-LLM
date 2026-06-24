@@ -2540,7 +2540,10 @@ class PyExecutor:
 
             self.model_engine.runtime_draft_len = runtime_draft_len
         else:
-            self.model_engine.runtime_draft_len = self.model_engine.max_total_draft_tokens
+            # target_verify_draft_len = K for parallel-draft (PARD/DFlash),
+            # max_total_draft_tokens for tree modes.  Decouples target verify
+            # width from the wider draft-side storage layout.
+            self.model_engine.runtime_draft_len = self.model_engine.target_verify_draft_len
 
     def _can_queue(self, scheduled_batch):
 
@@ -3115,6 +3118,12 @@ class PyExecutor:
 
     def _prepare_draft_requests(self):
         try:
+            # Pre-allocate per-request py_draft_tokens at target verify width
+            # so it matches dummy-pad sizing.  For parallel-draft (PARD/DFlash)
+            # this is K (not the wider 2K-1 storage); for tree modes it's the
+            # full max_total_draft_tokens.
+            draft_alloc_len = self.model_engine.target_verify_draft_len
+
             # Set draft tokens here to make the KV cache manager
             # and scheduler aware of them.
             for req in self.active_requests:
@@ -3124,9 +3133,9 @@ class PyExecutor:
 
                 req.py_last_draft_tokens = req.py_draft_tokens
 
-                if self.max_total_draft_tokens > 0 and self.use_spec_decode and not req.py_disable_speculative_decoding:
-                    req.py_draft_tokens = [0] * self.max_total_draft_tokens
-                    req.py_draft_pages_allocated = self.max_total_draft_tokens
+                if draft_alloc_len > 0 and self.use_spec_decode and not req.py_disable_speculative_decoding:
+                    req.py_draft_tokens = [0] * draft_alloc_len
+                    req.py_draft_pages_allocated = draft_alloc_len
                 else:
                     req.py_draft_tokens = []
                     req.py_draft_pages_allocated = 0

@@ -124,6 +124,61 @@ class PARDWorker(SpecWorkerBase):
         else:
             attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
 
+    def _widen_spec_dec_for_pard_draft(self, attn_metadata, spec_metadata):
+        """
+        Switch attn_metadata.spec-dec params from K+1 (target verify width)
+        to 2K (PARD draft width) for the duration of the draft forward.
+
+        The target verify forward already ran with attn_metadata sized for
+        K+1 tokens per gen request (via update_spec_dec_param at the engine
+        level).  PARD's draft layout is [acc_0..acc_M, masks] = 2K tokens
+        per gen request, so the attention kernel must see generation_lengths
+        and position_offsets/packed_mask sized for 2K.
+
+        The TrtllmAttention linear-tree path swaps in @functools.cache'd
+        position_offsets/packed_mask tensors keyed on (max_num_requests,
+        draft_len) — these have process-lifetime stable addresses, so
+        re-pointing is safe across CUDA graph capture/replay (the captured
+        kernel reads from the 2K-wide tensor, which exists for the entire
+        process lifetime).
+
+        spec_decoding_generation_lengths is a single preallocated buffer;
+        we write the widened length into it.  The previous K+1 fill was
+        only used by the target verify (already complete by this point)
+        and the next iteration will refill it from the engine, so we don't
+        need to restore.
+        """
+        # Skip on non-trtllm backends or when spec-dec is not enabled on
+        # the metadata (e.g. cross-attention or non-linear-tree fallback).
+        if not getattr(attn_metadata, "is_spec_decoding_enabled", False):
+            return None
+
+        K = self.max_draft_len
+        draft_len_for_attn = 2 * K - 1  # generation_lengths = 2K
+        prev_runtime_draft_len = spec_metadata.runtime_draft_len
+        spec_metadata.runtime_draft_len = draft_len_for_attn
+
+        # update_spec_dec_param swaps the cached position_offsets / packed_mask
+        # tensors and fills spec_decoding_generation_lengths.  Pass the per-PARD
+        # widths; this hits the linear-tree branch (max_draft_len ==
+        # max_total_draft_tokens).
+        attn_metadata.update_spec_dec_param(
+            batch_size=attn_metadata.num_seqs,
+            is_spec_decoding_enabled=True,
+            is_spec_dec_tree=False,
+            is_spec_dec_dynamic_tree=False,
+            max_draft_len=draft_len_for_attn,
+            max_total_draft_tokens=draft_len_for_attn,
+            spec_metadata=spec_metadata,
+            num_contexts=attn_metadata.num_contexts,
+        )
+        return prev_runtime_draft_len
+
+    def _restore_spec_dec_after_pard_draft(self, spec_metadata, prev_runtime_draft_len):
+        """Restore spec_metadata.runtime_draft_len after the draft forward."""
+        if prev_runtime_draft_len is not None:
+            spec_metadata.runtime_draft_len = prev_runtime_draft_len
+
     def _prepare_kv_for_draft_forward(
         self,
         attn_metadata,
@@ -194,21 +249,16 @@ class PARDWorker(SpecWorkerBase):
 
         self._execute_guided_decoder_if_present(logits)
 
-        # draft_tokens buffer has (2K-1) entries per gen request; extract the K real drafts
+        # Target verify is sized for K+1 tokens per gen request (engine-level
+        # update_spec_dec_param uses max_draft_len = K).  draft_tokens arrives
+        # as a flat buffer with K entries per gen request.
         if num_gens > 0:
-            draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, 2 * K - 1)[:, :K]
+            draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, K)
         else:
             draft_tokens = spec_metadata.draft_tokens.reshape(0, K)
 
-        # logits have 2K entries per gen request; extract K+1 for acceptance
-        if num_gens > 0:
-            ctx_logits = logits[:num_contexts]
-            vocab_size = logits.shape[-1]
-            gen_logits_2k = logits[num_contexts:].reshape(num_gens, 2 * K, vocab_size)
-            gen_logits_kp1 = gen_logits_2k[:, : K + 1, :].reshape(-1, vocab_size)
-            logits_for_accept = torch.cat([ctx_logits, gen_logits_kp1], dim=0)
-        else:
-            logits_for_accept = logits
+        # logits have K+1 entries per gen request, ready for acceptance as-is.
+        logits_for_accept = logits
 
         accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
             logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
@@ -237,6 +287,19 @@ class PARDWorker(SpecWorkerBase):
         self._prepare_kv_for_draft_forward(
             attn_metadata, num_accepted_tokens, num_contexts, batch_size
         )
+        # Widen attention spec-dec params from K+1 (target verify width) to
+        # 2K (PARD draft width).  Must happen after _prepare_attn_metadata_for_pard
+        # so that the original _seq_lens are saved for restoration, and before
+        # prepare_1st_drafter_inputs which writes 2K into _seq_lens for gens.
+        # Pure-context batches don't go through the gen segment of the attention
+        # kernel and don't need (or want) the 2K-wide spec-dec params written
+        # into the shared preallocated linear-tree generation_lengths buffer.
+        if num_gens > 0:
+            saved_runtime_draft_len = self._widen_spec_dec_for_pard_draft(
+                attn_metadata, spec_metadata
+            )
+        else:
+            saved_runtime_draft_len = None
 
         position_ids = position_ids.squeeze(0)
         inputs = self.prepare_1st_drafter_inputs(
@@ -297,33 +360,29 @@ class PARDWorker(SpecWorkerBase):
                         gen_draft_tokens
                     )
 
-                # Pad from (num_gens, K) to (num_gens, 2K-1).
-                if K > 1:
-                    pad = torch.zeros((num_gens, K - 1), dtype=torch.int32, device="cuda")
-                    gen_draft_tokens = torch.cat([gen_draft_tokens, pad], dim=1)
-
         elif num_contexts > 0 and self.use_separate_draft_kv_cache:
             # Pure context batch: populate the draft KV cache so it's
             # ready when generation starts.
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
                 draft_model.model(**inputs)
-            gen_draft_tokens = torch.empty((0, 2 * K - 1), dtype=torch.int32, device="cuda")
+            gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
 
         else:
-            gen_draft_tokens = torch.empty((0, 2 * K - 1), dtype=torch.int32, device="cuda")
+            gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
 
+        # next_draft_tokens carries K real drafts per request (no mask padding);
+        # the engine's runtime_draft_len = K so this matches the per-request
+        # draft slot sizing in draft_tokens_cuda.  PARD's 2K-wide layout is an
+        # internal detail of the draft forward.
         if num_contexts > 0 and num_gens > 0:
-            ctx_draft_tokens = torch.zeros(
-                (num_contexts, 2 * K - 1), dtype=torch.int32, device="cuda"
-            )
+            ctx_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
             next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
         elif num_contexts > 0:
-            next_draft_tokens = torch.zeros(
-                (num_contexts, 2 * K - 1), dtype=torch.int32, device="cuda"
-            )
+            next_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
         else:
             next_draft_tokens = gen_draft_tokens
 
+        self._restore_spec_dec_after_pard_draft(spec_metadata, saved_runtime_draft_len)
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
 
         # Deferred kv_lens rewind (must happen after restore so it persists).
@@ -442,6 +501,10 @@ class PARDWorker(SpecWorkerBase):
                 total_tokens_per_req
             )
             attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = total_tokens_per_req
+            # The in-place writes bypass on_update(), so _num_tokens still
+            # reflects the K+1 target verify width.  Recompute it here so the
+            # draft model sees the widened 2K-per-gen layout.
+            attn_metadata.on_update()
 
             # Position IDs: base = kv_lens - 2K = past_seen (correct for acc_0).
             # With TrtllmAttention (rope_fusion=True) these are ignored in

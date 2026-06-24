@@ -518,16 +518,19 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
-            # Parallel-draft modes (PARD, DFlash) size their per-request draft
-            # buffer by tokens_per_gen_step - 1 so the engine reserves exactly
-            # one slot per draft token the target will verify.  PARD still uses
-            # 2K tokens per gen req (K drafts + K mask fillers); DFlash was
-            # reduced to K+1 (K drafts + 1 bonus) - the spec config's
-            # tokens_per_gen_step carries the per-algorithm width.
-            if spec_config.spec_dec_mode.is_parallel_draft():
-                self.max_draft_len = self.max_total_draft_tokens
-            else:
-                self.max_draft_len = spec_config.max_draft_len
+            # Parallel-draft modes split width into two distinct concepts:
+            #   - max_total_draft_tokens (2K-1 for PARD, K for DFlash) sizes
+            #     the per-request draft slot in `next_draft_tokens` storage and
+            #     the sampler buffer.  PARD's draft layout is `[acc_0..acc_M,
+            #     masks]` totaling 2K tokens, so it needs 2K-1 stored draft
+            #     entries per request beyond the bonus.
+            #   - max_draft_len (K for both PARD and DFlash) is the per-request
+            #     target verify width minus 1.  Target verify only needs K+1
+            #     tokens per request (K drafts + 1 bonus); the K-1 PARD mask
+            #     fillers do not flow through the target.
+            # The PARD worker temporarily widens attn_metadata to 2K inside its
+            # own draft forward, then restores K+1 width for downstream code.
+            self.max_draft_len = spec_config.max_draft_len
             # Mutable per-iteration draft length (updated each iteration when
             # dynamic draft length is enabled; otherwise stays fixed).
             self.runtime_draft_len = self.max_draft_len
@@ -802,6 +805,17 @@ class PyTorchModelEngine(ModelEngine):
     @property
     def use_beam_search(self):
         return self.max_beam_width > 1
+
+    @property
+    def target_verify_draft_len(self):
+        """Per-request target verify width minus 1 (= K for parallel-draft,
+        = max_total_draft_tokens for tree modes).  Decouples target-verify
+        width from the wider draft-side storage layout for parallel-draft
+        modes (PARD's 2K-1 storage vs K verify width)."""
+        if (self.spec_config is not None
+                and self.spec_config.spec_dec_mode.is_parallel_draft()):
+            return self.max_draft_len
+        return self.max_total_draft_tokens
 
     def _get_draft_kv_cache_manager(
         self, resource_manager: ResourceManager
@@ -1285,8 +1299,10 @@ class PyTorchModelEngine(ModelEngine):
                         f"Capturing {len(graphs)} graphs: {graphs}")
             return graphs
 
-        # Case 3: Target model (two-model) or one-model without dynamic draft
-        draft_lengths = [self.max_total_draft_tokens]
+        # Case 3: Target model (two-model) or one-model without dynamic draft.
+        # Use target_verify_draft_len: for parallel-draft modes (PARD/DFlash)
+        # the verify width is K+1 (draft_len = max_draft_len), not 2K.
+        draft_lengths = [self.target_verify_draft_len]
         should_capture_no_spec = (
             self.max_total_draft_tokens > 0
             and not self.spec_config.spec_dec_mode.use_one_engine()
@@ -1587,7 +1603,13 @@ class PyTorchModelEngine(ModelEngine):
                 list(range(num_ctx_requests)),
                 token_nums=ctx_token_nums,
                 is_gen=False,
-                max_num_draft_tokens=self.max_total_draft_tokens,
+                # Use target_verify_draft_len: for parallel-draft (PARD/DFlash)
+                # this is K (per-request target verify width - 1, NOT the wider
+                # 2K-1 storage); for tree modes it is max_total_draft_tokens
+                # (which is what runtime_draft_len becomes after the first
+                # _prepare_tp_inputs call, but at warmup time that hasn't run
+                # yet, so we go through the property explicitly).
+                max_num_draft_tokens=self.target_verify_draft_len,
                 kv_reserve_draft_tokens=self.max_draft_loop_tokens,
                 use_mrope=self.use_mrope,
                 num_extra_decoding_steps=num_extra_decoding_steps,
@@ -1607,7 +1629,8 @@ class PyTorchModelEngine(ModelEngine):
                           num_ctx_requests + num_gen_requests)),
                 token_nums=[1] * num_gen_requests,
                 is_gen=True,
-                max_num_draft_tokens=self.max_total_draft_tokens,
+                # See ctx_requests comment above: target verify width, not storage.
+                max_num_draft_tokens=self.target_verify_draft_len,
                 kv_reserve_draft_tokens=self.max_draft_loop_tokens,
                 use_mrope=self.use_mrope,
                 max_beam_width=self.max_beam_width,
@@ -2801,7 +2824,11 @@ class PyTorchModelEngine(ModelEngine):
         # Prepare spec_metadata
         num_generation_tokens = num_extend_requests * num_tokens_per_extend_request
         if spec_metadata is not None:
-            total_draft_lens = self.max_total_draft_tokens * num_extend_requests
+            # Use runtime_draft_len rather than max_total_draft_tokens to size
+            # the slice: PARD's storage is wider (2K-1) than its target verify
+            # width (K), and only runtime_draft_len entries per request are
+            # copied from next_draft_tokens_device above.
+            total_draft_lens = self.runtime_draft_len * num_extend_requests
             spec_metadata.draft_tokens = self.draft_tokens_cuda[:
                                                                 total_draft_lens]
             spec_metadata.gather_ids = self.gather_ids_cuda[:total_num_tokens]
@@ -3137,9 +3164,12 @@ class PyTorchModelEngine(ModelEngine):
             ), f"{spec_config.decoding_type} does not support overlap scheduler"
 
         # For tree decoding, runtime_draft_len should match total tree
-        # tokens (not tree depth).  py_executor resets it every iteration.
+        # tokens (not tree depth).  For parallel-draft, target_verify_draft_len
+        # returns K (already current value); for non-linear tree modes the
+        # property returns max_total_draft_tokens.  py_executor resets every
+        # iteration; this re-pin keeps the value coherent inside _prepare_inputs.
         if spec_config is not None and not spec_config.is_linear_tree:
-            self.runtime_draft_len = self.max_total_draft_tokens
+            self.runtime_draft_len = self.target_verify_draft_len
 
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
@@ -4877,13 +4907,16 @@ class PyTorchModelEngine(ModelEngine):
             # to spec_metadata so downstream code (eagle3, interface, trtllm) can read it.
             spec_metadata.runtime_draft_len = self.runtime_draft_len
 
-            # Parallel-draft modes advertise a per-gen-step width via
-            # tokens_per_gen_step (PARD: 2K, DFlash: K+1).  Pass
-            # (tokens_per_gen_step - 1) so generation_lengths = tokens_per_gen_step
-            # and the XQA kernel computes the correct past_kv_len.
+            # Parallel-draft modes (PARD, DFlash) verify K+1 tokens per gen
+            # request through the target.  Pass max_draft_len (= K) so the
+            # linear-tree assertion holds (max_draft_len == max_total_draft_tokens)
+            # and generation_lengths = K+1.  PARD's draft layout is 2K wide,
+            # but its worker swaps in 2K-wide spec-dec params locally inside
+            # its own draft forward; the engine-level call here only sizes
+            # the target verify.
             if spec_metadata.spec_dec_mode.is_parallel_draft():
-                sd_max_draft_len = self.original_max_total_draft_tokens
-                sd_max_total = self.original_max_total_draft_tokens
+                sd_max_draft_len = self.original_max_draft_len
+                sd_max_total = self.original_max_draft_len
             else:
                 sd_max_draft_len = self.original_max_draft_len
                 sd_max_total = self._spec_dec_max_total_draft_tokens

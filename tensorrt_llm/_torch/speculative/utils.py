@@ -294,8 +294,15 @@ def get_spec_decoder(
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSampler(sampler_args, spec_config=spec_config)
     if spec_config.spec_dec_mode.is_parallel_draft():
-        return MTPSampler(sampler_args,
-                          nextn=spec_config.tokens_per_gen_step - 1)
+        # Use max_draft_len (= K) for the sampler's runtime draft length, not
+        # tokens_per_gen_step - 1 (= 2K-1 for PARD).  Target verify width is
+        # K+1 (controlled by model_engine.runtime_draft_len = K); the wider
+        # 2K-1 storage is a draft-side internal detail and only sizes the
+        # next_draft_tokens buffer (via args.max_total_draft_tokens).  Keeping
+        # sampler.draft_len = K aligns the dummy py_draft_tokens padding
+        # written for finished context requests with cuda_graph_runner's
+        # per-request length expectation.
+        return MTPSampler(sampler_args, nextn=spec_config.max_draft_len)
     if spec_config.spec_dec_mode.is_sa():
         return SASampler(sampler_args, max_draft_len=spec_config.max_draft_len)
     if spec_config.spec_dec_mode.is_draft_target_one_model():
