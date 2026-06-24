@@ -61,7 +61,7 @@ def _make_llm_config(
 
 def _run_and_check(llm_config: dict, min_avg_accepted: float):
     llm = LLM(**llm_config)
-    outputs = llm.generate(PROMPTS, SamplingParams(max_tokens=256, temperature=0))
+    outputs = llm.generate(PROMPTS, SamplingParams(max_tokens=512, temperature=0))
     llm.shutdown()
 
     avg_accepted = [o.avg_decoded_tokens_per_iter - 1 for o in outputs]

@@ -91,9 +91,25 @@ class PARDWorker(SpecWorkerBase):
         self.sa_enhancer: Optional[SADraftEnhancer] = None
         if getattr(spec_config, "sa_config", None) is not None:
             self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
+        # Per-dtype arange cache for hot-path gather/scatter index math.
+        # Captures are sorted largest-first and warmups precede the capture
+        # region, so lazy growth lands before any graph is captured.
+        self._arange_cache: dict[torch.dtype, torch.Tensor] = {}
         logger.info(
             f"PARDWorker initialized with use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
         )
+
+    def _arange(self, length: int, dtype: torch.dtype) -> torch.Tensor:
+        """Return a cached cuda arange(length, dtype=dtype).
+
+        Grows the cached tensor monotonically for each dtype and returns a
+        leading slice.  All callers must treat the result as read-only.
+        """
+        cached = self._arange_cache.get(dtype)
+        if cached is None or cached.numel() < length:
+            cached = torch.arange(length, dtype=dtype, device="cuda")
+            self._arange_cache[dtype] = cached
+        return cached[:length]
 
     @property
     def max_draft_len(self) -> int:
@@ -264,12 +280,10 @@ class PARDWorker(SpecWorkerBase):
             logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
         )
 
-        # Pad accepted_tokens from (batch, K+1) to (batch, 2K) to match sampler buffer
+        # Pad accepted_tokens from (batch, K+1) to (batch, 2K) to match the
+        # sampler's (max_total_draft_tokens + 1 = 2K) buffer width.
         if K > 1:
-            acc_padding = torch.zeros(
-                (batch_size, K - 1), dtype=accepted_tokens.dtype, device=accepted_tokens.device
-            )
-            accepted_tokens = torch.cat([accepted_tokens, acc_padding], dim=1)
+            accepted_tokens = torch.nn.functional.pad(accepted_tokens, (0, K - 1))
 
         sa_manager = spec_metadata._get_sa_manager() if self.sa_enhancer else None
         if self.sa_enhancer is not None and sa_manager is not None:
@@ -325,14 +339,13 @@ class PARDWorker(SpecWorkerBase):
                 gen_start_idx = attn_metadata.num_ctx_tokens
 
                 request_bases = (
-                    torch.arange(num_gens, dtype=torch.long, device="cuda")
-                    * self._draft_tokens_per_req
+                    self._arange(num_gens, dtype=torch.long) * self._draft_tokens_per_req
                     + gen_start_idx
                 )
 
                 gen_num_accepted = num_accepted_tokens[num_contexts:batch_size].long()
                 base_offsets = gen_num_accepted - 1  # M = bonus position
-                offsets = torch.arange(self.max_draft_len, dtype=torch.long, device="cuda")
+                offsets = self._arange(self.max_draft_len, dtype=torch.long)
 
                 gen_gather_ids = (
                     request_bases.unsqueeze(1) + base_offsets.unsqueeze(1) + offsets.unsqueeze(0)
@@ -485,8 +498,8 @@ class PARDWorker(SpecWorkerBase):
             # The remaining slots stay as mask tokens. This ensures:
             # 1) Accepted tokens provide in-sequence context via attention
             # 2) K unique mask predictions from positions M..M+K-1
-            max_acc_cols = gen_accepted_tokens.shape[1]  # K+1
-            col_range = torch.arange(max_acc_cols, dtype=torch.int32, device="cuda")
+            max_acc_cols = gen_accepted_tokens.shape[1]  # 2K after the F.pad above (K+1 if K==1)
+            col_range = self._arange(max_acc_cols, dtype=torch.int32)
             place_mask = col_range.unsqueeze(0) < gen_num_accepted.unsqueeze(1)
             request_ids_2d[:, :max_acc_cols] = torch.where(
                 place_mask,
@@ -496,15 +509,16 @@ class PARDWorker(SpecWorkerBase):
 
             input_ids_gen = request_ids_2d.flatten()
 
-            # Update seq_lens for gen requests to 2K
+            # Widen seq_lens for gen requests to 2K and recompute the host
+            # counters directly to avoid on_update()'s two `.item()` syncs.
             attn_metadata._seq_lens_cuda[num_contexts : num_contexts + num_gens] = (
                 total_tokens_per_req
             )
             attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = total_tokens_per_req
-            # The in-place writes bypass on_update(), so _num_tokens still
-            # reflects the K+1 target verify width.  Recompute it here so the
-            # draft model sees the widened 2K-per-gen layout.
-            attn_metadata.on_update()
+            attn_metadata._num_generations = num_gens
+            attn_metadata._num_tokens = (
+                attn_metadata._num_ctx_tokens + num_gens * total_tokens_per_req
+            )
 
             # Position IDs: base = kv_lens - 2K = past_seen (correct for acc_0).
             # With TrtllmAttention (rope_fusion=True) these are ignored in
@@ -519,7 +533,7 @@ class PARDWorker(SpecWorkerBase):
                     attn_metadata.num_ctx_tokens :: self._draft_tokens_per_req
                 ][:num_gens]
 
-            offsets = torch.arange(total_tokens_per_req, dtype=torch.int32, device="cuda")
+            offsets = self._arange(total_tokens_per_req, dtype=torch.int32)
             position_ids_gen = (gen_pos_starts.unsqueeze(1) + offsets.unsqueeze(0)).flatten()
         else:
             input_ids_gen = torch.empty(0, dtype=torch.int32, device="cuda")
