@@ -82,6 +82,91 @@ environment:
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"  # Environment variables for server
 ```
 
+#### Prepending to `PATH` / `PYTHONPATH` inside the container
+
+Container runtimes (pyxis/enroot) reset image-defined variables such as `PATH`
+and `PYTHONPATH` when the container starts, so a value exported *around* `srun`
+does not survive into the worker. Two variables in `worker_env_var` are applied
+by `start_worker.sh` and `start_worker_dwdp.sh` from *inside* the container:
+
+| Variable | Effect |
+|----------|--------|
+| `TRTLLM_PATH_PREPEND` | Prepended to `PATH` |
+| `TRTLLM_PYTHONPATH_PREPEND` | Prepended to `PYTHONPATH` |
+
+The motivating case is a Python package installed twice in one image, where the
+wrong copy wins. `PYTHONPATH` entries precede directories added by `.pth` files
+in `sys.path`, so prepending the directory of the copy you want overrides a
+`.pth`-activated one without rebuilding the image. A concrete instance: an image
+carrying both the internal nightly CuTe DSL frontend (under
+`nvidia_cutlass_dsl/dsl_packages/`) and the public PyPI one (under
+`nvidia_cutlass_dsl/python_packages/`, activated by its own `.pth`) will run the
+public tree, and if that tree predates the GPU architecture in use, every CuTe
+DSL kernel fails to compile with `invalid chip string`. Setting
+
+```yaml
+worker_env_var: "... TRTLLM_PYTHONPATH_PREPEND=/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/dsl_packages"
+```
+
+restores the nightly frontend.
+
+That is usually only half the fix. The same wheel installs its own
+`nvidia_cutlass_dsl/lib/libcute_dsl_runtime.so`, and the frontend resolves the
+runtime by walking its ancestor directories trying `lib` **before**
+`cu<CTK major>/lib` — so once the nightly frontend is back it loads the *public*
+runtime, which may not export the symbols the nightly kernels need (observed:
+`JIT session error: Symbols not found: [ CuteDSLRT_TVMFFISetRaisedCudaError ]`
+from any `cute.compile(..., "--enable-tvm-ffi")` call). Pin the matching runtime
+explicitly alongside the prepend:
+
+```yaml
+worker_env_var: "... CUTE_DSL_LIBS=/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/cu13/lib/libcute_dsl_runtime.so"
+```
+
+`CUTE_DSL_LIBS` is an ordinary variable — it needs no special handling in the
+worker scripts, and the frontend honors it ahead of any discovery. Two details
+matter: the value is the **full path to the `.so`**, not a directory, and the
+`cuNN` must match the image's CUDA major (check `libcudart.so.NN`) — a mismatched
+runtime compiles fine and then fails at launch with `cudaErrorInvalidValue`.
+
+Both variables are workarounds for a packaging problem in the image, not tuning
+knobs — fix the image when you can.
+
+As with the UCX variables below, `start_worker_dwdp.sh` applies these *after* the
+`worker_env_var` export loop, because on the DWDP path the request arrives inside
+the `ctx_worker_env_var` / `gen_worker_env_var` positional argument rather than
+via `srun --export`. Both scripts log `PATH prepended from ...` /
+`PYTHONPATH prepended from ...` when a prepend takes effect, so grep the worker
+log to confirm it ran — a value present in an environment dump is not proof that
+the export happened.
+
+#### Pinning the UCX transport for KV transfer
+
+Both `start_worker.sh` and `start_worker_dwdp.sh` clear the container-provided
+`UCX_TLS` by default, which lets UCX auto-select the transport used for the
+CTX->GEN KV transfer. Two variables in `worker_env_var` override that:
+
+| Variable | Effect |
+|----------|--------|
+| `TRTLLM_WORKER_UCX_TLS` | Re-exported as `UCX_TLS` after the clear |
+| `TRTLLM_WORKER_UCX_NET_DEVICES` | Re-exported as `UCX_NET_DEVICES` |
+
+Reach for these when the KV transfer does not connect, not when you want it
+faster. Auto-selection can pick an interface with no route to the peer; on GB300
+nodes, for example, the transfer only connects when `UCX_TLS` **and**
+`TRTLLM_WORKER_UCX_NET_DEVICES=eth0` are both pinned. Pinning `UCX_TLS` was
+measured on a prefill-heavy NVL72-class disaggregated run and left throughput
+unchanged, so treat it as a connectivity fix rather than a tuning parameter.
+
+Note that `start_worker_dwdp.sh` applies both variables *after* the
+`worker_env_var` export loop. That ordering is required: the request arrives as
+`TRTLLM_WORKER_UCX_TLS` inside `ctx_worker_env_var` / `gen_worker_env_var`, so
+clearing `UCX_TLS` before the loop would export the request and never act on it.
+
+The workers log which branch they took (`UCX_TLS pinned from ...` or
+`UCX_TLS cleared ...`), so grep the worker log to confirm the pin took effect —
+a value present in an environment dump is not proof that the export ran.
+
 ### 5. Worker Configuration
 The worker configuration section defines detailed settings for both context and generation workers:
 

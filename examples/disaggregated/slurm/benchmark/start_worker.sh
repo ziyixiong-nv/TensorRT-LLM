@@ -48,9 +48,11 @@ TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND:-}"
 TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND#\'}"; TRTLLM_PYTHONPATH_PREPEND="${TRTLLM_PYTHONPATH_PREPEND%\'}"
 if [ -n "${TRTLLM_PATH_PREPEND:-}" ]; then
     export PATH="${TRTLLM_PATH_PREPEND}:${PATH}"
+    echo "PATH prepended from TRTLLM_PATH_PREPEND: ${TRTLLM_PATH_PREPEND}"
 fi
 if [ -n "${TRTLLM_PYTHONPATH_PREPEND:-}" ]; then
     export PYTHONPATH="${TRTLLM_PYTHONPATH_PREPEND}${PYTHONPATH:+:${PYTHONPATH}}"
+    echo "PYTHONPATH prepended from TRTLLM_PYTHONPATH_PREPEND: ${TRTLLM_PYTHONPATH_PREPEND}"
 fi
 
 # Clear UCX_TLS for specific clusters. Some clusters instead need an
@@ -59,8 +61,17 @@ fi
 # UCX_TLS here, after the container-provided value is cleared.
 if [ -n "${TRTLLM_WORKER_UCX_TLS:-}" ]; then
     export UCX_TLS="${TRTLLM_WORKER_UCX_TLS}"
+    echo "UCX_TLS pinned from TRTLLM_WORKER_UCX_TLS: ${UCX_TLS}"
 else
     unset UCX_TLS
+    echo "UCX_TLS cleared (no TRTLLM_WORKER_UCX_TLS in worker_env_var)"
+fi
+# Some clusters also need the device list pinned (e.g. nodes where UCX would
+# otherwise pick an interface with no route to the peer).  Only override when
+# asked; otherwise leave the container-provided value alone.
+if [ -n "${TRTLLM_WORKER_UCX_NET_DEVICES:-}" ]; then
+    export UCX_NET_DEVICES="${TRTLLM_WORKER_UCX_NET_DEVICES}"
+    echo "UCX_NET_DEVICES pinned from TRTLLM_WORKER_UCX_NET_DEVICES: ${UCX_NET_DEVICES}"
 fi
 
 echo "SLURM_PROCID: ${SLURM_PROCID}, hostname: $(hostname), instance_id: ${instance_id}"
