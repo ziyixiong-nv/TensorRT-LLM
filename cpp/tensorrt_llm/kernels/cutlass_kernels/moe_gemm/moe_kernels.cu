@@ -1097,6 +1097,108 @@ __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id, int
     }
 }
 
+//! \brief Zero the N-dimension SF alignment padding for every expert, one warp per SF atom tile.
+//!
+//! Each expert's activation SF block is padded up to MinNDimAlignment (== one SfAtom, 128
+//! rows) so the next expert starts on an atom boundary. The padded rows have to be zero,
+//! otherwise the GEMM reads an uninitialised scale out of a partially populated atom.
+//! Writing them through writeSF() issues one STG.8 per (padded row, SF column) scattered
+//! through the [32, 4, 4] atom swizzle, so consecutive lanes land 16B apart within a row
+//! and 512B apart across rows, and the stores run at a few percent of HBM peak. With
+//! fine-grained experts the padding dominates: at 112 local experts and ~18 rows each the
+//! padded rows outnumber the real ones roughly 6:1, and unlike the real rows the cost does
+//! not shrink with the batch size.
+//!
+//! So walk the *destination* instead of applying the swizzle to logical coordinates. The
+//! atom's [32 (outer M), 4 (inner M), 4 (inner K)] layout puts atom row `m` at byte offset
+//! `16 * (m % 32) + 4 * (m / 32)` inside a 512B k-tile slab, which inverts to: the 16
+//! contiguous bytes at offset `16 * q` hold atom rows `{q, q + 32, q + 64, q + 96}`.
+//! Padding is always a row *suffix* `[atom_row_begin, 128)` -- alignToSfDim rounds up, so
+//! it can only occupy the tail of the expert's last atom -- hence each lane's padded bytes
+//! are a contiguous *byte* suffix of its own 16B, starting at sub-slot
+//! `ceil((atom_row_begin - q) / 32)`. One warp therefore covers a whole atom tile with 32
+//! stores of up to 16B each, fully coalesced, instead of 128 scattered 4B stores. Exactly
+//! the same bytes receive exactly the same zeros.
+template <int VecSize, int MinNDimAlignment>
+__device__ inline void zeroPaddedSfRows(int64_t const* expert_first_token_offset, int num_experts_per_node,
+    int64_t padded_num_cols, TmaWarpSpecializedGroupedGemmInput::ElementSF* act_sf_flat,
+    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType scaling_type, int64_t flat_tid, int64_t flat_num_threads)
+{
+    static_assert(MinNDimAlignment == 128, "The [32, 4, 4] SfAtom geometry is hard-coded below.");
+    int const num_col_vecs = static_cast<int>(padded_num_cols / VecSize);
+    int const num_k_tiles = (num_col_vecs + 3) / 4;
+    int const total_tiles = num_experts_per_node * num_k_tiles;
+
+    // flat_tid must be lane-contiguous within a warp and flat_num_threads a multiple of 32,
+    // which holds for every launch shape used here (blockDim.x == 1 for the activation
+    // kernels, so their linear thread index is threadIdx.y).
+    int const lane = static_cast<int>(flat_tid) & 31;
+    int64_t const warp = flat_tid >> 5;
+    int64_t const num_warps = flat_num_threads >> 5;
+
+    for (int64_t t = warp; t < total_tiles; t += num_warps)
+    {
+        int const tile = static_cast<int>(t);
+        int const expert = tile / num_k_tiles;
+        int const k_tile = tile - expert * num_k_tiles;
+
+        int64_t const first_token = expert_first_token_offset[expert];
+        int64_t const tokens_to_expert = expert_first_token_offset[expert + 1] - first_token;
+        int const atom_row_begin = static_cast<int>(tokens_to_expert & (MinNDimAlignment - 1));
+        if (atom_row_begin == 0)
+        {
+            // Already atom-aligned (this includes experts with no rows at all): no padding.
+            continue;
+        }
+
+        // Lane `lane` owns atom rows {lane, lane + 32, lane + 64, lane + 96}; keep the suffix
+        // of those that fall at or past atom_row_begin.
+        int const deficit = atom_row_begin - lane;
+        int const first_padded_sub_slot = deficit <= 0 ? 0 : ((deficit + 31) >> 5);
+        if (first_padded_sub_slot > 3)
+        {
+            continue;
+        }
+
+        int64_t const atom_base_row = tokens_to_expert - atom_row_begin; // multiple of MinNDimAlignment
+        auto* act_sf_expert = act_sf_flat + getOffsetActivationSF(expert, first_token, padded_num_cols, scaling_type);
+        auto* tile_ptr = reinterpret_cast<uint8_t*>(act_sf_expert)
+            + (atom_base_row / MinNDimAlignment) * static_cast<int64_t>(num_k_tiles) * 512
+            + static_cast<int64_t>(k_tile) * 512;
+
+        int const valid_col_vecs = num_col_vecs - k_tile * 4;
+        if (valid_col_vecs >= 4)
+        {
+            // getOffsetActivationSF() aligns the SF K extent to MinKDimAlignment ==
+            // BlockScaleVectorSize * 4, so both act_sf_expert and tile_ptr are 16B aligned.
+            uint8_t* dst = tile_ptr + 16 * lane + 4 * first_padded_sub_slot;
+            switch (first_padded_sub_slot)
+            {
+            case 0: *reinterpret_cast<uint4*>(dst) = uint4{0u, 0u, 0u, 0u}; break;
+            case 1:
+                *reinterpret_cast<uint32_t*>(dst) = 0u;
+                *reinterpret_cast<uint2*>(dst + 4) = uint2{0u, 0u};
+                break;
+            case 2: *reinterpret_cast<uint2*>(dst) = uint2{0u, 0u}; break;
+            default: *reinterpret_cast<uint32_t*>(dst) = 0u; break;
+            }
+        }
+        else
+        {
+            // Unreachable for the shapes above, kept so the helper stays correct if the SF K
+            // alignment ever drops below one full k-tile.
+            for (int sub_slot = first_padded_sub_slot; sub_slot < 4; ++sub_slot)
+            {
+                uint8_t* dst = tile_ptr + 16 * lane + 4 * sub_slot;
+                for (int i = 0; i < valid_col_vecs; ++i)
+                {
+                    dst[i] = 0;
+                }
+            }
+        }
+    }
+}
+
 // ====================== Compute FP8 dequant scale only ===============================
 __global__ void computeFP8DequantScaleKernel(
     float const** alpha_scale_ptr_array, int64_t const num_experts_per_node, float const* fp8_dequant)
@@ -1557,43 +1659,23 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
 #endif
 
     // Pad zeros in the extra SFs along the N dimension, we do this to ensure there are no nan values in the padded SF
-    // atom
+    // atom. See zeroPaddedSfRows(): one warp per SF atom tile writing coalesced 16B suffixes, instead of one
+    // scattered STG.8 per (padded row, SF column).
     if constexpr (is_nvfp4 || is_mxfp8)
     {
-        int64_t const start_offset = threadIdx.x;
-        int64_t const stride = EXPAND_THREADS_PER_BLOCK;
-        // Use VecSize per thread since we are just writing out zeros so every thread can process a whole vector
-        int64_t const padded_num_elems_in_col = padded_hidden_size / VecSize;
         assert(padded_hidden_size % VecSize == 0);
 
         constexpr int min_num_tokens_alignment = is_nvfp4 ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
                                                           : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX;
         static_assert((min_num_tokens_alignment & (min_num_tokens_alignment - 1)) == 0,
             "Min num tokens alignment must be a power of two");
-        // Since we don't know a priori how much padding is needed we assume the max per expert
-        // NOTE: we don't use (min_num_tokens_alignment-1) to be able to do power of two divisions
-        int64_t num_padding_tokens = min_num_tokens_alignment * num_experts_per_node;
+        constexpr auto scaling_type = is_nvfp4 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+                                               : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
 
-        for (int64_t padding_token = blockIdx.x; padding_token < num_padding_tokens; padding_token += gridDim.x)
-        {
-            int64_t expert = padding_token / min_num_tokens_alignment;
-            int64_t num_tokens_before_expert = expert_first_token_offset[expert];
-            int64_t num_tokens_after_expert = expert_first_token_offset[expert + 1];
-            int64_t tokens_to_expert = num_tokens_after_expert - num_tokens_before_expert;
-            int64_t padding_to_expert
-                = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(tokens_to_expert, min_num_tokens_alignment)
-                - tokens_to_expert;
-            int64_t expert_pad_idx = padding_token % min_num_tokens_alignment;
-            if (expert_pad_idx < padding_to_expert)
-            {
-                for (int64_t elem_index = start_offset; elem_index < padded_num_elems_in_col; elem_index += stride)
-                {
-                    writeSF<VecSize, VecSize>(num_tokens_before_expert, expert, /*source_row*/ -1,
-                        num_tokens_after_expert + expert_pad_idx, elem_index, padded_hidden_size, fc1_act_sf_flat,
-                        /* input_sf */ nullptr); // Pass nulltpr input_sf so we write 0
-                }
-            }
-        }
+        zeroPaddedSfRows<VecSize, min_num_tokens_alignment>(expert_first_token_offset, num_experts_per_node,
+            padded_hidden_size, fc1_act_sf_flat, scaling_type,
+            static_cast<int64_t>(blockIdx.x) * EXPAND_THREADS_PER_BLOCK + threadIdx.x,
+            static_cast<int64_t>(gridDim.x) * EXPAND_THREADS_PER_BLOCK);
     }
 }
 
@@ -2548,68 +2630,24 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
 #endif
 
     // Pad zeros in the extra SFs along the N dimension, we do this to ensure there are no nan values in the padded
-    // SF atom. Skip when DynamicFc2 since we output bf16, not FP4.
+    // SF atom. Skip when DynamicFc2 since we output bf16, not FP4. See zeroPaddedSfRows(): one warp per SF atom
+    // tile writing coalesced 16B suffixes, instead of one scattered STG.8 per (padded row, SF column).
     if constexpr (!DynamicFc2 && (IsNVFP4 || IsMXFP8))
     {
-        constexpr int64_t min_num_tokens_alignment = IsNVFP4
-            ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
-            : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX;
-        int64_t const num_padding_tokens = (IsNVFP4 || IsMXFP8) ? min_num_tokens_alignment * num_experts_per_node : 0;
-
+        constexpr int min_num_tokens_alignment = IsNVFP4 ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
+                                                         : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX;
         static_assert((min_num_tokens_alignment & (min_num_tokens_alignment - 1)) == 0,
             "Min num tokens alignment must be a power of two");
+        constexpr auto scaling_type = IsNVFP4 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+                                              : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
 
-        int64_t const padded_num_elems_in_col = padded_inter_size / VecSize;
-
-        // Early exit if this thread is out of bounds for SF columns
-        if (col_offset >= padded_num_elems_in_col)
-            return;
-
-        // Grid stride loop for N-dimension SF padding
-        for (int64_t row_offset = blockIdx.x * rows_per_cta; row_offset < num_padding_tokens; row_offset += grid_stride)
-        {
-            int64_t num_tokens_before_expert[kProcessRows];
-            int64_t num_tokens_after_expert[kProcessRows];
-
-#pragma unroll
-            for (int i = 0; i < kProcessRows; ++i)
-            {
-                int64_t padding_token = row_offset + i;
-                padding_token = std::min(padding_token, num_padding_tokens);
-                int64_t expert = padding_token / min_num_tokens_alignment;
-                num_tokens_before_expert[i] = expert_first_token_offset[expert];
-                num_tokens_after_expert[i] = expert_first_token_offset[expert + 1];
-            }
-#pragma unroll
-            for (int i = 0; i < kProcessRows; ++i)
-            {
-                int64_t const padding_token = row_offset + i;
-
-                if (padding_token >= num_padding_tokens)
-                    break;
-
-                int64_t expert = padding_token / min_num_tokens_alignment;
-                int64_t tokens_to_expert = num_tokens_after_expert[i] - num_tokens_before_expert[i];
-
-                // Skip inactive experts: 0 tokens means 0 padding needed
-                if (tokens_to_expert == 0)
-                    continue;
-
-                int64_t padding_to_expert
-                    = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(tokens_to_expert, min_num_tokens_alignment)
-                    - tokens_to_expert;
-                int64_t expert_pad_idx = padding_token % min_num_tokens_alignment;
-                if (expert_pad_idx < padding_to_expert)
-                {
-                    // The SF buffer is padded to a multiple of MinNDimAlignment for each expert
-                    // This means we can safely write to offset num_tokens_after_expert + padded_token, since the
-                    // next expert will leave space for the padding
-                    writeSF<VecSize, VecSize>(num_tokens_before_expert[i], expert, /*source_row*/ -1,
-                        num_tokens_after_expert[i] + expert_pad_idx, col_offset, padded_inter_size, fc2_act_sf_flat,
-                        /* input_sf */ nullptr); // Pass nullptr input_sf so we write 0
-                }
-            }
-        } // end of grid stride loop for SF padding
+        // blockDim is (1, ACTIVATION_THREADS_PER_BLOCK, 1), so the linear thread index is threadIdx.y and
+        // consecutive lanes of a warp get consecutive 16B chunks of one SF atom tile.
+        int64_t const flat_tid
+            = (static_cast<int64_t>(blockIdx.y) * gridDim.x + blockIdx.x) * ACTIVATION_THREADS_PER_BLOCK + threadIdx.y;
+        int64_t const flat_num_threads = static_cast<int64_t>(gridDim.x) * gridDim.y * ACTIVATION_THREADS_PER_BLOCK;
+        zeroPaddedSfRows<VecSize, min_num_tokens_alignment>(expert_first_token_offset, num_experts_per_node,
+            padded_inter_size, fc2_act_sf_flat, scaling_type, flat_tid, flat_num_threads);
     }
 }
 
@@ -2710,34 +2748,17 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void dynamicFP4Quanti
         }
     }
 
-    // N-dimension SF padding
-    constexpr int64_t min_num_tokens_alignment = TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4;
-    int64_t const num_padding_tokens = min_num_tokens_alignment * num_experts_per_node;
-    int64_t const padded_num_elems_in_col = padded_inter_size / VecSize;
-    if (col_offset >= padded_num_elems_in_col)
-        return;
-
-    for (int64_t row_offset = blockIdx.x * rows_per_cta; row_offset < num_padding_tokens; row_offset += grid_stride)
-    {
-        int64_t const padding_token = row_offset;
-        if (padding_token >= num_padding_tokens)
-            break;
-        int64_t expert = padding_token / min_num_tokens_alignment;
-        int64_t num_tokens_before = expert_first_token_offset[expert];
-        int64_t num_tokens_after = expert_first_token_offset[expert + 1];
-        int64_t tokens_to_expert = num_tokens_after - num_tokens_before;
-        if (tokens_to_expert == 0)
-            continue;
-        int64_t padding_to_expert
-            = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(tokens_to_expert, min_num_tokens_alignment)
-            - tokens_to_expert;
-        int64_t expert_pad_idx = padding_token % min_num_tokens_alignment;
-        if (expert_pad_idx < padding_to_expert)
-        {
-            writeSF<VecSize, VecSize>(num_tokens_before, expert, -1, num_tokens_after + expert_pad_idx, col_offset,
-                padded_inter_size, fc2_act_sf_flat, nullptr);
-        }
-    }
+    // N-dimension SF padding. See zeroPaddedSfRows(): one warp per SF atom tile writing coalesced 16B suffixes,
+    // instead of one scattered STG.8 per (padded row, SF column).
+    constexpr int min_num_tokens_alignment = TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4;
+    // blockDim is (1, ACTIVATION_THREADS_PER_BLOCK, 1), so the linear thread index is threadIdx.y and consecutive
+    // lanes of a warp get consecutive 16B chunks of one SF atom tile.
+    int64_t const flat_tid
+        = (static_cast<int64_t>(blockIdx.y) * gridDim.x + blockIdx.x) * ACTIVATION_THREADS_PER_BLOCK + threadIdx.y;
+    int64_t const flat_num_threads = static_cast<int64_t>(gridDim.x) * gridDim.y * ACTIVATION_THREADS_PER_BLOCK;
+    zeroPaddedSfRows<VecSize, min_num_tokens_alignment>(expert_first_token_offset, num_experts_per_node,
+        padded_inter_size, fc2_act_sf_flat, TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4, flat_tid,
+        flat_num_threads);
 #endif
 }
 
