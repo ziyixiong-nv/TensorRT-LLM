@@ -144,15 +144,44 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
   endif()
 
   if(DEP_PATCH_FILE AND NOT DEP_PATCH_FILE STREQUAL "")
-    set(_patch_file "${CMAKE_CURRENT_SOURCE_DIR}/${DEP_PATCH_FILE}")
-    list(
-      APPEND
-      FETCH_ARGS
-      PATCH_COMMAND
-      bash
-      -c
-      "patch -p1 --forward --batch --dry-run -i '${_patch_file}' && patch -p1 --forward --batch -i '${_patch_file}' || patch -p1 --reverse --batch --dry-run -i '${_patch_file}' || (echo 'Patch state for ${DEP_NAME} is inconsistent. Remove ${CMAKE_BINARY_DIR}/_deps/${DEP_NAME}-src and reconfigure.' >&2 && false)"
-    )
+    # `patch_file` is either one path or an array of paths applied in order, so
+    # a dependency needing more than one fix keeps one self-describing file per
+    # fix instead of accumulating unrelated hunks under the first one's name.
+    string(
+      JSON
+      _patch_file_type
+      ERROR_VARIABLE
+      _err
+      TYPE
+      "${DEP_OBJECT}"
+      "patch_file")
+    set(_patch_files)
+    if(_patch_file_type STREQUAL "ARRAY")
+      string(JSON _patch_file_count LENGTH "${DEP_OBJECT}" "patch_file")
+      math(EXPR _patch_file_count_minus_one "${_patch_file_count} - 1")
+      foreach(_patch_idx RANGE ${_patch_file_count_minus_one})
+        string(JSON _patch_entry GET "${DEP_OBJECT}" "patch_file" ${_patch_idx})
+        list(APPEND _patch_files "${CMAKE_CURRENT_SOURCE_DIR}/${_patch_entry}")
+      endforeach()
+    else()
+      list(APPEND _patch_files "${CMAKE_CURRENT_SOURCE_DIR}/${DEP_PATCH_FILE}")
+    endif()
+
+    # Each patch: apply if it applies, accept an already-applied tree (reverse
+    # dry-run succeeds), otherwise fail loudly rather than half-patch.
+    set(_patch_command "")
+    foreach(_patch_file IN LISTS _patch_files)
+      if(NOT _patch_command STREQUAL "")
+        string(APPEND _patch_command " && ")
+      endif()
+      string(
+        APPEND
+        _patch_command
+        "(patch -p1 --forward --batch --dry-run -i '${_patch_file}' && patch -p1 --forward --batch -i '${_patch_file}' || patch -p1 --reverse --batch --dry-run -i '${_patch_file}' || (echo 'Patch state for ${DEP_NAME} (${_patch_file}) is inconsistent. Remove ${CMAKE_BINARY_DIR}/_deps/${DEP_NAME}-src and reconfigure.' >&2 && false))"
+      )
+    endforeach()
+
+    list(APPEND FETCH_ARGS PATCH_COMMAND bash -c "${_patch_command}")
   endif()
 
   if(_git_submodules_error STREQUAL "NOTFOUND")
