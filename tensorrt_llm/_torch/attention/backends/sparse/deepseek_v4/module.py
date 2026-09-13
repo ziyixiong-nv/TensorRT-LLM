@@ -992,9 +992,9 @@ def forward_sparse_attn(
         and self.indexer is not None
         and self.indexer_stream is not None
         # V4.1's index keys are a reprojection of *this* layer's compressed latent
-        # (model.py:544), so its indexer cannot run beside the compressor that
-        # produces it. The compressor still pre-launches on its own stream and the
-        # indexer joins on `dsv4_compressor_event`; only the two-stream race is off.
+        # (model.py:544), so its indexer cannot be raced against the compressor the
+        # way this branch races them. It gets `_v41_indexer_overlap` below instead,
+        # which overlaps the indexer with Q and waits on the compressor's event.
         and self.indexer.supports_overlapped_prepare
     )
     # V4.1 hands the compressed latent from the compressor to the indexer as an
@@ -1037,6 +1037,38 @@ def forward_sparse_attn(
             _kv_comp = _run_compressor()
             if not _use_indexer_overlap:
                 self.dsv4_compressor_event.record()
+
+    # V4.1 gets its own overlap rather than none. `supports_overlapped_prepare` is
+    # False there because the *key* branch consumes this layer's compressed latent,
+    # so it cannot be raced against the compressor -- but that is an argument about
+    # the compressor, not about Q. The V4.1 indexer reads `qr`, `hidden_states` and
+    # (on a kv source) the latent, none of which is the Q branch's output, so the
+    # whole indexer is independent of the whole Q branch. Where the latent is
+    # involved the dependency is real but ordinary: the compressor has already been
+    # pre-launched on its own stream and recorded `dsv4_compressor_event`, which the
+    # indexer stream waits on. An event is exactly the tool for a cross-stream
+    # producer; "cannot wait on it" was too strong.
+    #
+    # Q stays on the caller stream and the indexer moves, which is the opposite
+    # assignment to the V4 branch below and deliberately so: it leaves `q` and the
+    # fused-Q buffers on the stream that consumes them, so only the indexer's own
+    # outputs cross.
+    #
+    # Not gated on `_v4_extra_overlap`: that requires a compressor, and the four
+    # index sources that are not kv sources (24, 28, 32, 36) have none -- they are
+    # the cleanest case here, with no latent and no event at all.
+    _v41_indexer_overlap = (
+        self.is_dsv41
+        and os.environ.get("TRTLLM_DSV41_INDEXER_OVERLAP", "1") == "1"
+        and do_multi_stream()
+        and self.indexer is not None
+        and self.indexer_stream is not None
+        and not self.indexer.supports_overlapped_prepare
+        # The latent has to come from the pre-launched compressor. Without the
+        # pre-launch it is produced on the caller stream inside the branch tree
+        # below, i.e. after this point, and there would be nothing to wait on.
+        and (not _v41_latent_handoff or _prelaunch_compressor)
+    )
 
     # Precompute QR-independent indexer work while the caller stream prepares KV.
     # Passing pre_aux later prevents the indexer from launching this work again.
@@ -1202,6 +1234,23 @@ def forward_sparse_attn(
 
     topk_indices = None
     indexer_ran = False
+    if _v41_indexer_overlap:
+        # Launched before the Q/compressor tree below, not inside it, because that
+        # tree is where Q is produced and the point is to have the indexer already
+        # running underneath it. Everything the indexer reads exists by now.
+        self.dsv4_overlap_start_event.record()
+        with torch.cuda.stream(self.indexer_stream):
+            self.dsv4_overlap_start_event.wait()
+            if _v41_latent_handoff:
+                self.dsv4_compressor_event.wait()
+                # Allocated on compressor_stream, read here: without this the caching
+                # allocator is free to hand the block to a later allocation on that
+                # stream while this one is still reading it.
+                _kv_comp.record_stream(self.indexer_stream)
+            topk_indices = _indexer_branch()
+            indexer_ran = True
+            self.dsv4_indexer_event.record()
+
     if _v4_extra_overlap:
         if _use_indexer_overlap:
             # Compressor and indexer prework are already in flight. Run Q after the
@@ -1257,6 +1306,21 @@ def forward_sparse_attn(
         q = _q_branch()
         if self.compressor is not None:
             _kv_comp = _run_compressor()
+
+    if _v41_indexer_overlap:
+        self.dsv4_indexer_event.wait()
+        _cur_stream = torch.cuda.current_stream()
+        # Everything the indexer produced was allocated on indexer_stream. The top-k
+        # is read here and, on an index source, by the indexed layers downstream that
+        # run no indexer of their own. The index keys are read by the *other* index
+        # sources sharing this kv source -- a cross-layer consumer, so its lifetime
+        # cannot be inferred from this scope and has to be recorded here.
+        for _crossed in (
+            topk_indices,
+            *(attn_metadata.v41_index_keys.get(self.layer_idx) or ()),
+        ):
+            if _crossed is not None:
+                _crossed.record_stream(_cur_stream)
 
     if self.indexer is not None:
         if not indexer_ran:

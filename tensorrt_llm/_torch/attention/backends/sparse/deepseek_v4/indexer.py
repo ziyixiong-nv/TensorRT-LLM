@@ -424,10 +424,11 @@ class DeepseekV4Indexer(Indexer):
         latent: Optional[torch.Tensor] = None,
     ):
         # The overlapped prepare exists to hide an *independent* key branch behind
-        # the Q GEMM. V4.1's key branch is not independent -- it consumes the main
-        # compressor's latent, produced on the caller's stream in the same layer --
-        # so `supports_overlapped_prepare` turns it off there rather than having the
-        # aux stream race a producer it cannot wait on.
+        # this class's own Q GEMM. V4.1's key branch is not independent of anything
+        # this class produces -- it consumes a latent handed in from outside -- so
+        # `supports_overlapped_prepare` turns the internal split off there. V4.1's
+        # overlap is one level up (`_v41_indexer_overlap`), where this whole method
+        # runs on the indexer stream.
         if self.supports_overlapped_prepare and do_multi_stream() and self.aux_stream is not None:
             q_fp8, q_scale, k_fp8, k_scale, weights = self._run_overlapped_indexer_prepare(
                 qr,
@@ -483,9 +484,17 @@ class DeepseekV41Indexer(DeepseekV4Indexer):
       generation is FP4, not the FP8 that V4's indexer uses.
     """
 
-    # The key branch consumes the main compressor's latent, produced on the
-    # caller's stream in this same layer, so it cannot be hidden behind the Q
-    # GEMM on the aux stream the way V4's independent key branch can.
+    # This flag governs the *indexer-internal* two-stream split only, where the aux
+    # stream would own the key branch and the caller stream the Q branch. That split
+    # does not work here: the key branch consumes the main compressor's latent, which
+    # arrives as an argument rather than being produced inside this class, so there is
+    # no launch point the aux stream can start from without racing it.
+    #
+    # It does not mean the V4.1 indexer is unoverlappable. One level up, the whole
+    # indexer -- Q projection, weights projection and key build together -- is
+    # independent of the whole Q branch, and `_v41_indexer_overlap` in module.py runs
+    # it on `indexer_stream` underneath q_b_proj, waiting on the compressor's event
+    # where the latent is involved.
     supports_overlapped_prepare = False
 
     def __init__(
@@ -667,7 +676,10 @@ class DeepseekV41Indexer(DeepseekV4Indexer):
         return q_fp8, q_scale, k_fp8, k_scale, weights
 
     def precompute_aux(self, hidden_states, metadata):
-        # Nothing to overlap: V4.1's aux-stream work in the V4 path is the
-        # indexer compressor, which does not exist here. Returning None routes
-        # `forward` to the serial path.
+        # Nothing to pre-launch from *here*. This hook fires before kv_a_proj, and the
+        # only V4.1 work that early is `weights_proj`; the key build needs a latent
+        # that does not exist yet. Hoisting one small GEMM would buy little and would
+        # duplicate what `_v41_indexer_overlap` already gets by moving the entire
+        # indexer off the caller stream. Returning None routes `forward` to the serial
+        # prepare, which is then serial only with respect to `indexer_stream`.
         return None
