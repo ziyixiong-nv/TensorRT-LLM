@@ -1183,7 +1183,7 @@ class Engram(nn.Module):
 
 
 class ShardedFp8MultiHeadEmbedding(nn.Module):
-    """Row-sharded fp8 n-gram table, dequantized on lookup.
+    """Sharded fp8 n-gram table, dequantized on lookup.
 
     The dense :class:`MultiHeadEmbedding` above keeps its table in the compute
     dtype and replicates it on every rank. That is fine for a table of a few
@@ -1194,22 +1194,40 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
     and sharded over the rank dimension, the pair costs ~24.7 GiB per rank at
     TP=8, which is what makes the model loadable at all.
 
-    Mirrors the reference ``ParallelEngramEmbedding``
-    (``<checkpoint>/inference/model.py:296-325``) exactly: contiguous row shards,
-    out-of-shard indices masked to row 0 and then zeroed, an in-place dequant to
-    ``dtype``, and a sum all-reduce to reassemble. Every rank looks up every
-    index, so the mask -- not the index arithmetic -- is what keeps the sum
-    correct: without zeroing, each rank would contribute row 0 of its own shard
-    for the indices it does not own.
+    There are two ways to cut it, and which one is used depends only on whether the
+    head count divides the rank count:
 
-    Note the shard is over the *concatenated* table (all heads' bucket ranges
-    end to end), not per head. Head ranges are already disjoint via ``offsets``,
-    so one flat shard split is both simpler and better balanced than sharding
-    each head's range separately.
+    **Head-sharded** (``num_heads % tp_size == 0``). Each rank owns a contiguous
+    *run of heads*, hence the contiguous row range those heads' buckets occupy.
+    Because a head's hash index is by construction inside that head's own bucket,
+    every index a rank looks up is one it owns: no shard mask, no zeroing, and
+    ``forward`` returns only this rank's ``num_local_heads`` columns. The caller
+    reassembles with an **all-gather**, which is what makes this the cheaper cut --
+    each rank gathers ``1/tp_size`` of the rows, and a concatenation moves about
+    half the bytes of the equivalent sum all-reduce.
+
+    **Row-sharded** (otherwise). Contiguous shards of the *concatenated* table,
+    every rank looking up every index with the out-of-shard ones masked to row 0
+    and then zeroed, reassembled by a **sum all-reduce**. This is the reference's
+    scheme (``ParallelEngramEmbedding``,
+    ``<checkpoint>/inference/model.py:296-325``) and it works at any rank count,
+    which is why it stays as the fallback: the mask -- not the index arithmetic --
+    is what keeps the sum correct, since without zeroing each rank would contribute
+    row 0 of its own shard for the indices it does not own.
+
+    DeepSeek-V4.1 has 24 heads (``(engram_max_ngram_size - 1) * engram_n_heads``)
+    of ~16M near-uniform rows each, so the head cut is available at every TP the
+    model is deployed at except 16, and is as balanced in memory as the row cut.
+
+    ``forward`` returns the rank's *contribution*, and the two cuts need different
+    collectives to combine them; ``shard_heads`` is what the caller reads to pick
+    (see ``DeepseekV41Engram.precompute``).
 
     ``cpu_offload`` moves this rank's shard out of HBM into pinned host memory and
     gathers from it over PCIe (see ``_uva_device_view``), returning the whole
-    ~24.7 GiB per rank to the KV cache pool at the cost of a slower lookup.
+    ~24.7 GiB per rank to the KV cache pool at the cost of a slower lookup. It
+    composes with either cut, and compounds with the head cut in particular: an
+    offloaded head-sharded lookup fetches ``1/tp_size`` as many rows over PCIe.
     """
 
     def __init__(
@@ -1242,17 +1260,41 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         self._views: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._views_src: Optional[Tuple[int, int]] = None
 
-        self.register_buffer("offsets", _bucket_offsets(list_of_N))
-
         self.num_embeddings = sum(list_of_N)
-        # Ceil-divide and let the last rank hold a short tail rather than
-        # distributing the remainder, so `vocab_start_idx` stays a plain
-        # multiplication -- same split the reference uses.
-        self.part_num_embeddings = (self.num_embeddings + tp_size - 1) // tp_size
-        self.vocab_start_idx = tp_rank * self.part_num_embeddings
-        self.vocab_end_idx = min(
-            self.vocab_start_idx + self.part_num_embeddings, self.num_embeddings
-        )
+        # An even head split is the only one worth taking: a ragged one would make
+        # every rank's contribution a different width, which the all-gather that
+        # reassembles them cannot express without per-rank sizes -- and the ranks
+        # left short of heads at high tp_size are exactly the case the row cut
+        # already handles well.
+        self.shard_heads = tp_size > 1 and self.num_heads % tp_size == 0
+        offsets = _bucket_offsets(list_of_N)
+
+        if self.shard_heads:
+            heads_per_rank = self.num_heads // tp_size
+            self.head_start = tp_rank * heads_per_rank
+            head_end = self.head_start + heads_per_rank
+            self.num_local_heads = heads_per_rank
+            self.vocab_start_idx = int(offsets[self.head_start])
+            self.vocab_end_idx = self.vocab_start_idx + sum(list_of_N[self.head_start : head_end])
+            self.part_num_embeddings = self.vocab_end_idx - self.vocab_start_idx
+            # Rebased onto the shard, and only the owned columns: `forward` adds
+            # these to `input_ids[:, head_start:head_end]` to land directly on a
+            # local row. Registered under the same name as the row-sharded case so
+            # the buffer set does not depend on the cut.
+            offsets = offsets[self.head_start : head_end] - self.vocab_start_idx
+        else:
+            self.head_start = 0
+            self.num_local_heads = self.num_heads
+            # Ceil-divide and let the last rank hold a short tail rather than
+            # distributing the remainder, so `vocab_start_idx` stays a plain
+            # multiplication -- same split the reference uses.
+            self.part_num_embeddings = (self.num_embeddings + tp_size - 1) // tp_size
+            self.vocab_start_idx = tp_rank * self.part_num_embeddings
+            self.vocab_end_idx = min(
+                self.vocab_start_idx + self.part_num_embeddings, self.num_embeddings
+            )
+
+        self.register_buffer("offsets", offsets)
 
         # Explicitly placed: construction usually runs under a CUDA default-device
         # context, so an offloaded table has to name "cpu" to stay off the GPU.
@@ -1287,10 +1329,12 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
                 shard = torch.as_tensor(shard)
             rows = shard.shape[0]
             if rows != param.shape[0]:
-                # Only the final rank can be short, and only by the ceil-divide
-                # remainder. Anything else means the table is not the size the
-                # bucket layout says it is, which would silently rehash it.
-                if self.tp_rank != self.tp_size - 1 or rows > param.shape[0]:
+                # Only the final rank of a *row* shard can be short, and only by
+                # the ceil-divide remainder. A head shard's row range is exact by
+                # construction, so any mismatch there -- and any mismatch on an
+                # interior rank -- means the table is not the size the bucket
+                # layout says it is, which would silently rehash it.
+                if self.shard_heads or self.tp_rank != self.tp_size - 1 or rows > param.shape[0]:
                     raise ValueError(
                         f"Engram {name}: rank {self.tp_rank}/{self.tp_size} expected "
                         f"{param.shape[0]} rows in [{start}, {end}) of a "
@@ -1327,27 +1371,47 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         return self._views
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """``[T, num_heads]`` bucket-local indices -> ``[T, num_heads, D]``.
+        """``[T, num_heads]`` bucket-local indices -> ``[T, num_local_heads, D]``.
 
-        The all-reduce is left to the caller (see
-        ``DeepseekV41Engram.precompute``): it runs on the Engram side stream, so
-        issuing a collective from inside this module would order it against the
-        wrong stream.
+        ``num_local_heads`` is ``num_heads`` unless the table is head-sharded, in
+        which case this is only the owned slice of the head axis and the caller
+        all-gathers it back to full width.
+
+        The collective is left to the caller (see
+        ``DeepseekV41Engram.precompute``): the lookup runs on the Engram side
+        stream, so issuing a collective from inside this module would order it
+        against the wrong stream.
         """
-        indices = input_ids + self.offsets
-        # The shared vocab-parallel shard mask, not a private reimplementation:
-        # ``VocabParallelEmbedding`` and the LM head both go through it, and a
-        # third copy of the convention in this package would drift into silently
-        # zeroed rows -- which the caller's sum all-reduce then makes
-        # indistinguishable from a real embedding -- rather than into an error.
-        # It returns the *drop* mask, already unsqueezed to broadcast over ``D``.
-        local, drop = get_masked_input_and_mask(indices, self.vocab_start_idx, self.vocab_end_idx)
+        if self.shard_heads:
+            # No mask: `offsets` is already rebased onto the shard and covers only
+            # the owned columns, and a head's hash index is inside that head's own
+            # bucket by construction (`NgramHashMapping._get_ngram_hashes` takes it
+            # mod the head's bucket size). A hash that broke that invariant would
+            # index out of the shard and fault here, where the row cut would
+            # silently substitute some other head's row instead -- so the loud
+            # failure is the better of the two.
+            head_end = self.head_start + self.num_local_heads
+            local = input_ids[:, self.head_start : head_end] + self.offsets
+            drop = None
+        else:
+            indices = input_ids + self.offsets
+            # The shared vocab-parallel shard mask, not a private reimplementation:
+            # ``VocabParallelEmbedding`` and the LM head both go through it, and a
+            # third copy of the convention in this package would drift into silently
+            # zeroed rows -- which the caller's sum all-reduce then makes
+            # indistinguishable from a real embedding -- rather than into an error.
+            # It returns the *drop* mask, already unsqueezed to broadcast over ``D``.
+            local, drop = get_masked_input_and_mask(
+                indices, self.vocab_start_idx, self.vocab_end_idx
+            )
 
         weight, scale = self.storage()
         values = torch.nn.functional.embedding(local, weight)
         scales = torch.nn.functional.embedding(local, scale)
         out = values.float().unflatten(-1, (-1, self.block_size)) * scales.float().unsqueeze(-1)
         out = out.flatten(-2).to(self.dtype)
+        if drop is None:
+            return out
         # In place: ``out`` is this call's own dequant result, so the out-of-place
         # form only bought a second ``[T, num_heads, D]`` allocation and a copy.
         return out.masked_fill_(drop, 0)

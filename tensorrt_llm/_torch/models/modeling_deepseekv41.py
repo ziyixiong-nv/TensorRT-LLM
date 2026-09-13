@@ -84,7 +84,7 @@ from ..configs.deepseek_v41 import (
     engram_cpu_offload_enabled,
     quant_role_for_weight_key,
 )
-from ..distributed import AllReduce, AllReduceParams, AllReduceStrategy
+from ..distributed import AllReduce, AllReduceParams, AllReduceStrategy, allgather
 from ..model_config import ModelConfig
 from ..modules.engram import Engram, ShardedFp8MultiHeadEmbedding
 from ..modules.mhc.hyper_connection import HCState, mHC
@@ -227,6 +227,8 @@ class DeepseekV41Engram(Engram):
         # Sum all-reduce reassembles the row shards. Built here rather than
         # reaching for a global so a TP=1 run allocates nothing, and carrying the
         # model's configured strategy like every other collective in the model.
+        # A head-sharded table needs a concatenation instead, so it allocates no
+        # workspace at all (see `_combine_embeddings`).
         #
         # It carries a width nothing else does -- `engram_n_heads *
         # engram_head_dim` (6144) against `hidden_size` (5120) -- which made it
@@ -240,16 +242,20 @@ class DeepseekV41Engram(Engram):
         # clean -- and it belongs to that path, not to Engram.
         self.embed_all_reduce = (
             AllReduce(mapping=mapping, strategy=allreduce_strategy)
-            if mapping is not None and self.tp_size > 1
+            if mapping is not None
+            and self.tp_size > 1
+            and not self.multi_head_embedding.shard_heads
             else None
         )
 
     def _make_multi_head_embedding(self, list_of_N: List[int], D: int) -> nn.Module:
-        """Row-sharded fp8 table instead of the dense replicated one.
+        """Sharded fp8 table instead of the dense replicated one.
 
         Same bucket layout (``list_of_N`` -> ``offsets``), so the indices the
-        shared ``EngramHashProvider`` computes are unchanged; only the storage
-        and the shard mask differ.
+        shared ``EngramHashProvider`` computes are unchanged; only the storage and
+        the cut differ. Which cut it picks -- head or row -- follows from the head
+        count and ``tp_size``, and ``_combine_embeddings`` reads it back off the
+        module to choose the matching collective.
 
         ``TRTLLM_V41_ENGRAM_CPU_OFFLOAD`` additionally moves the shard off the GPU
         (see ``engram_cpu_offload_enabled``). It is read here rather than taken as
@@ -270,37 +276,59 @@ class DeepseekV41Engram(Engram):
     def _make_short_conv(self) -> None:
         return None
 
+    def _combine_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """Reassemble the per-rank contributions into the full ``[T, H * D]``.
+
+        Which collective that takes is decided by how the table was cut, so it is
+        read off the embedding rather than configured twice:
+
+        * **head-sharded** -- each rank holds a distinct, complete slice of the
+          head axis, so the pieces concatenate. ``flatten`` is head-major and the
+          owned heads are a contiguous ascending run, so an all-gather on the last
+          dimension lands every rank's columns in exactly the right place; no
+          ``sizes`` is needed because an uneven split is what disables this cut.
+        * **row-sharded** -- every rank produces a full-width partial sum with the
+          rows it does not own zeroed, so the pieces add.
+
+        The all-gather is the cheaper of the two -- it moves each rank's slice once
+        rather than reducing full-width buffers -- but the real saving is upstream:
+        a head-sharded rank gathers ``1/tp_size`` of the table rows.
+        """
+        if self.embed_all_reduce is not None:
+            return self.embed_all_reduce(
+                embeddings, all_reduce_params=AllReduceParams(enable_allreduce=True)
+            )
+        if self.multi_head_embedding.shard_heads:
+            return allgather(embeddings, self.mapping, dim=-1)
+        return embeddings
+
     def precompute(
         self,
         hash_indices: torch.Tensor,
         dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
-        """Sharded lookup on the Engram side stream, all-reduce on the caller's.
+        """Sharded lookup on the Engram side stream, collective on the caller's.
 
         Same contract as the base class (``[T, num_heads]`` in,
         ``[T, num_heads * D]`` out, ``sync_event`` recorded). Each rank holds only
-        a row slice of the table, so the flattened embeddings are a partial sum
-        until the collective lands.
+        a slice of the table, so the flattened lookup is this rank's contribution
+        and is not the return value until ``_combine_embeddings`` has run.
 
-        The split is not a style choice. ``AllReduce`` shares one communicator and
-        one IPC workspace with every other collective in the model -- the MoE
-        reduction, the attention TP reduction -- and all of those are issued on
-        the main stream. Two collectives in flight over the same workspace race on
-        its flags, and eight ranks that disagree about ordering race on the
-        communicator itself. The result is silently wrong embeddings rather than a
-        crash, and it only reproduces when the streams actually overlap: it
-        disappears under ``CUDA_LAUNCH_BLOCKING=1``, and it disappeared under an
-        instrumentation pass whose per-layer ``isfinite`` checks happened to sync
-        often enough to serialize the fork. So the lookup overlaps and the
-        collective does not.
+        The split is not a style choice, and it holds for either collective. Both
+        share one communicator -- and ``AllReduce`` one IPC workspace -- with every
+        other collective in the model, the MoE reduction and the attention TP
+        reduction included, all of which are issued on the main stream. Two
+        collectives in flight over the same workspace race on its flags, and eight
+        ranks that disagree about ordering race on the communicator itself. The
+        result is silently wrong embeddings rather than a crash, and it only
+        reproduces when the streams actually overlap: it disappears under
+        ``CUDA_LAUNCH_BLOCKING=1``, and it disappeared under an instrumentation
+        pass whose per-layer ``isfinite`` checks happened to sync often enough to
+        serialize the fork. So the lookup overlaps and the collective does not.
         """
         if self.stream is None:
             embeddings = self.multi_head_embedding(hash_indices)
-            embeddings = embeddings.flatten(start_dim=-2)
-            if self.embed_all_reduce is not None:
-                embeddings = self.embed_all_reduce(
-                    embeddings, all_reduce_params=AllReduceParams(enable_allreduce=True)
-                )
+            embeddings = self._combine_embeddings(embeddings.flatten(start_dim=-2))
             return embeddings.to(dtype) if dtype is not None else embeddings
 
         # See the base class: the two `record_stream` calls are what keep the
@@ -315,13 +343,11 @@ class DeepseekV41Engram(Engram):
             self.sync_event.record()
         embeddings.record_stream(caller_stream)
 
-        if self.embed_all_reduce is not None:
+        if self.tp_size > 1:
             # Ordered against the lookup explicitly, since the collective is now
-            # on a different stream than the partial sum it consumes.
+            # on a different stream than the contribution it consumes.
             self.sync_event.wait(caller_stream)
-            embeddings = self.embed_all_reduce(
-                embeddings, all_reduce_params=AllReduceParams(enable_allreduce=True)
-            )
+            embeddings = self._combine_embeddings(embeddings)
         if dtype is not None:
             embeddings = embeddings.to(dtype)
         # Re-recorded so `sync_event` keeps meaning "the returned tensor is

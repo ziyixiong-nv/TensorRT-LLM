@@ -884,3 +884,156 @@ class TestShardedFp8MultiHeadEmbeddingCpuOffload:
         assert all(p.is_cuda for p in resident.parameters())
         weight, scale = resident.storage()
         assert weight is resident.weight and scale is resident.scale
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+class TestShardedFp8MultiHeadEmbeddingHeadSharding:
+    """Cutting the table by head has to reassemble into the row-cut answer.
+
+    When the head count divides the rank count each rank owns a contiguous run of
+    heads and returns only those columns, to be concatenated rather than summed.
+    So the reference here is the *unsharded* table -- one rank holding everything,
+    which is also what the row cut collapses to -- and the concatenation of the
+    per-rank contributions must equal it exactly. Nothing in the arithmetic
+    changes, only which rows each rank reads, so any difference is a wiring bug:
+    the wrong head columns sliced, the offsets rebased onto the wrong origin, or
+    the pieces concatenated in the wrong order.
+    """
+
+    # Six unequal buckets, so a head cut at TP=2, 3 and 6 gives ranks different
+    # numbers of *rows* while giving them the same number of heads. Equal buckets
+    # would let a row-range bug that happens to be a multiple of the bucket size
+    # pass.
+    LIST_OF_N = [64, 48, 16, 96, 32, 80]
+    D = 128
+    BLOCK_SIZE = 32
+
+    def _table(self, tp_size=1, tp_rank=0, cpu_offload=False):
+        with torch.device("cuda"):
+            return ShardedFp8MultiHeadEmbedding(
+                list_of_N=self.LIST_OF_N,
+                D=self.D,
+                block_size=self.BLOCK_SIZE,
+                dtype=torch.bfloat16,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                cpu_offload=cpu_offload,
+            )
+
+    def _checkpoint(self, seed=7):
+        gen = torch.Generator().manual_seed(seed)
+        rows = sum(self.LIST_OF_N)
+        # e4m3 codes with 0x7F/0xFF (NaN) excluded, and e8m0 exponents near 127, for
+        # the same reasons as the offload suite: a NaN or a saturated product would
+        # make a mismatch invisible.
+        magnitude = torch.randint(0, 127, (rows, self.D), dtype=torch.uint8, generator=gen)
+        sign = torch.randint(0, 2, (rows, self.D), dtype=torch.uint8, generator=gen) << 7
+        scale = torch.randint(
+            120, 135, (rows, self.D // self.BLOCK_SIZE), dtype=torch.uint8, generator=gen
+        )
+        return {
+            "weight": (magnitude | sign).view(torch.float8_e4m3fn),
+            "scale": scale.view(torch.float8_e8m0fnu),
+        }
+
+    def _indices(self, num_tokens=29, seed=3):
+        gen = torch.Generator().manual_seed(seed)
+        # Bucket-local, as the hash provider produces them: head j indexes into
+        # [0, LIST_OF_N[j]). That invariant is precisely what lets the head cut drop
+        # the shard mask, so the test has to honour it.
+        cols = [
+            torch.randint(0, n, (num_tokens, 1), dtype=torch.long, generator=gen)
+            for n in self.LIST_OF_N
+        ]
+        return torch.cat(cols, dim=1).cuda()
+
+    def _gather(self, tp_size, checkpoint, indices, cpu_offload=False):
+        """Every rank's contribution, concatenated on the head axis."""
+        parts = []
+        for tp_rank in range(tp_size):
+            table = self._table(tp_size=tp_size, tp_rank=tp_rank, cpu_offload=cpu_offload)
+            assert table.shard_heads, f"TP={tp_size} did not take the head cut"
+            table.load_weights([checkpoint])
+            parts.append(table(indices))
+        return torch.cat(parts, dim=1)
+
+    @pytest.mark.parametrize("tp_size", [2, 3, 6])
+    def test_head_shards_concatenate_to_the_unsharded_table(self, tp_size):
+        checkpoint = self._checkpoint()
+        indices = self._indices()
+
+        unsharded = self._table(tp_size=1)
+        assert not unsharded.shard_heads, "TP=1 has nothing to cut"
+        unsharded.load_weights([checkpoint])
+        reference = unsharded(indices)
+        assert reference.count_nonzero() > 0, "reference lookup produced nothing to compare"
+
+        torch.testing.assert_close(
+            self._gather(tp_size, checkpoint, indices), reference, atol=0.0, rtol=0.0
+        )
+
+    def test_each_rank_owns_exactly_its_heads_rows(self):
+        """The row range is the owned buckets' -- no rounding, no overlap, no gap."""
+        bounds = [0]
+        for n in self.LIST_OF_N:
+            bounds.append(bounds[-1] + n)
+
+        tp_size = 3
+        heads_per_rank = len(self.LIST_OF_N) // tp_size
+        for tp_rank in range(tp_size):
+            table = self._table(tp_size=tp_size, tp_rank=tp_rank)
+            head_start = tp_rank * heads_per_rank
+            assert table.head_start == head_start
+            assert table.num_local_heads == heads_per_rank
+            assert table.vocab_start_idx == bounds[head_start]
+            assert table.vocab_end_idx == bounds[head_start + heads_per_rank]
+            # Exact, so `load_weights` can never take its tail-pad branch.
+            assert table.weight.shape[0] == table.vocab_end_idx - table.vocab_start_idx
+            # Rebased onto the shard and covering only the owned columns, so every
+            # index this rank forms is in range without a mask.
+            assert table.offsets.tolist() == [
+                bounds[h] - bounds[head_start]
+                for h in range(head_start, head_start + heads_per_rank)
+            ]
+
+    def test_uneven_head_count_falls_back_to_the_row_cut(self):
+        """The row cut is the general one and must still work where heads do not divide.
+
+        Six heads at TP=4 is the situation DeepSeek-V4.1 is in at TP=16 -- 24 heads
+        do not divide by 16 -- so this is a deployment the fallback exists for, not
+        a synthetic case.
+        """
+        checkpoint = self._checkpoint()
+        indices = self._indices()
+        tp_size = 4
+        assert len(self.LIST_OF_N) % tp_size != 0
+
+        unsharded = self._table(tp_size=1)
+        unsharded.load_weights([checkpoint])
+        reference = unsharded(indices)
+
+        total = torch.zeros_like(reference)
+        for tp_rank in range(tp_size):
+            table = self._table(tp_size=tp_size, tp_rank=tp_rank)
+            assert not table.shard_heads
+            table.load_weights([checkpoint])
+            contribution = table(indices)
+            # Full width, unlike a head shard: the row cut's contributions are summed.
+            assert contribution.shape == reference.shape
+            total += contribution
+        torch.testing.assert_close(total, reference, atol=0.0, rtol=0.0)
+
+    def test_head_cut_composes_with_cpu_offload(self):
+        """Offloading is a storage change; it must not interact with the cut.
+
+        This is the combination worth exercising rather than either alone: the
+        offloaded head shard is the configuration that pulls ``1/tp_size`` as many
+        rows over PCIe, and it reaches the gather through a UVA view whose bounds
+        come from the head cut's row range.
+        """
+        checkpoint = self._checkpoint()
+        indices = self._indices()
+        resident = self._gather(2, checkpoint, indices, cpu_offload=False)
+        assert resident.count_nonzero() > 0
+        offloaded = self._gather(2, checkpoint, indices, cpu_offload=True)
+        torch.testing.assert_close(offloaded, resident, atol=0.0, rtol=0.0)
