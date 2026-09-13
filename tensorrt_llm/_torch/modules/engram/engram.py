@@ -26,15 +26,16 @@ All operations run on device:
 
 import math
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import triton  # type: ignore[import]
+import triton.language as tl  # type: ignore[import]
 from tokenizers import Regex, normalizers
 from torch import nn
 from transformers import AutoTokenizer
-
-from ..embedding import get_masked_input_and_mask
 
 # Default Engram embedding vocabulary size per n-gram level.
 # Derived from the DeepSeek-V3 tokenizer vocab size (129280) scaled by 5.
@@ -1182,6 +1183,111 @@ class Engram(nn.Module):
         return output
 
 
+# Rows per program in the fused lookup below. A row is one (token, head) pair, so a
+# block of 16 rows is 16 scattered gathers of `D` bytes; larger blocks buy nothing
+# because the addresses are unrelated and each one misses on its own.
+_LOOKUP_BLOCK_R = 16
+
+# ue8m0 code 0 is 2**-127, an fp32 denormal. The bitcast below reconstructs every
+# other code exactly but produces +0.0 here, so it is patched back in; code 255 is
+# NaN and gets the same treatment. Neither appears in a real checkpoint, but a
+# dequantizer that is exact on 254 of 256 codes is a trap for the next reader.
+_E8M0_DENORM = tl.constexpr(5.877471754111438e-39)
+
+
+@lru_cache(maxsize=None)
+def _multi_processor_count(device_index: int) -> int:
+    """SM count, cached -- ``get_device_properties`` is a syscall-priced query."""
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+@triton.jit(
+    do_not_specialize=[
+        "num_rows",
+        "vocab_start",
+        "vocab_end",
+        "ids_stride_t",
+        "ids_stride_h",
+        "grid_size",
+    ]
+)
+def _engram_lookup_kernel(
+    weight_ptr,
+    scale_ptr,
+    ids_ptr,
+    offsets_ptr,
+    out_ptr,
+    vocab_start,
+    vocab_end,
+    num_rows,
+    ids_stride_t,
+    ids_stride_h,
+    grid_size,
+    HEAD_START: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    DIM_PAD: tl.constexpr,
+    QB: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    MASKED: tl.constexpr,
+):
+    """Offset, mask, gather, dequantize and cast one Engram lookup, in one pass.
+
+    One program per ``BLOCK_R`` rows of the ``[T * LOCAL_HEADS, DIM]`` output, over a
+    grid-stride loop so ``grid_size`` is a launch parameter rather than a function of
+    ``num_rows``. That is what lets the caller cap the grid: the table is hundreds of
+    times larger than the TLB can cover, so past a certain point more programs only
+    add contention, and on a side stream the SMs are better left to the main one.
+
+    ``MASKED`` picks the cut. False is head-sharded -- every index is owned, and
+    ``offsets_ptr`` is already rebased onto the shard. True is row-sharded, where an
+    unowned index reads row 0 with ``owned`` false, so the gather returns zeros and
+    the ``other=127`` scale (``2**0``) leaves the product exactly zero: the same
+    convention as ``get_masked_input_and_mask`` followed by ``masked_fill_``.
+    """
+    cols = tl.arange(0, DIM_PAD)
+    in_dim = cols < DIM
+    scale_cols = cols // QB
+    for base in tl.range(tl.program_id(0) * BLOCK_R, num_rows, grid_size * BLOCK_R):
+        rows = base + tl.arange(0, BLOCK_R)
+        valid = rows < num_rows
+        # `out` is `[T, LOCAL_HEADS, DIM]` contiguous, so the row index is
+        # head-major within a token and splits back apart by division.
+        head = rows % LOCAL_HEADS
+        token = (rows // LOCAL_HEADS).to(tl.int64)
+        index = tl.load(
+            ids_ptr + token * ids_stride_t + (HEAD_START + head) * ids_stride_h,
+            mask=valid,
+            other=0,
+        ).to(tl.int64)
+        # int64 from here down: a shard holds up to ~48M rows of 256 lanes, and the
+        # row-major byte offset of the last one overflows int32 by a factor of six.
+        index += tl.load(offsets_ptr + head, mask=valid, other=0).to(tl.int64)
+        if MASKED:
+            owned = valid & (index >= vocab_start) & (index < vocab_end)
+            local = tl.where(owned, index - vocab_start, 0)
+        else:
+            owned = valid
+            local = index
+        gather = owned[:, None] & in_dim[None, :]
+        values = tl.load(weight_ptr + local[:, None] * DIM + cols[None, :], mask=gather, other=0.0)
+        code = tl.load(
+            scale_ptr + local[:, None] * (DIM // QB) + scale_cols[None, :],
+            mask=gather,
+            other=127,
+        )
+        # ue8m0 is exactly an fp32 exponent field, so the dequant scale is the byte
+        # shifted into place -- no table, no conversion instruction.
+        scale = (code.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        scale = tl.where(code == 0, _E8M0_DENORM, scale)
+        scale = tl.where(code == 255, float("nan"), scale)
+        tl.store(
+            out_ptr + rows[:, None] * DIM + cols[None, :],
+            (values.to(tl.float32) * scale).to(out_ptr.dtype.element_ty),
+            mask=valid[:, None] & in_dim[None, :],
+        )
+
+
 class ShardedFp8MultiHeadEmbedding(nn.Module):
     """Sharded fp8 n-gram table, dequantized on lookup.
 
@@ -1370,7 +1476,7 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         assert self._views is not None
         return self._views
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, background: bool = False) -> torch.Tensor:
         """``[T, num_heads]`` bucket-local indices -> ``[T, num_local_heads, D]``.
 
         ``num_local_heads`` is ``num_heads`` unless the table is head-sharded, in
@@ -1381,37 +1487,64 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         ``DeepseekV41Engram.precompute``): the lookup runs on the Engram side
         stream, so issuing a collective from inside this module would order it
         against the wrong stream.
-        """
-        if self.shard_heads:
-            # No mask: `offsets` is already rebased onto the shard and covers only
-            # the owned columns, and a head's hash index is inside that head's own
-            # bucket by construction (`NgramHashMapping._get_ngram_hashes` takes it
-            # mod the head's bucket size). A hash that broke that invariant would
-            # index out of the shard and fault here, where the row cut would
-            # silently substitute some other head's row instead -- so the loud
-            # failure is the better of the two.
-            head_end = self.head_start + self.num_local_heads
-            local = input_ids[:, self.head_start : head_end] + self.offsets
-            drop = None
-        else:
-            indices = input_ids + self.offsets
-            # The shared vocab-parallel shard mask, not a private reimplementation:
-            # ``VocabParallelEmbedding`` and the LM head both go through it, and a
-            # third copy of the convention in this package would drift into silently
-            # zeroed rows -- which the caller's sum all-reduce then makes
-            # indistinguishable from a real embedding -- rather than into an error.
-            # It returns the *drop* mask, already unsqueezed to broadcast over ``D``.
-            local, drop = get_masked_input_and_mask(
-                indices, self.vocab_start_idx, self.vocab_end_idx
-            )
 
+        One fused kernel, not a composition of ``F.embedding`` calls. The tensor
+        formulation gathers rows, gathers scales, widens both to fp32, multiplies,
+        and narrows back -- five launches, and an fp32 intermediate four times the
+        size of the output (~50 MiB at a 16K-token chunk) that exists only to be
+        cast away. Fusing deletes all of it, which matters more here than the
+        launch count: the lookup shares the device with the main stream's compute
+        and the allocator with the KV cache pool.
+
+        ``background`` says the launch is on a side stream and should leave SMs for
+        the main one -- see the kernel's grid discussion. It is a parameter rather
+        than an attribute because it is a property of the *call site*, and the
+        module is called from both.
+        """
+        num_rows = input_ids.shape[0] * self.num_local_heads
+        out = torch.empty(
+            (input_ids.shape[0], self.num_local_heads, self.embedding_dim),
+            dtype=self.dtype,
+            device=input_ids.device,
+        )
         weight, scale = self.storage()
-        values = torch.nn.functional.embedding(local, weight)
-        scales = torch.nn.functional.embedding(local, scale)
-        out = values.float().unflatten(-1, (-1, self.block_size)) * scales.float().unsqueeze(-1)
-        out = out.flatten(-2).to(self.dtype)
-        if drop is None:
-            return out
-        # In place: ``out`` is this call's own dequant result, so the out-of-place
-        # form only bought a second ``[T, num_heads, D]`` allocation and a copy.
-        return out.masked_fill_(drop, 0)
+        num_sms = _multi_processor_count(input_ids.device.index)
+        # `max(1, ...)` for the empty batch: a zero-sized grid is not a launch.
+        grid_size = max(
+            1,
+            min(
+                triton.cdiv(num_rows, _LOOKUP_BLOCK_R),
+                num_sms // 2 if background else num_sms,
+            ),
+        )
+        _engram_lookup_kernel[(grid_size,)](
+            weight,
+            # Triton has no ue8m0 dtype; the kernel reads the exponent as the byte
+            # it is, which is also what makes the dequant a shift.
+            scale.view(torch.uint8),
+            input_ids,
+            self.offsets,
+            out,
+            self.vocab_start_idx,
+            self.vocab_end_idx,
+            num_rows,
+            input_ids.stride(0),
+            input_ids.stride(1),
+            grid_size,
+            HEAD_START=self.head_start,
+            LOCAL_HEADS=self.num_local_heads,
+            DIM=self.embedding_dim,
+            DIM_PAD=triton.next_power_of_2(self.embedding_dim),
+            QB=self.block_size,
+            # Head-sharded needs no mask: `offsets` is already rebased onto the
+            # shard and covers only the owned columns, and a head's hash index is
+            # inside that head's own bucket by construction
+            # (`NgramHashMapping._get_ngram_hashes` takes it mod the head's bucket
+            # size). A hash that broke that invariant would index out of the shard
+            # and read whatever follows it, where the row cut would substitute some
+            # other head's row -- neither is detectable, so the invariant is the
+            # thing to hold, not the check.
+            MASKED=not self.shard_heads,
+            BLOCK_R=_LOOKUP_BLOCK_R,
+        )
+        return out

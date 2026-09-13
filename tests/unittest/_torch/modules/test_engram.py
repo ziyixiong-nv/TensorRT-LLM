@@ -17,6 +17,7 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.embedding import get_masked_input_and_mask
 from tensorrt_llm._torch.modules.engram import Engram, EngramConfig, EngramHashProvider
 from tensorrt_llm._torch.modules.engram.engram import (
     CompressedTokenizer,
@@ -24,6 +25,7 @@ from tensorrt_llm._torch.modules.engram.engram import (
     NgramHashMapping,
     ShardedFp8MultiHeadEmbedding,
     ShortConv,
+    _engram_lookup_kernel,
     _uva_device_view,
 )
 
@@ -1037,3 +1039,223 @@ class TestShardedFp8MultiHeadEmbeddingHeadSharding:
         assert resident.count_nonzero() > 0
         offloaded = self._gather(2, checkpoint, indices, cpu_offload=True)
         torch.testing.assert_close(offloaded, resident, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+class TestShardedFp8MultiHeadEmbeddingFusedLookup:
+    """The fused lookup kernel against the tensor formulation it replaced.
+
+    ``forward`` used to be a composition: add the offsets, mask, ``F.embedding``
+    twice, widen both results to fp32, multiply, narrow back, ``masked_fill_``. That
+    is now one Triton kernel, and the point of replacing it was traffic -- the fp32
+    intermediate alone is four times the size of the output -- not arithmetic. So the
+    composition is kept here as the reference and equality is exact.
+
+    Two things only this suite can catch:
+
+    * **The ue8m0 dequant.** The kernel reconstructs the scale by shifting the byte
+      into an fp32 exponent field rather than converting it, which is exact for 254
+      of the 256 codes: byte 0 is ``2**-127`` (a denormal, where the shift gives
+      ``+0.0``) and byte 255 is NaN (where it gives ``+inf``). Both are patched, and
+      the fixture below looks up *every row of the table* so both are reached -- a
+      real checkpoint uses perhaps fifteen codes and would never find them.
+    * **The masking convention.** The row cut's out-of-shard rows are zeroed by
+      ``other=0.0``/``other=127`` inside the gather instead of by
+      ``get_masked_input_and_mask`` plus ``masked_fill_``. The reference still uses
+      the shared helper, so the two cannot drift apart silently.
+    """
+
+    LIST_OF_N = [64, 48, 16, 96, 32, 80]
+    D = 128
+    BLOCK_SIZE = 32
+
+    # 6 heads: TP 2/3/6 divide it and take the head cut, TP 4 does not and falls back
+    # to the row cut. Ranks are chosen to include both an interior one and the last,
+    # which is the only one whose row shard can be short.
+    SHARDS = [(1, 0), (2, 1), (3, 2), (4, 0), (4, 3), (6, 5)]
+
+    def _table(self, tp_size=1, tp_rank=0, cpu_offload=False):
+        with torch.device("cuda"):
+            table = ShardedFp8MultiHeadEmbedding(
+                list_of_N=self.LIST_OF_N,
+                D=self.D,
+                block_size=self.BLOCK_SIZE,
+                dtype=torch.bfloat16,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                cpu_offload=cpu_offload,
+            )
+        table.load_weights([self._checkpoint()])
+        return table
+
+    def _checkpoint(self, seed=13):
+        """Unlike the other suites', this table spans all 256 scale codes.
+
+        ``row % 256`` rather than a random draw so the mapping is exhaustive and
+        reproducible: 336 rows over 256 codes leaves none unused, and the two the
+        bitcast gets wrong land on known rows rather than wherever the seed put them.
+        """
+        gen = torch.Generator().manual_seed(seed)
+        rows = sum(self.LIST_OF_N)
+        magnitude = torch.randint(0, 127, (rows, self.D), dtype=torch.uint8, generator=gen)
+        sign = torch.randint(0, 2, (rows, self.D), dtype=torch.uint8, generator=gen) << 7
+        codes = (torch.arange(rows, dtype=torch.long) % 256).to(torch.uint8)
+        scale = codes[:, None].expand(rows, self.D // self.BLOCK_SIZE).contiguous()
+        return {
+            "weight": (magnitude | sign).view(torch.float8_e4m3fn),
+            "scale": scale.view(torch.float8_e8m0fnu),
+        }
+
+    def _indices(self):
+        """Every row of every bucket, so no code and no offset goes unexercised.
+
+        ``t % N[j]`` walks each head's bucket from 0, and the token count is the
+        largest bucket, so head ``j`` covers all of ``[0, N[j])``. Shorter buckets
+        repeat, which is harmless -- the point is coverage, not distinctness.
+        """
+        num_tokens = max(self.LIST_OF_N)
+        cols = [
+            torch.arange(num_tokens, dtype=torch.long).remainder(n)[:, None] for n in self.LIST_OF_N
+        ]
+        return torch.cat(cols, dim=1).cuda()
+
+    @staticmethod
+    def _reference(table, indices):
+        """The lookup as composed tensor ops -- what ``forward`` used to be."""
+        if table.shard_heads:
+            head_end = table.head_start + table.num_local_heads
+            local = indices[:, table.head_start : head_end] + table.offsets
+            drop = None
+        else:
+            local, drop = get_masked_input_and_mask(
+                indices + table.offsets, table.vocab_start_idx, table.vocab_end_idx
+            )
+        weight, scale = table.storage()
+        values = torch.nn.functional.embedding(local, weight)
+        scales = torch.nn.functional.embedding(local, scale)
+        out = values.float().unflatten(-1, (-1, table.block_size)) * scales.float().unsqueeze(-1)
+        out = out.flatten(-2).to(table.dtype)
+        return out if drop is None else out.masked_fill_(drop, 0)
+
+    @pytest.mark.parametrize("tp_size,tp_rank", SHARDS)
+    @pytest.mark.parametrize("background", [False, True], ids=["full_grid", "background"])
+    def test_fused_lookup_matches_the_tensor_formulation(self, tp_size, tp_rank, background):
+        """Bit-exact on both cuts, and unaffected by how many programs run.
+
+        ``background`` only caps the grid, and the kernel is a grid-stride loop, so a
+        difference between the two would mean rows are being dropped or written twice.
+        """
+        table = self._table(tp_size=tp_size, tp_rank=tp_rank)
+        indices = self._indices()
+        reference = self._reference(table, indices)
+
+        # `equal_nan` because scale code 255 is a NaN by definition and the fixture
+        # deliberately includes it; the guards below are what keep that from making
+        # the comparison vacuous.
+        torch.testing.assert_close(
+            table(indices, background=background), reference, atol=0.0, rtol=0.0, equal_nan=True
+        )
+
+    def test_the_fixture_reaches_the_two_codes_the_bitcast_gets_wrong(self):
+        """Without this, the exactness test could pass on a kernel missing both patches.
+
+        Codes 0 and 255 are the entire reason the kernel carries two ``tl.where``s.
+        They are reached only because the fixture enumerates rows rather than sampling
+        them, which is a property of the fixture and so is asserted on the fixture.
+        """
+        table = self._table()
+        indices = self._indices()
+        out = table(indices)
+
+        codes = self._checkpoint()["scale"].view(torch.uint8)
+        rows_looked_up = (indices + table.offsets).unique().cpu()
+        seen = codes[rows_looked_up, 0].unique().tolist()
+        assert 0 in seen and 255 in seen, f"fixture missed the extremes, saw {len(seen)} codes"
+        assert len(seen) == 256, f"fixture covers only {len(seen)} of 256 scale codes"
+
+        # And the extremes survive into the output: NaN from code 255, and an
+        # underflow to zero from code 0, which a bitcast alone would also produce --
+        # so it is the NaN that discriminates.
+        assert out.isnan().any(), "code 255 did not produce a NaN"
+
+    def test_offloaded_lookup_matches_the_resident_one(self):
+        """The kernel gathers over PCIe when the shard is offloaded.
+
+        Worth its own case: the kernel receives a UVA view rather than a device
+        allocation, and an fp8 pointer into pinned host memory is exactly the sort of
+        thing a gather can mishandle without failing.
+        """
+        indices = self._indices()
+        resident = self._table(tp_size=2, tp_rank=1)
+        offloaded = self._table(tp_size=2, tp_rank=1, cpu_offload=True)
+        reference = resident(indices)
+        assert reference.count_nonzero() > 0, "reference lookup produced nothing to compare"
+        torch.testing.assert_close(
+            offloaded(indices), reference, atol=0.0, rtol=0.0, equal_nan=True
+        )
+
+    def test_empty_batch_launches_nothing_and_returns_the_right_shape(self):
+        """A zero-row grid is not a launch, so the empty batch needs its own floor."""
+        table = self._table(tp_size=2, tp_rank=0)
+        out = table(torch.empty(0, len(self.LIST_OF_N), dtype=torch.long, device="cuda"))
+        assert out.shape == (0, table.num_local_heads, self.D)
+        assert out.dtype == table.dtype
+
+    def test_lookup_captures_into_a_cuda_graph(self):
+        """The decode path replays this kernel from a graph, never launches it.
+
+        Worth pinning because a Triton kernel is only capturable once it is compiled:
+        a JIT compile inside the capture region issues host work the graph cannot
+        record and aborts it. The warmup below is what the runtime's own warmup pass
+        does for real, and the replay-with-new-indices is the part that would silently
+        return stale rows if the kernel had captured a value rather than a pointer.
+        """
+        table = self._table(tp_size=2, tp_rank=1)
+        indices = self._indices()
+        static_ids = torch.empty_like(indices)
+
+        static_ids.copy_(indices)
+        warm = torch.cuda.Stream()
+        warm.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warm):
+            table(static_ids, background=True)
+        torch.cuda.current_stream().wait_stream(warm)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = table(static_ids, background=True)
+
+        for shift in (0, 1):
+            # Rotated, so every row the graph reads is a different one than before.
+            static_ids.copy_(indices.roll(shifts=shift, dims=0))
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                captured, self._reference(table, static_ids), atol=0.0, rtol=0.0, equal_nan=True
+            )
+
+    def test_one_jit_variant_serves_every_token_count(self):
+        """Token count, grid size and strides must not specialize the kernel.
+
+        A second variant costs more than a compile. Triton JITs on the launching
+        thread, and a compile inside a CUDA graph capture issues host work the graph
+        cannot record -- so a shape-specialized kernel would turn the first decode at
+        each new batch size into an aborted capture, which the test above would still
+        pass because it only ever captures one shape. The ``do_not_specialize`` list
+        on the kernel is the whole defence, and dropping it changes no behaviour that
+        anything else here would notice.
+        """
+        table = self._table()
+        cache = _engram_lookup_kernel.device_caches[torch.cuda.current_device()][0]
+        cache.clear()
+
+        sizes = []
+        for background in (False, True):
+            for tokens in (1, 7, 256):
+                indices = torch.zeros(
+                    (tokens, len(self.LIST_OF_N)), dtype=torch.long, device="cuda"
+                )
+                table(indices, background=background)
+                sizes.append(len(cache))
+        assert sizes == [1] * len(sizes), f"the kernel recompiled per shape: {sizes}"

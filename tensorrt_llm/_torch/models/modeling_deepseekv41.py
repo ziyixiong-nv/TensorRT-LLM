@@ -338,7 +338,9 @@ class DeepseekV41Engram(Engram):
         self.stream.wait_stream(caller_stream)
         hash_indices.record_stream(self.stream)
         with torch.cuda.stream(self.stream):
-            embeddings = self.multi_head_embedding(hash_indices)
+            # `background`: the lookup is on the side stream precisely so it can
+            # overlap the main one, which it cannot do while holding every SM.
+            embeddings = self.multi_head_embedding(hash_indices, background=True)
             embeddings = embeddings.flatten(start_dim=-2)
             self.sync_event.record()
         embeddings.record_stream(caller_stream)
