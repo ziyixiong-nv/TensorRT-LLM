@@ -353,19 +353,33 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
                 MoERejectReason.QUANT_UNSUPPORTED,
                 f"MegaMoEDeepGemm supports W4A8_MXFP4_MXFP8 only, got {p.quant_algo}",
             )
-        # TMA requires packed-UE8M0 scale-factor rows to be 16-byte aligned (K % 512 == 0).
+        # The 16-byte-aligned thing is the per-token scale-factor *record* in the
+        # symmetric dispatch buffer, not the weight SF row. DeepGEMM sizes those
+        # records as `Data(hidden / 32)` and `Data(intermediate_hidden / 32)`
+        # (`deep_gemm/include/deep_gemm/layout/mega_moe.cuh`, the `Buffer`
+        # layout), and `Data`'s constructor asserts `num_bytes % 16 == 0`. One
+        # UE8M0 byte per 32 channels then forces `K % 512 == 0` on both widths.
+        #
+        # Do not relax this to 128 from reading the weight path: the weight and
+        # activation SF *matrices* are MN-major, so their 16-byte alignment sits
+        # on MN (`check_sf_layout`'s `stride(-1) == get_tma_aligned_size(mn, ...)`),
+        # and DeepGEMM's own host check is only `intermediate_hidden % 128 == 0`
+        # (`csrc/apis/mega.hpp`). Those are a different tensor. A K that clears
+        # 128 but not 512 -- e.g. 2304 -- aborts inside
+        # `get_symm_buffer_size_for_mega_moe` before any GEMM runs, so the guard
+        # here is what turns that abort into a backend fallback.
         if p.hidden_size is not None and p.hidden_size % 512 != 0:
             return _reject(
                 MoERejectReason.SHAPE_UNALIGNED,
                 f"MegaMoEDeepGemm requires hidden_size % 512 == 0 "
-                f"(DeepGEMM TMA-aligned packed-UE8M0 SF row); "
+                f"(TMA-aligned packed-UE8M0 SF record in DeepGEMM's dispatch buffer); "
                 f"got hidden_size={p.hidden_size}",
             )
         if p.intermediate_size is not None and p.intermediate_size % 512 != 0:
             return _reject(
                 MoERejectReason.SHAPE_UNALIGNED,
                 f"MegaMoEDeepGemm requires intermediate_size % 512 == 0 "
-                f"(DeepGEMM TMA-aligned packed-UE8M0 SF row); "
+                f"(TMA-aligned packed-UE8M0 SF record in DeepGEMM's dispatch buffer); "
                 f"got intermediate_size={p.intermediate_size}",
             )
         if p.activation_type not in cls.activation_support.kinds:
