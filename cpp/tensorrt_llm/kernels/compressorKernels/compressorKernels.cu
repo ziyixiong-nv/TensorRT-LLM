@@ -198,15 +198,17 @@ struct VecType<16>
 
 // Cache scale / pre-store quantization type for postProcessScatterKernel.
 // The store dtype is implied: kNone keeps the input dtype (elem_bytes
-// controls bf16 vs fp32), kFP8* writes one byte per element, and
-// kMXFP4Blockwise writes packed FP4 (two values per byte) plus per-32
-// UE8M0 scale bytes.
+// controls bf16 vs fp32), kFP8* writes one byte per element, and the FP4
+// types write packed FP4 (two values per byte) plus one scale byte per
+// block -- per-32 UE8M0 for kMXFP4Blockwise, per-16 E4M3 for
+// kNVFP4Blockwise.
 enum class CacheScaleType
 {
     kNone = 0,
-    kFP8PerTensor = 1,  // FP8 E4M3 with static scale=1.0
-    kFP8Blockwise = 2,  // FP8 E4M3 with per-128-element fp32 scales
-    kMXFP4Blockwise = 3 // packed FP4 E2M1 with per-32 UE8M0 scales
+    kFP8PerTensor = 1,   // FP8 E4M3 with static scale=1.0
+    kFP8Blockwise = 2,   // FP8 E4M3 with per-128-element fp32 scales
+    kMXFP4Blockwise = 3, // packed FP4 E2M1 with per-32 UE8M0 scales
+    kNVFP4Blockwise = 4  // packed FP4 E2M1 with per-16 E4M3 scales
 };
 
 // ============================================================================
@@ -1320,6 +1322,8 @@ void prefillReductionLaunch(void const* kv_score, float const* ape, void* paged_
 //   - kFP8Blockwise:      one fp8 byte per value + one fp32 scale per 128 values.
 //   - kMXFP4Blockwise:    packed fp4 (two values per byte) + one ue8m0 byte
 //                         per 32 values.
+//   - kNVFP4Blockwise:    packed fp4 (two values per byte) + one e4m3 byte
+//                         per 16 values (V4.1 tech report §2.4.4).
 //
 // Pipeline (10 steps, all in fp32 registers):
 //   1. Vectorized load compressed token from kv_comp
@@ -1764,6 +1768,84 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
                 = toUe8m0(scale);
         }
     }
+    else if constexpr (SCALE_TYPE == CacheScaleType::kNVFP4Blockwise)
+    {
+        // DeepSeek-V4.1 tech report §2.4.4: E2M1 values with one E4M3 scale per
+        // 16 channels, and deliberately no second-level global scale ("leaves
+        // ample dynamic range... simplifies the cache layout").  Layout matches
+        // kMXFP4Blockwise -- data region then a per-page scale footer -- so the
+        // two differ only in block size and scale encoding.
+        constexpr int GROUP_SIZE = 16 / VEC;
+        constexpr int PACKED_VEC_BYTES = VEC / 2;
+        constexpr float kFp4Max = 6.0f;
+
+        float local_amax = 0.f;
+#pragma unroll
+        for (int i = 0; i < VEC; i++)
+            local_amax = fmaxf(local_amax, fabsf(v[i]));
+
+#pragma unroll
+        for (int offset = GROUP_SIZE / 2; offset > 0; offset >>= 1)
+            local_amax = fmaxf(local_amax, __shfl_xor_sync(0xFFFFFFFF, local_amax, offset));
+
+        // Quantize against the *stored* E4M3 scale, so dequantization is exactly
+        // `codebook[nibble] * scale` with no residual of the pre-rounding value.
+        //
+        // Unlike cvt_warp_fp16_to_fp4 in quantization.cuh this divides rather
+        // than multiplying by rcp.approx.ftz. That op's operand order exists to
+        // match an external reference byte-for-byte; this path has no such
+        // constraint (it quantizes fp32 registers, where that op sees bf16, so
+        // the amax already differs) and IEEE division is both marginally more
+        // accurate and exactly reproducible by the software model the unit test
+        // checks against.
+        __nv_fp8_e4m3 const scale_fp8(local_amax / kFp4Max);
+        float const scale = static_cast<float>(scale_fp8);
+
+        uint8_t fp4_bytes[PACKED_VEC_BYTES];
+        if (scale > 0.f)
+        {
+#pragma unroll
+            for (int i = 0; i < VEC; i += 2)
+                fp4_bytes[i / 2] = packE2M1x2(v[i] / scale, v[i + 1] / scale);
+        }
+        else
+        {
+            // An all-zero block (or one that underflows E4M3) stores as zeros;
+            // dequantization multiplies by a zero scale either way.
+#pragma unroll
+            for (int i = 0; i < PACKED_VEC_BYTES; ++i)
+                fp4_bytes[i] = 0;
+        }
+
+        int const packed_head_dim = HEAD_DIM / 2;
+        uint8_t* fp4_dst = block_base + token_offset * packed_head_dim + tid * PACKED_VEC_BYTES;
+#pragma unroll
+        for (int i = 0; i < PACKED_VEC_BYTES; ++i)
+            fp4_dst[i] = fp4_bytes[i];
+
+        if (tid % GROUP_SIZE == 0)
+        {
+            int const scale_idx = tid / GROUP_SIZE;
+            uint8_t* scale_dst
+                = block_base + tokens_per_block * packed_head_dim + token_offset * num_scale_blocks + scale_idx;
+            *scale_dst = scale_fp8.__x;
+        }
+
+        if (quant_output != nullptr)
+        {
+            uint8_t* fp4_out_dst = reinterpret_cast<uint8_t*>(quant_output)
+                + static_cast<int64_t>(token_idx) * packed_head_dim + tid * PACKED_VEC_BYTES;
+#pragma unroll
+            for (int i = 0; i < PACKED_VEC_BYTES; ++i)
+                fp4_out_dst[i] = fp4_bytes[i];
+        }
+        if (scale_output != nullptr && tid % GROUP_SIZE == 0)
+        {
+            int const scale_idx = tid / GROUP_SIZE;
+            reinterpret_cast<uint8_t*>(scale_output)[static_cast<int64_t>(token_idx) * num_scale_blocks + scale_idx]
+                = scale_fp8.__x;
+        }
+    }
 }
 
 // Explicit instantiations — fused postprocess+scatter.
@@ -1789,6 +1871,8 @@ INST_PPS_AR(128, 2, CacheScaleType::kFP8Blockwise)
 INST_PPS_AR(512, 2, CacheScaleType::kFP8Blockwise)
 INST_PPS_AR(128, 2, CacheScaleType::kMXFP4Blockwise)
 INST_PPS_AR(512, 2, CacheScaleType::kMXFP4Blockwise)
+INST_PPS_AR(128, 2, CacheScaleType::kNVFP4Blockwise)
+INST_PPS_AR(512, 2, CacheScaleType::kNVFP4Blockwise)
 #undef INST_PPS_AR
 #undef INST_PPS
 
@@ -1821,7 +1905,7 @@ void postProcessScatterLaunch(void const* kv_comp, void* kv_out, void const* rms
     }
 
     TLLM_CHECK_WITH_INFO(
-        cache_scale_type >= 0 && cache_scale_type <= 3, "Invalid cache_scale_type: %d", cache_scale_type);
+        cache_scale_type >= 0 && cache_scale_type <= 4, "Invalid cache_scale_type: %d", cache_scale_type);
     auto const cst = static_cast<CacheScaleType>(cache_scale_type);
 
     bool const is_quantized_store = (cst != CacheScaleType::kNone);
@@ -1829,8 +1913,11 @@ void postProcessScatterLaunch(void const* kv_comp, void* kv_out, void const* rms
     int const smem_bytes = head_dim * sizeof(float);
     TLLM_CHECK_WITH_INFO(cst != CacheScaleType::kMXFP4Blockwise || head_dim % 32 == 0,
         "MXFP4 cache requires head_dim divisible by 32, got %d", head_dim);
-    TLLM_CHECK_WITH_INFO(cst != CacheScaleType::kMXFP4Blockwise || head_dim % 2 == 0,
-        "FP4 packed cache requires even head_dim, got %d", head_dim);
+    TLLM_CHECK_WITH_INFO(cst != CacheScaleType::kNVFP4Blockwise || head_dim % 16 == 0,
+        "NVFP4 cache requires head_dim divisible by 16, got %d", head_dim);
+    bool const is_fp4_store = (cst == CacheScaleType::kMXFP4Blockwise || cst == CacheScaleType::kNVFP4Blockwise);
+    TLLM_CHECK_WITH_INFO(
+        !is_fp4_store || head_dim % 2 == 0, "FP4 packed cache requires even head_dim, got %d", head_dim);
     TLLM_CHECK_WITH_INFO(!is_quantized_store || elem_bytes == 2,
         "Quantized cache modes require bf16 compressor output, got elem_bytes=%d", elem_bytes);
 
@@ -1840,6 +1927,7 @@ void postProcessScatterLaunch(void const* kv_comp, void* kv_out, void const* rms
     //   fp8 pertensor:    tpb * HD
     //   fp8 blockwise:    tpb * HD + tpb * (HD/128)*4
     //   mxfp4:            tpb * (HD/2) + tpb * (HD/32)
+    //   nvfp4:            tpb * (HD/2) + tpb * (HD/16)
     int num_scale_blocks = 0;
     int cache_stride_blk_bytes = 0;
     switch (cst)
@@ -1851,6 +1939,10 @@ void postProcessScatterLaunch(void const* kv_comp, void* kv_out, void const* rms
         break;
     case CacheScaleType::kMXFP4Blockwise:
         num_scale_blocks = head_dim / 32;
+        cache_stride_blk_bytes = tokens_per_block * (head_dim / 2) + tokens_per_block * num_scale_blocks;
+        break;
+    case CacheScaleType::kNVFP4Blockwise:
+        num_scale_blocks = head_dim / 16;
         cache_stride_blk_bytes = tokens_per_block * (head_dim / 2) + tokens_per_block * num_scale_blocks;
         break;
     default: cache_stride_blk_bytes = tokens_per_block * head_dim * elem_bytes; break;
@@ -1906,6 +1998,10 @@ void postProcessScatterLaunch(void const* kv_comp, void* kv_out, void const* rms
     else if (cst == CacheScaleType::kMXFP4Blockwise)
     {
         DISPATCH_HD_BF16(CacheScaleType::kMXFP4Blockwise);
+    }
+    else if (cst == CacheScaleType::kNVFP4Blockwise)
+    {
+        DISPATCH_HD_BF16(CacheScaleType::kNVFP4Blockwise);
     }
     else
     {

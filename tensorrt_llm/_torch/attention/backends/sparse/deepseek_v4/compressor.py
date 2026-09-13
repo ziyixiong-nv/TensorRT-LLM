@@ -29,6 +29,10 @@ class KVCacheDtype(IntEnum):
       - FP8_BLOCKWISE:     1 byte per value + 1 fp32 scale per 128 values.
       - MXFP4_BLOCKWISE:   packed FP4 (½ byte per value) + 1 UE8M0 byte per
                            32 values.
+      - NVFP4_BLOCKWISE:   packed FP4 (½ byte per value) + 1 E4M3 byte per
+                           16 values. The V4.1 tech report §2.4.4 main-KV
+                           format; see :mod:`.fp4_kv` for the page layout and
+                           the read side.
 
     Storage size in bytes per logical element is therefore::
 
@@ -37,6 +41,7 @@ class KVCacheDtype(IntEnum):
             FP8_PERTENSOR: 1,
             FP8_BLOCKWISE: 1 + 4 / 128,  # data + fp32 scale
             MXFP4_BLOCKWISE: 0.5 + 1 / 32,  # nibble + ue8m0 byte
+            NVFP4_BLOCKWISE: 0.5 + 1 / 16,  # nibble + e4m3 byte
         }[kv_cache_dtype]
     """
 
@@ -44,6 +49,17 @@ class KVCacheDtype(IntEnum):
     FP8_PERTENSOR = 1  # FP8 E4M3 with implicit scale=1
     FP8_BLOCKWISE = 2  # FP8 E4M3 with per-128 fp32 scales
     MXFP4_BLOCKWISE = 3  # packed FP4 E2M1 with per-32 UE8M0 scales
+    NVFP4_BLOCKWISE = 4  # packed FP4 E2M1 with per-16 E4M3 scales (§2.4.4)
+
+    @property
+    def fp4_scale_block(self) -> Optional[int]:
+        """Channels per scale byte for the packed-FP4 presets, else ``None``.
+
+        The two FP4 layouts are byte-identical apart from this number (and the
+        encoding of the byte itself, which only the kernel and the dequant
+        codebook care about), so every size computation can branch on it.
+        """
+        return {KVCacheDtype.MXFP4_BLOCKWISE: 32, KVCacheDtype.NVFP4_BLOCKWISE: 16}.get(self)
 
 
 _KV_CACHE_DTYPE_MAP = {
@@ -52,6 +68,7 @@ _KV_CACHE_DTYPE_MAP = {
     "fp8_pertensor": KVCacheDtype.FP8_PERTENSOR,
     "fp8_blockwise": KVCacheDtype.FP8_BLOCKWISE,
     "mxfp4": KVCacheDtype.MXFP4_BLOCKWISE,
+    "nvfp4": KVCacheDtype.NVFP4_BLOCKWISE,
 }
 
 
@@ -130,12 +147,12 @@ def postprocess_scatter_compressed(
             scale_output = torch.empty(
                 total_tokens, head_dim // 128, dtype=torch.float32, device=rows.device
             )
-        elif kv_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
+        elif (scale_block := kv_cache_dtype.fp4_scale_block) is not None:
             quant_output = torch.empty(
                 total_tokens, head_dim // 2, dtype=torch.uint8, device=rows.device
             )
             scale_output = torch.empty(
-                total_tokens, head_dim // 32, dtype=torch.uint8, device=rows.device
+                total_tokens, head_dim // scale_block, dtype=torch.uint8, device=rows.device
             )
 
     torch.ops.trtllm.compressor_postprocess_scatter(
@@ -161,7 +178,7 @@ def postprocess_scatter_compressed(
     )
 
     if quant_output is not None:
-        if kv_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
+        if kv_cache_dtype.fp4_scale_block is not None:
             return quant_output.view(torch.float4_e2m1fn_x2), scale_output
         return quant_output.view(torch.float8_e4m3fn), scale_output
     if unquantized_copy is not None:

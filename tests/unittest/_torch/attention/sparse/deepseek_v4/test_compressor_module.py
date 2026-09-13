@@ -2000,6 +2000,16 @@ def test_main_compressor_does_not_materialize_postprocess_output(monkeypatch):
             (1, 64),
             (1, 4),
         ),
+        # Same packed-FP4 data row as MXFP4; only the scale footer is wider
+        # because §2.4.4's preset carries one E4M3 scale per 16 channels
+        # rather than one UE8M0 per 32.
+        (
+            "nvfp4",
+            KVCacheDtype.NVFP4_BLOCKWISE,
+            torch.float4_e2m1fn_x2,
+            (1, 64),
+            (1, 8),
+        ),
     ],
 )
 def test_indexer_returns_fused_quant_outputs(

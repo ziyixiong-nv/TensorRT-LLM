@@ -2211,6 +2211,37 @@ def _mxfp4_reference(x: torch.Tensor, block_size: int = 32) -> tuple[torch.Tenso
     return packed, scales
 
 
+def _nvfp4_reference(x: torch.Tensor, block_size: int = 16) -> tuple[torch.Tensor, torch.Tensor]:
+    """V4.1 tech report §2.4.4: E2M1 values with one E4M3 scale per 16 channels.
+
+    Exactly reproducible rather than approximate: the kernel divides by the
+    *stored* E4M3 scale with IEEE division (not ``rcp.approx.ftz`` as
+    ``quantization.cuh``'s ``cvt_warp_fp16_to_fp4`` does), so a software model
+    can match it byte for byte.
+
+    Assumes ``amax / 6`` is in E4M3's finite range, which holds for any input
+    the compressor sees; the two casts would disagree on saturation otherwise.
+    """
+    assert x.shape[-1] % block_size == 0
+    packed = torch.empty(*x.shape[:-1], x.shape[-1] // 2, device=x.device, dtype=torch.uint8)
+    scales = torch.empty(
+        *x.shape[:-1], x.shape[-1] // block_size, device=x.device, dtype=torch.uint8
+    )
+    for start in range(0, x.shape[-1], block_size):
+        end = start + block_size
+        chunk = x[:, start:end].float()
+        scale_fp8 = (chunk.abs().amax(dim=1, keepdim=True) / 6.0).to(torch.float8_e4m3fn)
+        scale = scale_fp8.to(torch.float32)
+        # A block whose scale underflows to zero stores as zeros: dequantization
+        # multiplies by a zero scale either way, so the nibbles carry no signal.
+        alive = scale > 0
+        q_nibbles = _e2m1_nibbles_reference(chunk / torch.where(alive, scale, 1.0))
+        q_nibbles = torch.where(alive, q_nibbles, torch.zeros_like(q_nibbles))
+        packed[:, start // 2 : end // 2] = q_nibbles[:, 0::2] | (q_nibbles[:, 1::2] << 4)
+        scales[:, start // block_size] = scale_fp8[:, 0].view(torch.uint8)
+    return packed, scales
+
+
 def _setup_fused_test_inputs(
     batch_size, num_tokens, head_dim, nope_dim, rope_dim, tokens_per_block
 ):
@@ -2500,6 +2531,13 @@ def test_fused_postprocess_scatter_fp8_blockwise(
 
 @pytest.mark.parametrize("rotate_activation", [True, False], ids=["rotate", "no_rotate"])
 @pytest.mark.parametrize(
+    "cache_scale_type,scale_block,reference_fn",
+    [
+        pytest.param(3, 32, _mxfp4_reference, id="mxfp4_ue8m0_per32"),
+        pytest.param(4, 16, _nvfp4_reference, id="nvfp4_e4m3_per16"),
+    ],
+)
+@pytest.mark.parametrize(
     "batch_size,num_tokens,head_dim,nope_dim,rope_dim,tokens_per_block",
     [
         pytest.param(1, 16, 128, 64, 64, 32, id="b1_t16_indexer"),
@@ -2511,10 +2549,24 @@ def test_fused_postprocess_scatter_fp8_blockwise(
     not _HAS_POSTPROCESS_SCATTER, reason="Postprocess/scatter CUDA ops not available"
 )
 @skip_pre_blackwell
-def test_fused_postprocess_scatter_mxfp4(
-    batch_size, num_tokens, head_dim, nope_dim, rope_dim, tokens_per_block, rotate_activation
+def test_fused_postprocess_scatter_fp4(
+    batch_size,
+    num_tokens,
+    head_dim,
+    nope_dim,
+    rope_dim,
+    tokens_per_block,
+    cache_scale_type,
+    scale_block,
+    reference_fn,
+    rotate_activation,
 ):
-    """Optimized indexer mode: packed FP4 cache data plus per-32 UE8M0 scale bytes."""
+    """Packed FP4 cache data plus a per-page scale footer.
+
+    Both presets share this test because they share the layout: MXFP4 (the
+    indexer's, per-32 UE8M0) and NVFP4 (§2.4.4's main-KV, per-16 E4M3) differ
+    only in block size and in how the scale byte is encoded.
+    """
     (
         kv_comp,
         rms_weight,
@@ -2533,7 +2585,7 @@ def test_fused_postprocess_scatter_mxfp4(
     )
 
     packed_head_dim = head_dim // 2
-    num_scale_blocks = head_dim // 32
+    num_scale_blocks = head_dim // scale_block
     cache_stride_blk_bytes = (
         tokens_per_block * packed_head_dim + tokens_per_block * num_scale_blocks
     )
@@ -2555,7 +2607,7 @@ def test_fused_postprocess_scatter_mxfp4(
         rotate_activation,
         keep_fp32=True,
     )
-    ref_packed, ref_scales = _mxfp4_reference(ref)
+    ref_packed, ref_scales = reference_fn(ref)
 
     compressed_mask = torch.ones(total_tokens, dtype=torch.bool, device="cuda")
     torch.ops.trtllm.compressor_postprocess_scatter(
@@ -2574,7 +2626,7 @@ def test_fused_postprocess_scatter_mxfp4(
         block_offsets,
         compressed_mask,
         tokens_per_block,
-        3,
+        cache_scale_type,
         rotate_activation,
         fp4_output,
         scale_output,
@@ -2582,7 +2634,7 @@ def test_fused_postprocess_scatter_mxfp4(
     torch.cuda.synchronize()
 
     assert torch.equal(fp4_output, ref_packed), "packed FP4 output bytes must match reference"
-    assert torch.equal(scale_output, ref_scales), "UE8M0 scale bytes must match reference"
+    assert torch.equal(scale_output, ref_scales), "scale footer bytes must match reference"
 
     for b in range(batch_size):
         for t in range(num_tokens):
