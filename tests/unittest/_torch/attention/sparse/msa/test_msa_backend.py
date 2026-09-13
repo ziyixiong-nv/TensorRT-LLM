@@ -282,10 +282,15 @@ def test_msa_paged_hnd_input_materializes_unaligned_outer_stride() -> None:
 
     pages, heads, page_size, head_dim = 5, 2, 128, 128
     outer_stride = heads * page_size * head_dim + 1
-    storage = torch.empty(
-        pages * outer_stride,
-        dtype=torch.float8_e4m3fn,
-        device="cuda",
+    # Deterministic finite bytes rather than `torch.empty`: an uninitialized e4m3fn
+    # buffer can hold 0x7f or 0xff, both of which are NaN, and `assert_close` counts
+    # NaN as unequal -- so this test passed or failed depending on what the caching
+    # allocator had last left in that block. Codes 0..126 are all finite, and cycling
+    # through them makes a wrong stride visible rather than merely possible.
+    storage = (
+        (torch.arange(pages * outer_stride, dtype=torch.int32, device="cuda") % 127)
+        .to(torch.uint8)
+        .view(torch.float8_e4m3fn)
     )
     view = storage.as_strided(
         (pages, heads, page_size, head_dim),
