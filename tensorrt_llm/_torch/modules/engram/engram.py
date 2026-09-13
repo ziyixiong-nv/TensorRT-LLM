@@ -778,6 +778,57 @@ def _bucket_offsets(list_of_N: List[int]) -> torch.Tensor:
     return torch.tensor(offsets, dtype=torch.long)
 
 
+class _CudaArrayInterfaceView:
+    """Adapter that presents a raw device address as a CUDA array to ``torch``.
+
+    ``torch.as_tensor`` consumes ``__cuda_array_interface__`` but has no public
+    entry point taking a bare pointer, and ``typestr`` is a NumPy code -- which
+    has no spelling for either fp8 dtype. Both are single-byte, so the view is
+    published as ``|u1`` and the caller reinterprets it; see ``_uva_device_view``.
+    """
+
+    def __init__(self, ptr: int, shape: Tuple[int, ...]):
+        self.__cuda_array_interface__ = {
+            "shape": tuple(shape),
+            "typestr": "|u1",
+            "data": (int(ptr), False),
+            "strides": None,
+            "version": 3,
+        }
+
+
+def _uva_device_view(host_tensor: torch.Tensor) -> torch.Tensor:
+    """A zero-copy CUDA view of a pinned host tensor, same shape and dtype.
+
+    Under unified virtual addressing -- every 64-bit CUDA platform TensorRT-LLM
+    supports -- page-locked host memory is mapped into the device address space at
+    the *same* address, so ``cudaHostGetDevicePointer`` is an identity and the
+    host ``data_ptr`` can be handed to a kernel directly. That is what makes an
+    offloaded Engram table possible without a custom op: a device-side gather
+    reads the rows it needs over PCIe and nothing else is transferred.
+
+    Restricted to contiguous single-byte tensors. Nothing here needs anything
+    wider, and the ``|u1`` reinterpretation below would silently mis-stride one.
+    """
+    if not host_tensor.is_pinned():
+        raise ValueError(
+            "A UVA device view requires page-locked host memory; this tensor is "
+            "ordinary pageable memory, whose host address is not valid on the device."
+        )
+    if not host_tensor.is_contiguous():
+        raise ValueError("A UVA device view requires a contiguous tensor.")
+    if host_tensor.element_size() != 1:
+        raise ValueError(
+            f"A UVA device view is restricted to single-byte dtypes, got "
+            f"{host_tensor.dtype} ({host_tensor.element_size()} bytes)."
+        )
+    view = torch.as_tensor(
+        _CudaArrayInterfaceView(host_tensor.data_ptr(), host_tensor.shape),
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+    return view.view(host_tensor.dtype)
+
+
 class MultiHeadEmbedding(nn.Module):
     """Multi-head embedding layer with per-head offset handling.
 
@@ -1155,6 +1206,10 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
     end to end), not per head. Head ranges are already disjoint via ``offsets``,
     so one flat shard split is both simpler and better balanced than sharding
     each head's range separately.
+
+    ``cpu_offload`` moves this rank's shard out of HBM into pinned host memory and
+    gathers from it over PCIe (see ``_uva_device_view``), returning the whole
+    ~24.7 GiB per rank to the KV cache pool at the cost of a slower lookup.
     """
 
     def __init__(
@@ -1165,6 +1220,7 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         dtype: Optional[torch.dtype] = None,
         tp_size: int = 1,
         tp_rank: int = 0,
+        cpu_offload: bool = False,
     ):
         super().__init__()
         if D % block_size != 0:
@@ -1179,6 +1235,12 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         self.dtype = dtype if dtype is not None else torch.bfloat16
         self.tp_size = tp_size
         self.tp_rank = tp_rank
+        self.cpu_offload = cpu_offload
+        # Cached device views of the pinned shard, keyed by the host addresses they
+        # were built from so a reallocated parameter cannot leave a stale pointer
+        # behind. Unused when the shard is resident in HBM.
+        self._views: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._views_src: Optional[Tuple[int, int]] = None
 
         self.register_buffer("offsets", _bucket_offsets(list_of_N))
 
@@ -1192,12 +1254,17 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
             self.vocab_start_idx + self.part_num_embeddings, self.num_embeddings
         )
 
+        # Explicitly placed: construction usually runs under a CUDA default-device
+        # context, so an offloaded table has to name "cpu" to stay off the GPU.
+        storage = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
         self.weight = nn.Parameter(
-            torch.empty(self.part_num_embeddings, D, dtype=torch.float8_e4m3fn),
+            torch.empty(self.part_num_embeddings, D, dtype=torch.float8_e4m3fn, **storage),
             requires_grad=False,
         )
         self.scale = nn.Parameter(
-            torch.empty(self.part_num_embeddings, D // block_size, dtype=torch.float8_e8m0fnu),
+            torch.empty(
+                self.part_num_embeddings, D // block_size, dtype=torch.float8_e8m0fnu, **storage
+            ),
             requires_grad=False,
         )
 
@@ -1239,6 +1306,26 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
             else:
                 param.data.copy_(shard.to(param.dtype))
 
+    def storage(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(weight, scale)`` as a device-side gather has to see them.
+
+        Identity for a resident shard. For an offloaded one it is the pair of UVA
+        views over the pinned parameters -- rebuilt only when the parameters have
+        been reallocated, since constructing a view is cheap but not free and this
+        runs on every lookup.
+        """
+        if not self.cpu_offload:
+            return self.weight, self.scale
+        src = (self.weight.data_ptr(), self.scale.data_ptr())
+        if self._views_src != src:
+            self._views = (
+                _uva_device_view(self.weight.data),
+                _uva_device_view(self.scale.data),
+            )
+            self._views_src = src
+        assert self._views is not None
+        return self._views
+
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """``[T, num_heads]`` bucket-local indices -> ``[T, num_heads, D]``.
 
@@ -1256,8 +1343,9 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         # It returns the *drop* mask, already unsqueezed to broadcast over ``D``.
         local, drop = get_masked_input_and_mask(indices, self.vocab_start_idx, self.vocab_end_idx)
 
-        values = torch.nn.functional.embedding(local, self.weight)
-        scales = torch.nn.functional.embedding(local, self.scale)
+        weight, scale = self.storage()
+        values = torch.nn.functional.embedding(local, weight)
+        scales = torch.nn.functional.embedding(local, scale)
         out = values.float().unflatten(-1, (-1, self.block_size)) * scales.float().unsqueeze(-1)
         out = out.flatten(-2).to(self.dtype)
         # In place: ``out`` is this call's own dequant result, so the out-of-place

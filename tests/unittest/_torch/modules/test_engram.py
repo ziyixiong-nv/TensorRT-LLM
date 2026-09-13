@@ -22,7 +22,9 @@ from tensorrt_llm._torch.modules.engram.engram import (
     CompressedTokenizer,
     MultiHeadEmbedding,
     NgramHashMapping,
+    ShardedFp8MultiHeadEmbedding,
     ShortConv,
+    _uva_device_view,
 )
 
 
@@ -741,3 +743,144 @@ class TestEngramHashProviderCudaGraphRefresh:
             provider.compute_hashes(tokens)
         finally:
             torch.cuda.set_sync_debug_mode("default")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+class TestShardedFp8MultiHeadEmbeddingCpuOffload:
+    """The offloaded n-gram table must be the resident one, bit for bit.
+
+    ``cpu_offload=True`` moves the fp8 shard into pinned host memory and gathers
+    from it through a UVA device view instead of out of HBM. That is a storage
+    change only: the dequantized rows, the shard mask and the checkpoint keys are
+    all supposed to be unchanged, so the resident table is the reference and
+    equality is exact -- the same rows are read and the same arithmetic is applied
+    to them.
+    """
+
+    LIST_OF_N = [64, 48, 16]
+    D = 128
+    BLOCK_SIZE = 32
+
+    def _table(self, cpu_offload, tp_size=1, tp_rank=0):
+        # Built under a CUDA default-device context, as the model builder does. The
+        # resident table lands in HBM from the context alone; the offloaded one has
+        # to override it, which is the placement hazard worth exercising here.
+        with torch.device("cuda"):
+            return ShardedFp8MultiHeadEmbedding(
+                list_of_N=self.LIST_OF_N,
+                D=self.D,
+                block_size=self.BLOCK_SIZE,
+                dtype=torch.bfloat16,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                cpu_offload=cpu_offload,
+            )
+
+    def _checkpoint(self, seed=0):
+        """A full-height fp8 table plus its e8m0 scales, as the checkpoint stores it."""
+        gen = torch.Generator().manual_seed(seed)
+        rows = sum(self.LIST_OF_N)
+        # Any e4m3 code except 0x7F/0xFF, which are NaN -- and a NaN on both sides
+        # compares unequal, so seeding them would fail the test without a mismatch.
+        magnitude = torch.randint(0, 127, (rows, self.D), dtype=torch.uint8, generator=gen)
+        sign = torch.randint(0, 2, (rows, self.D), dtype=torch.uint8, generator=gen) << 7
+        weight = (magnitude | sign).view(torch.float8_e4m3fn)
+        # Exponents around 127 (scale 1.0); the extremes would flush the product to
+        # zero or to inf and hide a mismatch behind saturation.
+        scale = torch.randint(
+            120, 135, (rows, self.D // self.BLOCK_SIZE), dtype=torch.uint8, generator=gen
+        ).view(torch.float8_e8m0fnu)
+        return {"weight": weight, "scale": scale}
+
+    def _indices(self, num_tokens=37, seed=1):
+        gen = torch.Generator().manual_seed(seed)
+        cols = [
+            torch.randint(0, n, (num_tokens, 1), dtype=torch.long, generator=gen)
+            for n in self.LIST_OF_N
+        ]
+        return torch.cat(cols, dim=1).cuda()
+
+    @pytest.mark.parametrize("tp_size,tp_rank", [(1, 0), (4, 0), (4, 2), (4, 3)])
+    def test_offloaded_lookup_matches_the_resident_one(self, tp_size, tp_rank):
+        """Exact equality, including the zeroed rows this rank does not own."""
+        checkpoint = self._checkpoint()
+        indices = self._indices()
+
+        resident = self._table(cpu_offload=False, tp_size=tp_size, tp_rank=tp_rank)
+        resident.load_weights([checkpoint])
+        offloaded = self._table(cpu_offload=True, tp_size=tp_size, tp_rank=tp_rank)
+        offloaded.load_weights([checkpoint])
+
+        reference = resident(indices)
+        # Out-of-shard rows are zeroed by design, so at TP=4 most of the reference
+        # is zero. Without this, two all-zero tensors would compare equal and the
+        # test would pass on a table that never loaded.
+        assert reference.count_nonzero() > 0, "reference lookup produced nothing to compare"
+        torch.testing.assert_close(offloaded(indices), reference, atol=0.0, rtol=0.0)
+
+    def test_offloaded_table_holds_no_device_memory(self):
+        """The point of the feature: the parameters are not on the GPU.
+
+        Asserted on the parameters rather than on a memory delta because the
+        allocator's reserved pool makes a delta noisy, and because the failure mode
+        that matters is a parameter silently landing on the device -- a CUDA
+        default-device context during construction, or a stray ``.to(device)``.
+        """
+        offloaded = self._table(cpu_offload=True)
+        for name, param in offloaded.named_parameters():
+            assert param.device.type == "cpu", f"{name} is on {param.device}"
+            assert param.is_pinned(), f"{name} is not page-locked"
+
+        # And the views handed to the gather *are* device tensors over that same
+        # host memory -- a view that quietly copied would defeat the whole feature.
+        weight, scale = offloaded.storage()
+        assert weight.is_cuda and scale.is_cuda
+        assert weight.data_ptr() == offloaded.weight.data_ptr()
+        assert scale.data_ptr() == offloaded.scale.data_ptr()
+        assert (weight.dtype, weight.shape) == (
+            offloaded.weight.dtype,
+            offloaded.weight.shape,
+        )
+        assert (scale.dtype, scale.shape) == (offloaded.scale.dtype, offloaded.scale.shape)
+
+    def test_views_are_cached_but_follow_a_reallocated_parameter(self):
+        """One view per address, and never a stale one.
+
+        The cache exists because ``storage()`` runs on every lookup; the address key
+        exists because a reallocated parameter would otherwise leave the gather
+        reading freed host memory.
+        """
+        offloaded = self._table(cpu_offload=True)
+        first = offloaded.storage()
+        assert offloaded.storage()[0] is first[0], "view rebuilt for an unchanged address"
+
+        replacement = torch.empty_like(offloaded.weight.data, pin_memory=True)
+        assert replacement.data_ptr() != offloaded.weight.data_ptr()
+        offloaded.weight = torch.nn.Parameter(replacement, requires_grad=False)
+        rebuilt = offloaded.storage()
+        assert rebuilt[0] is not first[0]
+        assert rebuilt[0].data_ptr() == offloaded.weight.data_ptr()
+
+    def test_uva_view_rejects_memory_it_cannot_map(self):
+        """Pageable host memory has no device address; saying so beats faulting.
+
+        A pageable pointer handed to a kernel is an illegal access that poisons the
+        whole CUDA context, so this has to be refused in Python.
+        """
+        pageable = torch.empty(4, 8, dtype=torch.float8_e4m3fn)
+        with pytest.raises(ValueError, match="page-locked"):
+            _uva_device_view(pageable)
+
+        with pytest.raises(ValueError, match="contiguous"):
+            _uva_device_view(torch.empty(8, 4, dtype=torch.uint8, pin_memory=True).t())
+
+        with pytest.raises(ValueError, match="single-byte"):
+            _uva_device_view(torch.empty(4, 8, dtype=torch.bfloat16, pin_memory=True))
+
+    def test_resident_default_is_unchanged(self):
+        """``cpu_offload`` defaults off, and the default path never builds a view."""
+        resident = self._table(cpu_offload=False)
+        assert resident.cpu_offload is False
+        assert all(p.is_cuda for p in resident.parameters())
+        weight, scale = resident.storage()
+        assert weight is resident.weight and scale is resident.scale

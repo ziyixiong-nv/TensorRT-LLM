@@ -81,6 +81,7 @@ from ..configs.deepseek_v41 import (
     DeepseekV41QuantLayout,
     assert_weight_layout,
     dense_fp8_requant_enabled,
+    engram_cpu_offload_enabled,
     quant_role_for_weight_key,
 )
 from ..distributed import AllReduce, AllReduceParams, AllReduceStrategy
@@ -249,6 +250,12 @@ class DeepseekV41Engram(Engram):
         Same bucket layout (``list_of_N`` -> ``offsets``), so the indices the
         shared ``EngramHashProvider`` computes are unchanged; only the storage
         and the shard mask differ.
+
+        ``TRTLLM_V41_ENGRAM_CPU_OFFLOAD`` additionally moves the shard off the GPU
+        (see ``engram_cpu_offload_enabled``). It is read here rather than taken as
+        a constructor argument because the offload changes nothing a caller can
+        observe -- same shapes, same values, same checkpoint keys -- so there is
+        nothing for a caller to coordinate with.
         """
         return ShardedFp8MultiHeadEmbedding(
             list_of_N=list_of_N,
@@ -257,6 +264,7 @@ class DeepseekV41Engram(Engram):
             dtype=self.config.dtype,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
+            cpu_offload=engram_cpu_offload_enabled(),
         )
 
     def _make_short_conv(self) -> None:

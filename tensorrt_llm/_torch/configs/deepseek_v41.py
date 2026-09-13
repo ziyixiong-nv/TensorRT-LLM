@@ -491,6 +491,30 @@ def dense_fp8_requant_enabled() -> bool:
     return os.environ.get(_DENSE_FP8_ENV, "0") not in ("0", "", "false", "False")
 
 
+_ENGRAM_CPU_OFFLOAD_ENV = "TRTLLM_V41_ENGRAM_CPU_OFFLOAD"
+
+
+def engram_cpu_offload_enabled() -> bool:
+    """Whether the Engram n-gram tables live in pinned host memory instead of HBM.
+
+    Off by default: the lookup then gathers 264-byte rows over PCIe rather than
+    out of HBM, which is a real per-token cost that only pays for itself when the
+    freed capacity is worth more than the latency.
+
+    The capacity is not small. V4.1's two tables hold ~384M rows of 256 fp8 lanes
+    plus one e8m0 exponent per 32 lanes, so the pair is ~198 GiB whole and
+    ~24.7 GiB per rank at TP=8 -- the single largest resident tensor in the model
+    and, at low TP, the reason it does not fit at all. Offloading returns all of
+    it to the KV cache pool.
+
+    What makes this cheap enough to be worth offering is that
+    ``DeepseekV41Engram.precompute`` already runs the lookup on the Engram side
+    stream, so the PCIe gather overlaps the layers between the hash computation
+    and the first Engram layer, and only two layers do a lookup at all.
+    """
+    return os.environ.get(_ENGRAM_CPU_OFFLOAD_ENV, "0") not in ("0", "", "false", "False")
+
+
 def layout_for_role(
     role: str,
     quantization_config: Optional[Dict[str, Any]] = None,
