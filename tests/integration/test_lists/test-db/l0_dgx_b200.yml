@@ -169,6 +169,10 @@ l0_dgx_b200:
       backend: pytorch
       orchestrator: mpi
   tests:
+  # DeepSeek-V4.1 has 24 Engram hash heads and is served at TP=8, so the head cut is
+  # its default path -- and the all-gather that reassembles the shards is only
+  # exercised at a real world size. Cheap (~70 s) next to the accuracy runs below.
+  - unittest/_torch/multi_gpu/test_engram_sharding.py
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1dp2cp2-overlap_on] TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1tp2cp2-overlap_on] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput] TIMEOUT (60)
