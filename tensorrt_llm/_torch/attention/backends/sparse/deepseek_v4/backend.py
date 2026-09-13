@@ -36,11 +36,11 @@ from .kernels import deepseek_v4_local_to_global_indices
 from .metadata import DeepseekV4TrtllmAttentionMetadata
 from .params import (
     DEEPSEEK_V4_VARIANT,
-    DEEPSEEK_V41_VARIANT,
     DeepseekV4AttentionType,
     DeepSeekV4Params,
     is_compress_layer,
     is_sparse_layer,
+    is_v41,
     owns_compressed_kv,
     owns_index_topk,
     source_layer_for,
@@ -155,7 +155,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
 
         if self.owns_indexer:
             indexer_kwargs = {}
-            if self.variant == DEEPSEEK_V41_VARIANT:
+            if is_v41(self.variant):
                 indexer_cls = DeepseekV41Indexer
                 # V4.1's index keys are a reprojection of the compressed latent, so
                 # only a layer that compresses its own KV can build them
@@ -192,9 +192,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             if quant_config is not None:
                 has_fp8_kv_cache = quant_config.layer_quant_mode.has_fp8_kv_cache()
             kv_cache_dtype = "fp8_pertensor" if has_fp8_kv_cache else "default"
-            compressor_cls = (
-                DeepseekV41Compressor if self.variant == DEEPSEEK_V41_VARIANT else Compressor
-            )
+            compressor_cls = DeepseekV41Compressor if is_v41(self.variant) else Compressor
             self.compressor = compressor_cls(
                 mla_params,
                 layer_idx,

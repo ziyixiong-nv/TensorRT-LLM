@@ -52,13 +52,13 @@ from .params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DEEPSEEK_V4_SPARSE_RATIO,
     DEEPSEEK_V4_VARIANT,
-    DEEPSEEK_V41_VARIANT,
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
     has_compressor_state,
     is_compress_layer,
     is_overlap_compressor,
     is_sparse_layer,
+    is_v41,
     owns_compressed_kv,
     pool_factor,
     source_layer_for,
@@ -1022,7 +1022,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     source_layer_idx, attn_type
                 ]
 
-        if self._variant == DEEPSEEK_V41_VARIANT:
+        if is_v41(self._variant):
             self._add_v41_cache_layers(_add_layer, _alias_layer)
         else:
             self._add_v4_cache_layers(_add_layer)

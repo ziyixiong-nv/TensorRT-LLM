@@ -24,7 +24,7 @@ from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
 from ..params import SparseBackendForwardArgs
 from .flash_mla import DeepSeekV4FlashMLA
-from .params import DEEPSEEK_V4_VARIANT, DEEPSEEK_V41_VARIANT, is_sparse_layer
+from .params import DEEPSEEK_V4_VARIANT, is_sparse_layer, is_v41
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.mla import MLA
@@ -121,9 +121,7 @@ def initialize_sparse_attn(self) -> None:
     )
 
     self.has_dsv4_indexer = _has_dsv4_indexer(self)
-    self.is_dsv41 = (
-        getattr(self.sparse_params, "variant", DEEPSEEK_V4_VARIANT) == DEEPSEEK_V41_VARIANT
-    )
+    self.is_dsv41 = is_v41(getattr(self.sparse_params, "variant", DEEPSEEK_V4_VARIANT))
     # Which layer's top-k this layer uses. V4.1 splits the selection off from the
     # layer that consumes it: only `index_source_layer_ids` run an `Indexer`, and
     # the ~30 indexed layers in between reuse what their source published

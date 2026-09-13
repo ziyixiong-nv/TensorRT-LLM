@@ -19,13 +19,13 @@ from .indexer import DeepseekV4Indexer
 from .params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DEEPSEEK_V4_VARIANT,
-    DEEPSEEK_V41_VARIANT,
     DeepseekV4AttentionType,
     DeepSeekV4MetadataParams,
     compress_ratio_has_attention,
     is_compress_layer,
     is_dense_compress_layer,
     is_sparse_layer,
+    is_v41,
     pool_factor,
     swa_only_ratio,
 )
@@ -100,7 +100,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # guarantees stable specialization keys.
         self._compress_ratios_sorted = sorted(self.compress_ratio_set)
         self._swa_only_ratio = swa_only_ratio(self.variant)
-        _supported_ratios = {0, 1, 2} if self.variant == DEEPSEEK_V41_VARIANT else {1, 4, 128}
+        _supported_ratios = {0, 1, 2} if is_v41(self.variant) else {1, 4, 128}
         _unsupported = self.compress_ratio_set - _supported_ratios
         assert not _unsupported, (
             f"Unsupported compress ratios {_unsupported} for variant {self.variant!r}. "

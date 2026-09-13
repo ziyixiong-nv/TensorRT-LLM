@@ -23,6 +23,28 @@ DEEPSEEK_V41_VARIANT = "v41"
 DEEPSEEK_V4_VARIANTS = (DEEPSEEK_V4_VARIANT, DEEPSEEK_V41_VARIANT)
 
 
+def is_v41(variant: str) -> bool:
+    """Whether ``variant`` selects V4.1 — raising on anything unrecognized.
+
+    Every variant-dependent predicate in this module reads as "V4.1 does X,
+    otherwise do what V4 did", so an unrecognized string does not fail: it
+    silently reinterprets a V4.1 model under V4 semantics. That is the worst
+    available outcome, because the two disagree on what a compress ratio *means*
+    (see the note above ``DEEPSEEK_V4_VARIANT``): a V4.1 ratio of 2 is a pooling
+    factor, but ``is_sparse_layer`` under V4 tests ``== 4``, so it goes false on
+    every layer and disables the indexer model-wide with no error anywhere.
+    Funnelling the comparison through here makes that a startup exception
+    instead.
+    """
+    if variant == DEEPSEEK_V41_VARIANT:
+        return True
+    if variant == DEEPSEEK_V4_VARIANT:
+        return False
+    raise ValueError(
+        f"Unknown DeepSeek-V4 variant {variant!r}; expected one of {DEEPSEEK_V4_VARIANTS}."
+    )
+
+
 class DeepseekV4AttentionType(Enum):
     """DeepSeek-V4 cache roles."""
 
@@ -81,7 +103,7 @@ def swa_only_ratio(variant: str = DEEPSEEK_V4_VARIANT) -> int:
     long-range layer. Several tables are keyed by ratio and need an entry for
     the SWA-only layers, so the sentinel has to be nameable.
     """
-    return 0 if variant == DEEPSEEK_V41_VARIANT else 1
+    return 0 if is_v41(variant) else 1
 
 
 def is_dense_compress_layer(compress_ratio: int, variant: str = DEEPSEEK_V4_VARIANT) -> bool:
@@ -105,7 +127,7 @@ def is_overlap_compressor(compress_ratio: int, variant: str = DEEPSEEK_V4_VARIAN
     one ``[max_batch, ratio, head_dim]`` group (model.py:452), so no V4.1 layer
     is an overlap compressor.
     """
-    if variant == DEEPSEEK_V41_VARIANT:
+    if is_v41(variant):
         return False
     return compress_ratio == DEEPSEEK_V4_OVERLAP_COMPRESSOR_RATIO
 
@@ -122,7 +144,7 @@ def is_sparse_layer(compress_ratio: int, variant: str = DEEPSEEK_V4_VARIANT) -> 
     top-k computation, but the keys they score live in the cache owned by the
     nearest preceding KV source, and every long-range layer reads a selection.
     """
-    if variant == DEEPSEEK_V41_VARIANT:
+    if is_v41(variant):
         return compress_ratio > 0
     return compress_ratio == DEEPSEEK_V4_SPARSE_RATIO
 
@@ -208,7 +230,7 @@ def is_compress_layer(compress_ratio: int, variant: str = DEEPSEEK_V4_VARIANT) -
     cache (``compress_len = (start_pos + seqlen) // 1``); there the test is
     truthiness, matching model.py:775.
     """
-    if variant == DEEPSEEK_V41_VARIANT:
+    if is_v41(variant):
         return compress_ratio > 0
     return compress_ratio > 1
 
@@ -223,7 +245,7 @@ def has_compressor_state(compress_ratio: int, variant: str = DEEPSEEK_V4_VARIANT
     A ratio-1 layer that allocated compressor-state cache would reserve memory
     the kernels never touch.
     """
-    if variant == DEEPSEEK_V41_VARIANT:
+    if is_v41(variant):
         return compress_ratio > 1
     return is_compress_layer(compress_ratio, variant)
 
@@ -241,7 +263,7 @@ def compress_ratio_has_attention(
     # `wq_b`, `weights_proj`, and — on a KV source — `wk`/`k_norm`/`k_cache`),
     # because its keys are derived from the main compressor's latent. So the two
     # INDEXER_COMPRESSOR_* roles are V4-only.
-    has_indexer_state = is_sparse and variant != DEEPSEEK_V41_VARIANT
+    has_indexer_state = is_sparse and not is_v41(variant)
 
     if attn_type == DeepseekV4AttentionType.SWA:
         return True
