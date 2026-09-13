@@ -84,6 +84,18 @@ except Exception as _e:
     mhc_fused_hc_cuda = None
     mhc_gemm_rms_fma_cuda = None
 
+# Deliberately a separate guard from the block above: triton availability is
+# orthogonal to whether libth_common's mHC ops loaded, and folding the two
+# together would drop the fused tail whenever an unrelated CUDA op is missing.
+try:
+    from tensorrt_llm._torch.modules.mhc.mhc_triton import (
+        mhc_coeff_tail_triton,
+        mhc_collapse_triton,
+    )
+except Exception:
+    mhc_coeff_tail_triton = None
+    mhc_collapse_triton = None
+
 
 class mHC(nn.Module):
     def __init__(
@@ -183,13 +195,25 @@ class mHC(nn.Module):
     # ops, which is why V4.1 needs the methods below rather than a flag on
     # ``pre_mapping``.
     #
-    # Correctness first: the mixer GEMM + row sqrsum still goes through the
-    # ``mhc_gemm_sqrsum_fma`` kernel (identical to what ``pre_mapping``'s FMA
-    # tactic feeds ``mhc_big_fuse``), while the ``[M, mult]`` / ``[M, mult,
-    # mult]`` Sinkhorn tail and the collapse run in torch. Those tails are tiny
-    # next to the ``K = mult * hidden_size`` projection. Every pre-existing
-    # method is left untouched, so the V4 path keeps its exact kernels and
-    # numerics and only V4.1 pays the unfused cost.
+    # The mixer GEMM + row sqrsum goes through the ``mhc_gemm_sqrsum_fma`` kernel
+    # (identical to what ``pre_mapping``'s FMA tactic feeds ``mhc_big_fuse``).
+    # The ``[M, mult]`` / ``[M, mult, mult]`` Sinkhorn tail and the collapse then
+    # go through ``mhc_triton``, one kernel each.
+    #
+    # They used to run as eager torch, on the assumption that tails on
+    # ``[M, 4]`` / ``[M, 4, 4]`` tensors are negligible next to the
+    # ``K = mult * hidden_size`` projection. That was wrong, and not marginally:
+    # the cost is launch count, not arithmetic. At ``sinkhorn_iters = 20`` the
+    # tail is ~129 launches (114 of them the 19 row/column normalize pairs) plus
+    # ~13 for the collapse, and ``pre_mapping_lagged`` runs twice per layer --
+    # ~296 launches per layer, ~10.8k per forward at 40 layers. Tech-report §3.2
+    # budgets 15 kernels for a whole Reuse-Mode prefill layer and 11 for decode,
+    # and names the fused form ("Mega-mHC") as one of the kernels that gets V4.1
+    # there. Fusing each tail into a single kernel takes the pair from ~148
+    # launches per sublayer to 2.
+    #
+    # Every pre-existing method is left untouched and the eager tail remains the
+    # fallback, so the V4 path keeps its exact kernels and numerics.
 
     def mixer_projection(self, x: torch.Tensor) -> torch.Tensor:
         """RMS-scaled mixer projection: ``[..., mult, hidden] -> [M, mix_hc]`` fp32.
@@ -200,6 +224,19 @@ class mHC(nn.Module):
 
             mixes = F.linear(x.flatten(2).float(), fn) * rsqrt(mean(x ^ 2) + norm_eps)
         """
+        y_acc, r_acc = self._mixer_gemm(x)
+        # r_acc is the row sum of squares; the reference normalizes by the mean.
+        rsqrt = torch.rsqrt(r_acc / self.hc_dim + self.norm_eps).unsqueeze(-1)
+        return y_acc * rsqrt
+
+    def _mixer_gemm(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The mixer GEMM and row sum of squares, *before* the per-token rsqrt.
+
+        Split out of :meth:`mixer_projection` because the fused tail in
+        :meth:`hc_coeffs` applies that rsqrt inside its own kernel, so it needs
+        the raw accumulator. :meth:`mixer_projection` is unchanged: it is this
+        plus the same rsqrt it always applied.
+        """
         x_flat = x.reshape(-1, self.mult, self.hidden_size)
         m = x_flat.shape[0]
         x_2d = x_flat.reshape(m, self.hc_dim).contiguous()
@@ -207,15 +244,12 @@ class mHC(nn.Module):
 
         if _cuda_available and mhc_gemm_rms_fma_cuda is not None and x_2d.is_cuda:
             # w_t is [N, K] == [mix_hc, hc_dim], i.e. ``self.fn`` as stored.
-            y_acc, r_acc = mhc_gemm_rms_fma_cuda(x_2d, None, m, self.mix_hc, self.hc_dim, w_t=w_t)
-        else:
-            x_fp32 = x_2d.to(torch.float32)
-            y_acc = torch.nn.functional.linear(x_fp32, w_t)
-            r_acc = x_fp32.square().sum(-1)
+            return mhc_gemm_rms_fma_cuda(x_2d, None, m, self.mix_hc, self.hc_dim, w_t=w_t)
 
-        # r_acc is the row sum of squares; the reference normalizes by the mean.
-        rsqrt = torch.rsqrt(r_acc / self.hc_dim + self.norm_eps).unsqueeze(-1)
-        return y_acc * rsqrt
+        # One upcast feeds both outputs -- `x_2d.to(float32)` twice would double
+        # the peak fp32 footprint at prefill token counts.
+        x_fp32 = x_2d.to(torch.float32)
+        return torch.nn.functional.linear(x_fp32, w_t), x_fp32.square().sum(-1)
 
     def split_sinkhorn(
         self, mixes: torch.Tensor
@@ -260,7 +294,23 @@ class mHC(nn.Module):
         ``pre_mix`` feeds :meth:`collapse` unchanged.
         """
         outer_shape = x.shape[:-2]
-        pre, post, comb = self.split_sinkhorn(self.mixer_projection(x))
+        if mhc_coeff_tail_triton is not None and x.is_cuda:
+            y_acc, r_acc = self._mixer_gemm(x)
+            pre, post, comb = mhc_coeff_tail_triton(
+                y_acc,
+                r_acc,
+                self.scale,
+                self.base,
+                self.mult,
+                self.hc_dim,
+                self.norm_eps,
+                self.eps,
+                self.sinkhorn_eps,
+                self.post_mult_value,
+                self.sinkhorn_iters,
+            )
+        else:
+            pre, post, comb = self.split_sinkhorn(self.mixer_projection(x))
         return (
             pre.view(*outer_shape, self.mult, 1),
             post.view(*outer_shape, self.mult, 1),
@@ -309,8 +359,11 @@ class mHC(nn.Module):
         assert self.hidden_size == x.shape[-1]
 
         pre_own, post_mix, comb_mix = self.hc_coeffs(x)
-        pre_mix = pre_mix.reshape(*x.shape[:-2], self.mult, 1).to(torch.float32)
-        layer_input = self.collapse(x, pre_mix)
+        if mhc_collapse_triton is not None and x.is_cuda:
+            layer_input = mhc_collapse_triton(x, pre_mix)
+        else:
+            pre_mix = pre_mix.reshape(*x.shape[:-2], self.mult, 1).to(torch.float32)
+            layer_input = self.collapse(x, pre_mix)
         return pre_own, post_mix, comb_mix, layer_input
 
     def fused_hc(

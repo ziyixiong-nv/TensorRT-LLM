@@ -99,6 +99,11 @@ pytestmark = pytest.mark.skipif(
 # transcription itself, which is bit-exact.
 KERNEL_TOL = dict(rtol=1e-4, atol=1e-4)
 FALLBACK_TOL = dict(rtol=1e-7, atol=1e-7)
+# The Triton tail folds `mixer_projection`'s rsqrt into its own kernel and keeps
+# the whole Sinkhorn loop in registers, so its residual against the reference is
+# a different quantity from the GEMM's accumulation order -- pinned separately
+# rather than folded into KERNEL_TOL, so a regression in either is attributable.
+TRITON_TOL = dict(rtol=1e-06, atol=1e-06)
 
 
 def _reference_coeffs(
@@ -215,14 +220,30 @@ def _residual(num_tokens: int, hidden_size: int = HIDDEN_SIZE, seed: int = 1) ->
     ).bfloat16()
 
 
-def _coeffs_without_the_fma_kernel(module: mHC, x: torch.Tensor):
-    """``hc_coeffs`` with ``mixer_projection`` forced onto its torch fallback."""
-    saved = hyper_connection.mhc_gemm_rms_fma_cuda
-    hyper_connection.mhc_gemm_rms_fma_cuda = None
+def _coeffs_with(module: mHC, x: torch.Tensor, *, triton: bool, fma: bool):
+    """``hc_coeffs`` with each optional fast path independently forced off.
+
+    Both have to be controllable separately because they are three different
+    numerics, not one: the Triton tail folds ``mixer_projection``'s rsqrt into
+    its own kernel and runs the Sinkhorn loop in registers, the FMA kernel
+    changes the GEMM's accumulation order over ``K = 20480``, and with both off
+    the path is a bit-exact transcription of the reference. Nulling only the FMA
+    symbol -- which is all this helper used to do -- would leave the "torch
+    fallback" row running Triton, i.e. silently stop testing the one tactic
+    ``FALLBACK_TOL``'s bit-exactness applies to.
+    """
+    saved = (hyper_connection.mhc_coeff_tail_triton, hyper_connection.mhc_gemm_rms_fma_cuda)
+    if not triton:
+        hyper_connection.mhc_coeff_tail_triton = None
+    if not fma:
+        hyper_connection.mhc_gemm_rms_fma_cuda = None
     try:
         return module.hc_coeffs(x)
     finally:
-        hyper_connection.mhc_gemm_rms_fma_cuda = saved
+        (
+            hyper_connection.mhc_coeff_tail_triton,
+            hyper_connection.mhc_gemm_rms_fma_cuda,
+        ) = saved
 
 
 def _assert_bf16_within_one_ulp(actual: torch.Tensor, expected: torch.Tensor, what: str):
@@ -254,9 +275,21 @@ def _assert_coeffs_match_reference(module: mHC, x: torch.Tensor, what: str):
         x, module.fn, module.base, module.scale, mult=module.mult, norm_eps=RMS_NORM_EPS
     )
 
+    # All four combinations, so a failure localizes to one stage. The
+    # `triton tail only` row is the informative one for the tail itself: it runs
+    # the Triton tail on the exact-accumulation torch GEMM, so whatever it shows
+    # is the tail's own error with the GEMM's contribution removed -- 2.4e-07,
+    # hence TRITON_TOL. The combined row is bounded by the *GEMM*, not the tail:
+    # its residual (7.7e-06) is the `fma kernel` row's (7.7e-06) to two digits,
+    # because K = mult * hidden_size = 20480 terms of accumulation reordering
+    # dwarf a tail that never leaves registers. So it carries KERNEL_TOL, and
+    # TRITON_TOL stays a bound on the tail alone rather than being quietly
+    # relaxed to cover something it does not measure.
     for tactic, coeffs, tol in (
-        ("fma kernel", module.hc_coeffs(x), KERNEL_TOL),
-        ("torch fallback", _coeffs_without_the_fma_kernel(module, x), FALLBACK_TOL),
+        ("triton tail + fma kernel", _coeffs_with(module, x, triton=True, fma=True), KERNEL_TOL),
+        ("triton tail only", _coeffs_with(module, x, triton=True, fma=False), TRITON_TOL),
+        ("fma kernel", _coeffs_with(module, x, triton=False, fma=True), KERNEL_TOL),
+        ("torch fallback", _coeffs_with(module, x, triton=False, fma=False), FALLBACK_TOL),
     ):
         pre, post, comb = coeffs
         for name, got, ref in (
@@ -273,6 +306,67 @@ def _assert_coeffs_match_reference(module: mHC, x: torch.Tensor, what: str):
     # to doubly stochastic, which is why that check cannot live here.)
     columns = comb_ref.sum(dim=-2)
     torch.testing.assert_close(columns, torch.ones_like(columns), rtol=0, atol=1e-5)
+
+
+@pytest.mark.skipif(hyper_connection.mhc_coeff_tail_triton is None, reason="triton unavailable")
+def test_fused_tail_collapses_the_launch_count():
+    """The property the fusion exists for, asserted rather than assumed.
+
+    Tech-report §3.2 budgets 15 kernels for an entire Reuse-Mode prefill layer
+    and 11 for decode. The eager tail alone spends ~129 on ``[M, 4]`` /
+    ``[M, 4, 4]`` tensors -- 114 of them the 19 Sinkhorn row/column normalize
+    pairs -- and ``pre_mapping_lagged`` runs twice per layer, so at 40 layers
+    that is ~10.8k launches per forward. Correct numerics with the launch count
+    intact would be a silent non-fix, hence a test on the count itself.
+
+    The bounds are deliberately loose: the point is the order of magnitude, and a
+    tight bound would fail on any harmless op-order change in the eager path.
+    """
+    module = _build_mhc()
+    x = _residual(8)
+
+    def count(fn) -> int:
+        fn()  # warm up: the first Triton call JIT-compiles, the first torch call
+        torch.cuda.synchronize()  # may allocate -- neither belongs in the count
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+            fn()
+            torch.cuda.synchronize()
+        return sum(int(e.count) for e in prof.key_averages() if e.device_time_total > 0)
+
+    fused = count(lambda: _coeffs_with(module, x, triton=True, fma=True))
+    eager = count(lambda: _coeffs_with(module, x, triton=False, fma=True))
+    assert fused <= 8, f"fused tail launched {fused} kernels, expected a handful"
+    assert eager > 100, (
+        f"eager tail launched only {eager} kernels -- if it is genuinely that "
+        f"cheap now, this test and the comment in hyper_connection.py are stale"
+    )
+
+
+@pytest.mark.skipif(hyper_connection.mhc_collapse_triton is None, reason="triton unavailable")
+@pytest.mark.parametrize("num_tokens", [1, 17, 4096])
+def test_fused_collapse_is_bit_identical_to_eager(num_tokens: int):
+    """The fused collapse must be a drop-in, not merely a close approximation.
+
+    ``mhc_collapse_triton`` passes ``enable_fp_fusion=False`` so its accumulation
+    stays a separate fp32 multiply and add, matching ``mHC.collapse``. Without
+    that, the compiler contracts each step into an FMA: still correct — measured
+    against fp64 the FMA form is if anything slightly *more* accurate — but no
+    longer bit-identical, which would mean switching a layer onto the fused path
+    could shift logits. Equality is the property worth having, so assert it
+    directly rather than bounding the difference; a tolerance here would pass
+    just as well with the contraction back on.
+
+    4096 tokens is in the list because the disagreement the contraction produces
+    is rare (~4e-5 of elements) — a small shape would not see it.
+    """
+    module = _build_mhc(hidden_size=REAL_HIDDEN_SIZE)
+    x = _residual(num_tokens, hidden_size=REAL_HIDDEN_SIZE)
+    pre_mix = _reference_coeffs(
+        x, module.fn, module.base, module.scale, mult=module.mult, norm_eps=RMS_NORM_EPS
+    )[0]
+
+    fused = hyper_connection.mhc_collapse_triton(x, pre_mix)
+    torch.testing.assert_close(fused, module.collapse(x, pre_mix), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 17, 128])
@@ -351,7 +445,17 @@ def test_sinkhorn_asymmetry_and_iteration_count_on_release_weights():
         return c
 
     # `sinkhorn_iters = 20` means 19 pairs, exactly.
-    torch.testing.assert_close(comb, tail(SINKHORN_ITERS - 1), rtol=0, atol=0)
+    #
+    # Not `atol=0`: `hc_coeffs` runs the whole tail inside one Triton kernel, in
+    # registers, while `tail()` above is eager torch, so the two round differently
+    # (~1.2e-07 absmax here, about one fp32 ULP at these magnitudes). Bit-exactness
+    # was never the property under test -- it was an accident of both sides having
+    # been the same torch ops. What is under test is the *separation* below, and
+    # `SEP` is checked against it directly: the nearest wrong variant is 3.7e-03
+    # away, so any bound between fp32 noise and that gap has identical detecting
+    # power, and this one keeps four orders of margin on both sides.
+    SEP = 1e-6
+    torch.testing.assert_close(comb, tail(SINKHORN_ITERS - 1), rtol=0, atol=SEP)
     for wrong, label in (
         (tail(SINKHORN_ITERS - 2), "18 pairs"),
         (tail(SINKHORN_ITERS), "20 pairs"),
@@ -360,6 +464,13 @@ def test_sinkhorn_asymmetry_and_iteration_count_on_release_weights():
     ):
         delta = (wrong - comb).abs().max().item()
         assert delta > 1e-3, f"{label} is indistinguishable ({delta:.3e}) — gate is blind"
+        # The above pins the variant deltas in absolute terms; this pins them
+        # relative to the tolerance the match is accepted at, which is what
+        # actually decides whether the gate can still tell them apart.
+        assert delta > 100 * SEP, (
+            f"{label} ({delta:.3e}) is within 100x the match tolerance ({SEP:.0e}) — "
+            f"loosening the tolerance any further would blind this gate"
+        )
 
 
 @requires_release_checkpoint
