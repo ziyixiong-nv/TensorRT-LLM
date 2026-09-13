@@ -1275,29 +1275,28 @@ def test_fusions_require_fp8_kv_cache(has_fp8_kv_cache: bool) -> None:
     assert _is_fused_q_fp8_quant_enabled(mla, num_generations=1, num_contexts=0) is has_fp8_kv_cache
 
 
-def test_fused_q_path_is_off_without_the_per_head_query_norm() -> None:
-    """V4.1 deletes the per-head query norm, and the fused Q kernel always applies it.
+def test_fused_q_path_survives_a_missing_per_head_query_norm() -> None:
+    """A module with no per-head query norm (V4.1) keeps the fused Q path.
 
-    `deepseek_v4_q_norm_fused_fp8` folds norm + RoPE + FP8 quant into one launch with
-    no way to skip the norm, so a module whose `q_b_layernorm` is `None` must report
-    the fused Q path off rather than normalize a query V4.1 does not normalize. That
-    is a correctness gate, not a perf choice: the fallback costs the whole fused
-    prologue (`_is_fused_prologue_active` couples the two folds), which is the cheaper
-    of the two mistakes.
+    `deepseek_v4_q_norm_fused_fp8` takes `apply_norm`, so `q_b_layernorm is None`
+    means "pass False", not "fall back". The distinction is expensive: the two folds
+    are coupled by `_is_fused_prologue_active`, so declining on the Q side drops the
+    KV fold with it -- an un-fused RoPE and a separate quant pass per layer.
     """
     mla = _make_mla(has_fp8_kv_cache=True, has_q_b_layernorm=False)
 
-    assert _is_fused_q_fp8_quant_enabled(mla, num_generations=1, num_contexts=0) is False
-    # The KV predicate still says yes, so the absent query norm is what turned the Q
-    # fold off -- not the geometry or the cache dtype, which both still qualify.
+    assert mla.q_b_layernorm is None
+    assert _is_fused_q_fp8_quant_enabled(mla, num_generations=1, num_contexts=0) is True
     assert _is_fused_kv_norm_enabled(mla, num_generations=1) is True
-    # And the coupling carries it: the whole prologue stays off with specs available.
     assert (
         _is_fused_prologue_active(
             mla, num_contexts=0, num_generations=1, rope_specs=[("dummy", None, 1, None)]
         )
-        is False
+        is True
     )
+    # The FP8 KV cache is still the gate, so the predicate has something left to say.
+    mla.mqa.has_fp8_kv_cache = False
+    assert _is_fused_q_fp8_quant_enabled(mla, num_generations=1, num_contexts=0) is False
 
 
 def test_kv_norm_fusion_needs_the_full_width_weight() -> None:
@@ -1446,12 +1445,20 @@ def _make_cos_sin(device: torch.device) -> torch.Tensor:
 
 
 def _reference(
-    q: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, num_heads: int
+    q: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    num_heads: int,
+    apply_norm: bool = True,
 ) -> torch.Tensor:
-    """RMS-norm over the whole 512-wide head, rotate the tail, scale for FP8."""
+    """RMS-norm over the whole 512-wide head, rotate the tail, scale for FP8.
+
+    `apply_norm=False` is the norm-less model: the norm carries no learned weight,
+    so dropping it is exactly an inverse-RMS of 1.
+    """
     num_tokens = q.shape[0]
     x = q.view(num_tokens, num_heads, HEAD_DIM).float()
-    inv_rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + EPS)
+    inv_rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + EPS) if apply_norm else 1.0
     normed = x * inv_rms
 
     nope = normed[..., :NOPE_DIM] * QUANT_SCALE
@@ -1469,7 +1476,7 @@ def _reference(
     return torch.cat([nope, rotated * QUANT_SCALE], dim=-1)
 
 
-def _run_op(q, num_heads, cos_sin, cache_seq_lens, seq_len, cu_q_seqlens):
+def _run_op(q, num_heads, cos_sin, cache_seq_lens, seq_len, cu_q_seqlens, apply_norm=True):
     num_tokens = q.shape[0]
     quant_q = torch.zeros(
         (num_tokens, num_heads * HEAD_DIM), dtype=torch.float8_e4m3fn, device=q.device
@@ -1492,6 +1499,7 @@ def _run_op(q, num_heads, cos_sin, cache_seq_lens, seq_len, cu_q_seqlens):
         cache_seq_lens,
         seq_len,
         cu_q_seqlens,
+        apply_norm,
     )
     return quant_q, q_pe
 
@@ -1590,3 +1598,44 @@ def test_fused_rope_context_positions(num_heads: int, cached_offset: int) -> Non
     )
     reference = _reference(q, cos_sin, positions.long(), num_heads)
     _assert_matches(quant_q, q_pe, reference, num_heads)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("apply_norm", [True, False], ids=["with_norm", "without_norm"])
+def test_fused_rope_without_the_query_norm(apply_norm: bool) -> None:
+    """The RoPE fold and `apply_norm=False` compose, which V4.1 needs together.
+
+    V4.1 deleted V4's per-head query norm but keeps everything else about the
+    prologue, so it reaches this kernel through the rotate-into-quant_q path with
+    the norm switched off. That path scales by the norm factor on separate lines
+    from the nope quant -- once for the rotated pairs, once for the pass-through
+    tail -- so covering the no-RoPE case alone would leave it untested.
+
+    Both settings run, because the flag is a trailing defaulted argument: a wiring
+    mistake that ignores it would leave `without_norm` matching the *norming*
+    reference, and only comparing against both catches that.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    num_heads, seq_len, num_seqs = 4, 2, 3
+    num_tokens = num_seqs * seq_len
+
+    q = torch.randn((num_tokens, num_heads * HEAD_DIM), dtype=torch.bfloat16, device=device)
+    cos_sin = _make_cos_sin(device)
+    cache_seq_lens = torch.tensor([16, 40, 71], dtype=torch.int32, device=device)
+
+    quant_q, q_pe = _run_op(
+        q, num_heads, cos_sin, cache_seq_lens, seq_len, None, apply_norm=apply_norm
+    )
+
+    token = torch.arange(num_tokens, device=device)
+    positions = (cache_seq_lens[token // seq_len] - seq_len + (token % seq_len)).long()
+    _assert_matches(
+        quant_q, q_pe, _reference(q, cos_sin, positions, num_heads, apply_norm), num_heads
+    )
+
+    other = _reference(q, cos_sin, positions, num_heads, not apply_norm)
+    got = quant_q.view(num_tokens, num_heads, HEAD_DIM).float()
+    assert not torch.equal(got, other.to(torch.float8_e4m3fn).float()), (
+        f"apply_norm={apply_norm} matched the other setting's reference -- the flag is inert"
+    )

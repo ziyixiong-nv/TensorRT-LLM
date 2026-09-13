@@ -480,25 +480,37 @@ def test_v41_builds_no_per_head_query_norm_and_the_flag_is_what_decides() -> Non
 
 @pytest.mark.skip_less_device_memory(40000)
 @skip_blackwell_geforce
-def test_the_fused_fp8_query_prologue_refuses_to_run_without_the_norm() -> None:
-    """``deepseek_v4_q_norm_fused_fp8`` always normalizes, so V4.1 must not reach it.
+def test_the_fused_fp8_query_prologue_runs_without_the_norm() -> None:
+    """V4.1's missing query norm must not cost it the fused FP8 prologue.
 
-    This is the coupling that is easy to lose. The fused kernel folds norm + RoPE +
-    FP8 quant into one launch and has no "skip the norm" flag, so a model without
-    the per-head query norm cannot use it -- and because
-    ``_is_fused_prologue_active`` requires the Q and KV folds together, the gate has
-    to be checked on the Q side or the KV fold silently leaves a raw latent behind.
-    Restoring the fused path for V4.1 is a C++ change; until then this must hold.
+    ``deepseek_v4_q_norm_fused_fp8`` takes ``apply_norm``, so the norm-less model
+    reaches the same kernel with the RMS scale made an identity. What this test
+    protects is that the *gate* knows that: it used to refuse on
+    ``q_b_layernorm is None``, and because ``_is_fused_prologue_active`` requires
+    the Q and KV folds together, refusing on the Q side dropped the whole prologue
+    -- an un-fused RoPE plus a separate quant pass per layer.
+
+    Only the KV-cache dtype should decide. The tiny config here is BF16-KV, which
+    is exactly how this stayed invisible: the gate returns False either way, so
+    asserting False proves nothing. Hence both dtypes, on the same module.
     """
     model_config, _ = _tiny_v41_model_config(tokens_per_block=128)
     model = DeepseekV41ForCausalLM(model_config).to(torch.device("cuda"))
     attn = model.model.layers[0].self_attn
     assert attn.q_b_layernorm is None
-    assert _is_fused_q_fp8_quant_enabled(attn, num_generations=0, num_contexts=1) is False
-    assert _is_fused_q_fp8_quant_enabled(attn, num_generations=1, num_contexts=0) is False
-    assert (
-        _is_fused_prologue_active(attn, rope_specs=[object()], num_generations=1, num_contexts=0)
-        is False
+    # The fold's kernel is instantiated for one geometry, and V4.1 shares V4's.
+    assert (attn.qk_head_dim, attn.kv_lora_rank, attn.qk_rope_head_dim) == (512, 448, 64)
+    assert attn.kv_a_layernorm.weight.shape[0] == 512, (
+        "V4.1 still norms the whole latent; the KV fold's kernel assumes that width"
     )
+
+    phases = ({"num_contexts": 1, "num_generations": 0}, {"num_contexts": 0, "num_generations": 1})
+    for has_fp8_kv_cache in (False, True):
+        attn.mqa.has_fp8_kv_cache = has_fp8_kv_cache
+        for phase in phases:
+            assert _is_fused_q_fp8_quant_enabled(attn, **phase) is has_fp8_kv_cache
+            assert (
+                _is_fused_prologue_active(attn, rope_specs=[object()], **phase) is has_fp8_kv_cache
+            )
     del model
     torch.cuda.empty_cache()

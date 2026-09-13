@@ -464,15 +464,11 @@ def _is_fused_q_fp8_quant_enabled(
         return False
     if self.qk_head_dim != 512 or self.kv_lora_rank != 448:
         return False
-    # `deepseek_v4_q_norm_fused_fp8` folds norm + RoPE + FP8 quant into one kernel
-    # and always normalizes, so a model without the per-head Q norm (V4.1) cannot
-    # use it. Falling back costs the whole fused prologue, since
-    # `_is_fused_prologue_active` couples the Q and KV folds by correctness.
-    # Restoring it for V4.1 means threading a "skip the norm" flag down to the
-    # kernel, which is a C++ change and a rebuild -- worth doing, but not at the
-    # price of shipping a wrong query.
-    if self.q_b_layernorm is None:
-        return False
+    # A model without the per-head Q norm (V4.1 deleted V4's) still gets the fold:
+    # `deepseek_v4_q_norm_fused_fp8` takes `apply_norm=False`, which makes the RMS
+    # scale an identity. That has to be a kernel flag rather than a Python branch
+    # because the fold is all-or-nothing -- `_is_fused_prologue_active` couples the
+    # Q and KV folds by correctness, so declining it here costs the whole prologue.
     # fp8_ds_mla (FlashInfer sparse MLA) does not use the fused Q FP8 path.
     if self.kv_cache_dtype == "fp8_ds_mla":
         return False
@@ -589,6 +585,10 @@ def _deepseek_v4_q_b_layernorm_fused_fp8(
     # `quant_q_buffer` as FP8, leaving `q_pe` untouched. One spec per phase; the
     # row ranges are disjoint, so launches never overlap.
     launches = rope_specs if rope_specs else [(slice(None), None, 0, None)]
+    # V4.1 has no per-head Q norm, so the kernel folds RoPE and the quant only;
+    # `eps` is then unread, and 0.0 says so rather than inventing a value.
+    apply_norm = self.q_b_layernorm is not None
+    eps = float(self.q_b_layernorm.variance_epsilon) if apply_norm else 0.0
     for rows, cache_seq_lens, seq_len, cu_q_seqlens in launches:
         torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
             q_proj[rows],
@@ -597,12 +597,13 @@ def _deepseek_v4_q_b_layernorm_fused_fp8(
             self.num_heads_tp,
             self.qk_head_dim,
             self.kv_lora_rank,
-            float(self.q_b_layernorm.variance_epsilon),
+            eps,
             self._quant_scale_qkv,
             rope_cos_sin,
             cache_seq_lens,
             seq_len,
             cu_q_seqlens,
+            apply_norm,
         )
     # Both buffers must be live for the fused path; the downstream
     # absorption-context op switches on `quant_scale_qkv is not None`
