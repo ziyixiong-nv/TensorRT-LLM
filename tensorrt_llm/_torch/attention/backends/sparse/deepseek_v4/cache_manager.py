@@ -98,12 +98,29 @@ def get_token_bytes(
     has_fp8_kv_cache: bool,
     indexer_k_dtype: str = "fp8",
     use_fp8_ds_mla: bool = False,
+    main_kv_dtype: str = "auto",
     variant: str = DEEPSEEK_V4_VARIANT,
 ) -> int:
     if not compress_ratio_has_attention(compress_ratio, attn_type, variant):
         raise ValueError(
             f"Layer with compress ratio {compress_ratio} does not have attention type {attn_type}"
         )
+
+    if main_kv_dtype not in ("auto", "fp4"):
+        raise ValueError(f"Unsupported main_kv_dtype {main_kv_dtype!r}; expected 'auto' or 'fp4'.")
+
+    # V4.1 §2.4.4 quantizes the *global* KV to FP4 and deliberately leaves SWA KV
+    # at FP8 "due to its sensitivity to quantization", so this must be checked
+    # before the footer-scale branch and must claim only COMPRESS. FP4 global +
+    # footer-scale FP8 SWA is the report's combination, not a conflict.
+    if main_kv_dtype == "fp4" and attn_type == DeepseekV4AttentionType.COMPRESS:
+        from . import fp4_kv
+
+        if head_dim != fp4_kv.DIM_TOTAL:
+            raise ValueError(
+                f"FP4 main-KV layout requires head_dim {fp4_kv.DIM_TOTAL}, got {head_dim}"
+            )
+        return fp4_kv.TOKEN_BYTES
 
     if use_fp8_ds_mla and attn_type in (
         DeepseekV4AttentionType.SWA,
