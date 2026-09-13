@@ -497,20 +497,28 @@ _ENGRAM_CPU_OFFLOAD_ENV = "TRTLLM_V41_ENGRAM_CPU_OFFLOAD"
 def engram_cpu_offload_enabled() -> bool:
     """Whether the Engram n-gram tables live in pinned host memory instead of HBM.
 
-    Off by default: the lookup then gathers 264-byte rows over PCIe rather than
-    out of HBM, which is a real per-token cost that only pays for itself when the
-    freed capacity is worth more than the latency.
+    Off by default, and the default is now the conservative choice rather than the
+    obvious one. The lookup gathers 264-byte rows over PCIe instead of out of HBM,
+    which is a real per-token cost -- but it has been measured, and it is small:
+    about 1 us per decode step and 150 us per 4K-token context step across both
+    Engram layers, on a side stream, against a step measured in milliseconds. See
+    ``ShardedFp8MultiHeadEmbedding`` for the table.
 
-    The capacity is not small. V4.1's two tables hold ~384M rows of 256 fp8 lanes
-    plus one e8m0 exponent per 32 lanes, so the pair is ~198 GiB whole and
-    ~24.7 GiB per rank at TP=8 -- the single largest resident tensor in the model
-    and, at low TP, the reason it does not fit at all. Offloading returns all of
-    it to the KV cache pool.
+    What it buys is not small. V4.1's two tables hold 384_006_168 and 384_016_682
+    rows of 256 fp8 lanes plus one e8m0 exponent per 32 lanes, so the pair is
+    ~188 GiB whole and 23.6 GiB per rank at TP=8 -- the single largest resident
+    tensor in the model and, at low TP, the reason it does not fit at all.
+    Offloading returns all of it to the KV cache pool.
 
     What makes this cheap enough to be worth offering is that
     ``DeepseekV41Engram.precompute`` already runs the lookup on the Engram side
     stream, so the PCIe gather overlaps the layers between the hash computation
     and the first Engram layer, and only two layers do a lookup at all.
+
+    It stays off by default because the cost above is a microbenchmark of the
+    lookup, not an end-to-end throughput arm: it says the gather is cheap, not that
+    the freed capacity is worth having in a given deployment. Turning it on is the
+    right move wherever KV capacity binds, and that is a per-deployment judgement.
     """
     return os.environ.get(_ENGRAM_CPU_OFFLOAD_ENV, "0") not in ("0", "", "false", "False")
 

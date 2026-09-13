@@ -1295,9 +1295,9 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
     dtype and replicates it on every rank. That is fine for a table of a few
     hundred thousand rows; it is not an option for DeepSeek-V4.1, whose two
     Engram tables hold 384_006_168 and 384_016_682 rows of 256 lanes. In bf16
-    that is ~197 GiB *each*, replicated -- more than a whole node. Stored as the
+    that is 183 GiB *each*, replicated -- more than a whole node. Stored as the
     checkpoint stores them (fp8 e4m3 rows plus one e8m0 exponent per 32 lanes)
-    and sharded over the rank dimension, the pair costs ~24.7 GiB per rank at
+    and sharded over the rank dimension, the pair costs 23.6 GiB per rank at
     TP=8, which is what makes the model loadable at all.
 
     There are two ways to cut it, and which one is used depends only on whether the
@@ -1331,9 +1331,29 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
 
     ``cpu_offload`` moves this rank's shard out of HBM into pinned host memory and
     gathers from it over PCIe (see ``_uva_device_view``), returning the whole
-    ~24.7 GiB per rank to the KV cache pool at the cost of a slower lookup. It
+    23.6 GiB per rank to the KV cache pool at the cost of a slower lookup. It
     composes with either cut, and compounds with the head cut in particular: an
     offloaded head-sharded lookup fetches ``1/tp_size`` as many rows over PCIe.
+
+    Measured, one Engram layer at the shipping geometry (24 heads at TP=8, so 3
+    heads and 11.8 GiB per rank, B200, graph replay, background grid):
+
+    ====== ============ ============= ==================
+    tokens device HBM   pinned host   effective PCIe
+    ====== ============ ============= ==================
+    1        4.0 us       4.5 us      --
+    8        4.1 us       6.2 us      0.96 GiB/s
+    512      4.1 us      16.4 us      23.0 GiB/s
+    4096    10.3 us      86.1 us      35.1 GiB/s
+    ====== ============ ============= ==================
+
+    So the flag costs about 1 us per decode step and 150 us per 4K-token context
+    step across the two layers -- fractions of a percent of either, and on a side
+    stream besides. A 64x smaller table reproduces every one of these figures to
+    within 0.1 us except T=4096, which moves by 2 us out of 86. That is the control
+    that makes them mean something: the offloaded cost is not an artifact of an
+    uncomfortably large fixture, and the resident arm was not hitting cache either,
+    so what the flag pays for is the interconnect and not the loss of residency.
     """
 
     def __init__(
