@@ -208,6 +208,37 @@ class DeepseekV41Engram(Engram):
         fp8_block_size: int = 32,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
     ):
+        # The Engram table is sharded over the TP group and put back together in
+        # `_combine_embeddings` by an all-gather over the head dim, or an all-reduce
+        # when the fallback row cut is used. Both need every rank to present the same
+        # shape (`distributed/ops.py` all-gather with `sizes=None` requires it), and
+        # attention DP gives each rank its own token count while `mapping.tp_size`
+        # stays at the full width. So the collective is malformed rather than merely
+        # slow, and it fails as a NCCL shape mismatch or as silently wrong rows.
+        #
+        # This refuses the configuration; it is not a claim that it cannot be built.
+        # The shard is already the right one -- sharding heads over the whole rank set
+        # is what vLLM calls `embedding_across_dp`, and under attention DP TP x DP is
+        # the whole rank set -- so only the gather axis is wrong. Gathering on the
+        # token dim instead stays equal-shape, and each rank then selects its own
+        # token chunk with all heads out of the gathered buffer. What that needs and
+        # this path does not have is a token count agreed across ranks to pad to.
+        # Note that replication is not the alternative: the tables are ~40% of the
+        # checkpoint, so any real support has to shard.
+        if (
+            mapping is not None
+            and getattr(mapping, "enable_attention_dp", False)
+            and mapping.tp_size > 1
+        ):
+            raise NotImplementedError(
+                "DeepSeek-V4.1 Engram does not support attention data parallelism "
+                "(enable_attention_dp=True) at tensor_parallel_size > 1: the Engram "
+                "table is sharded over the TP group and recombined with a collective "
+                "that requires every rank to hold the same number of tokens, which "
+                "attention DP violates. Run with enable_attention_dp=False, or at "
+                "tensor_parallel_size=1."
+            )
+
         # Read by `_make_multi_head_embedding`, which the base __init__ calls,
         # so these have to be in place first. Plain attributes on a not-yet
         # initialized nn.Module are fine (nn.Module.__setattr__ only intercepts

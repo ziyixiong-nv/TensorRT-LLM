@@ -776,3 +776,47 @@ def test_no_v41_attention_subclass_reacquires_the_per_head_query_norm():
     # test that passes by looking at nothing.
     assert v41.DeepseekV41Attention.q_b_norm_enabled is False
     assert DeepseekV4Attention.q_b_norm_enabled is True
+
+
+class _StubEngramConfig:
+    """A config whose every attribute access raises.
+
+    The attention-DP guard is supposed to fire before it reads anything. Making that
+    structural rather than incidental: if a future edit moves the raise below the
+    first config read, this stops being a passing test.
+    """
+
+    def __getattr__(self, name):
+        raise AssertionError(
+            f"the attention-DP guard read config.{name}; it is supposed to raise "
+            f"before touching the config at all"
+        )
+
+
+def test_engram_refuses_attention_dp():
+    """enable_attention_dp=True at tp_size>1 must be refused, not silently sharded."""
+    mapping = Mapping(world_size=8, tp_size=8, rank=0, enable_attention_dp=True)
+    with pytest.raises(NotImplementedError, match="attention data parallelism"):
+        v41.DeepseekV41Engram(layer_id=0, config=_StubEngramConfig(), mapping=mapping)
+
+
+def test_engram_guard_is_scoped_to_attention_dp():
+    """Without attention DP the guard must not fire.
+
+    Asserted as "raises something else, but not our message" rather than "constructs
+    successfully", because a real construction wants a real config and allocates the
+    table -- which is what this CPU test is avoiding. What matters is that the refusal
+    is scoped to the configuration it names.
+    """
+    mapping = Mapping(world_size=8, tp_size=8, rank=0, enable_attention_dp=False)
+    with pytest.raises(Exception) as excinfo:
+        v41.DeepseekV41Engram(layer_id=0, config=_StubEngramConfig(), mapping=mapping)
+    assert "attention data parallelism" not in str(excinfo.value)
+
+
+def test_engram_allows_attention_dp_at_tp1():
+    """tp_size=1 shards nothing, so there is no collective to malform."""
+    mapping = Mapping(world_size=1, tp_size=1, rank=0, enable_attention_dp=True)
+    with pytest.raises(Exception) as excinfo:
+        v41.DeepseekV41Engram(layer_id=0, config=_StubEngramConfig(), mapping=mapping)
+    assert "attention data parallelism" not in str(excinfo.value)
