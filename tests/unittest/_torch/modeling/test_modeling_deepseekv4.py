@@ -520,7 +520,16 @@ def test_deepseek_v4_mla_builds_both_norms_at_the_v4_widths():
 def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():
     assert inspect.signature(Compressor).parameters["rotate_activation"].default is False
 
-    indexer_init = inspect.getsource(DeepseekV4Indexer.__init__)
+    # V4's indexer builds a pooling ``Compressor`` of its own. That construction
+    # moved out of ``__init__`` into the ``_build_key_path`` hook when V4.1
+    # arrived: V4.1 has no indexer compressor at all (it derives index keys from
+    # the main compressor's pre-RoPE latent with a real ``wk``), so it overrides
+    # the hook rather than inheriting an unconditional construction. Both
+    # literals still execute on the V4 path, one method over, so read both
+    # sources rather than pinning which method holds the call.
+    indexer_init = inspect.getsource(DeepseekV4Indexer.__init__) + inspect.getsource(
+        DeepseekV4Indexer._build_key_path
+    )
     assert "is_neox=False" in indexer_init
     assert "rotate_activation=HAS_FAST_HADAMARD" in indexer_init
 
@@ -1181,6 +1190,7 @@ def _make_mla(
     dsv4_geometry: bool = True,
     kv_lora_rank: int = KV_LORA_RANK,
     qk_rope_head_dim: int = QK_ROPE_HEAD_DIM,
+    has_q_b_layernorm: bool = True,
 ) -> MLA:
     from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
@@ -1218,6 +1228,22 @@ def _make_mla(
         mla.kv_a_layernorm = RMSNorm(
             hidden_size=kv_lora_rank + qk_rope_head_dim, dtype=torch.bfloat16, eps=1e-6
         )
+    # `q_b_layernorm` is not fabrication for the same reason: `initialize_sparse_attn`
+    # assigns it on every DSv4 module, as an `RMSNorm` for V4 and as `None` for V4.1,
+    # which deleted the per-head query norm. `_is_fused_q_fp8_quant_enabled` reads it
+    # directly (not through `getattr`) so that a module which never ran the DSv4
+    # initializer raises instead of quietly reporting the fusion off -- so the fake
+    # has to carry it, and carries both values so the V4.1 branch is reachable here.
+    mla.q_b_layernorm = (
+        RMSNorm(
+            hidden_size=kv_lora_rank + qk_rope_head_dim,
+            dtype=torch.bfloat16,
+            eps=1e-6,
+            has_weights=False,
+        )
+        if has_q_b_layernorm
+        else None
+    )
     return mla
 
 
@@ -1247,6 +1273,31 @@ def test_fusions_require_fp8_kv_cache(has_fp8_kv_cache: bool) -> None:
     mla = _make_mla(has_fp8_kv_cache=has_fp8_kv_cache)
     assert _is_fused_kv_norm_enabled(mla, num_generations=1) is has_fp8_kv_cache
     assert _is_fused_q_fp8_quant_enabled(mla, num_generations=1, num_contexts=0) is has_fp8_kv_cache
+
+
+def test_fused_q_path_is_off_without_the_per_head_query_norm() -> None:
+    """V4.1 deletes the per-head query norm, and the fused Q kernel always applies it.
+
+    `deepseek_v4_q_norm_fused_fp8` folds norm + RoPE + FP8 quant into one launch with
+    no way to skip the norm, so a module whose `q_b_layernorm` is `None` must report
+    the fused Q path off rather than normalize a query V4.1 does not normalize. That
+    is a correctness gate, not a perf choice: the fallback costs the whole fused
+    prologue (`_is_fused_prologue_active` couples the two folds), which is the cheaper
+    of the two mistakes.
+    """
+    mla = _make_mla(has_fp8_kv_cache=True, has_q_b_layernorm=False)
+
+    assert _is_fused_q_fp8_quant_enabled(mla, num_generations=1, num_contexts=0) is False
+    # The KV predicate still says yes, so the absent query norm is what turned the Q
+    # fold off -- not the geometry or the cache dtype, which both still qualify.
+    assert _is_fused_kv_norm_enabled(mla, num_generations=1) is True
+    # And the coupling carries it: the whole prologue stays off with specs available.
+    assert (
+        _is_fused_prologue_active(
+            mla, num_contexts=0, num_generations=1, rope_specs=[("dummy", None, 1, None)]
+        )
+        is False
+    )
 
 
 def test_kv_norm_fusion_needs_the_full_width_weight() -> None:

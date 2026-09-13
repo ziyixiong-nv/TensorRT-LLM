@@ -12,12 +12,18 @@ from tensorrt_llm._torch.attention.backends.interface import MLAParams, Position
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
+from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils import fp8_utils
 
 from ..dsa.indexer import HAS_FAST_HADAMARD, Indexer, rotate_activation
-from .compressor import Compressor, KVCacheDtype, resolve_kv_cache_dtype
+from .compressor import (
+    Compressor,
+    KVCacheDtype,
+    postprocess_scatter_compressed,
+    resolve_kv_cache_dtype,
+)
 from .params import DeepSeekV4Params
 
 if TYPE_CHECKING:
@@ -26,6 +32,21 @@ if TYPE_CHECKING:
 
 
 class DeepseekV4Indexer(Indexer):
+    # Whether the key branch can run concurrently with the Q branch on the aux
+    # stream. True for V4, whose keys come from an indexer-local compressor over
+    # `hidden_states`; False for V4.1, whose keys depend on the main compressor.
+    supports_overlapped_prepare = True
+
+    def _decode_indexer_block_table(self, metadata) -> torch.Tensor:
+        """This layer's INDEXER_COMPRESS page table, selected by compression ratio.
+
+        V4 has one indexer pool, so this returns what the base class would. V4.1
+        has one per ratio -- the pools differ in page scale -- so the ratio is the
+        only thing that distinguishes them and a ratio-blind read would score
+        against another pool's pages.
+        """
+        return metadata.indexer_block_table(self.compress_ratio)
+
     def __init__(
         self,
         quant_config: Optional[QuantConfig],
@@ -67,7 +88,8 @@ class DeepseekV4Indexer(Indexer):
             head_dim=self.rope_dim,
             is_neox=False,
         )
-        rms_norm_eps = 1e-6
+        # `args.norm_eps` in the reference; 1e-6 for V4 but 1e-20 for V4.1.
+        rms_norm_eps = sparse_params.rms_norm_eps
         index_head_dim = sparse_params.index_head_dim
         indexer_mla_params = MLAParams(
             hidden_size=mla_params.hidden_size,
@@ -82,6 +104,41 @@ class DeepseekV4Indexer(Indexer):
         self.indexer_k_dtype = sparse_params.indexer_k_dtype
         compressor_preset = "mxfp4" if self.indexer_k_dtype == "fp4" else "fp8_blockwise"
         self.indexer_cache_dtype = resolve_kv_cache_dtype(compressor_preset)
+        self._build_key_path(
+            indexer_mla_params,
+            layer_idx,
+            compress_ratio,
+            rms_norm_eps,
+            skip_create_weights_in_init,
+            pos_embd_params,
+            dtype,
+            compressor_preset,
+        )
+        self.indexer_start_event = torch.cuda.Event()
+        self.weights_proj_event = torch.cuda.Event()
+        self.k_cache_update_event = torch.cuda.Event()
+
+    def _build_key_path(
+        self,
+        indexer_mla_params: MLAParams,
+        layer_idx: int,
+        compress_ratio: int,
+        rms_norm_eps: float,
+        skip_create_weights_in_init: bool,
+        pos_embd_params: Optional[PositionalEmbeddingParams],
+        dtype: Optional[torch.dtype],
+        compressor_preset: KVCacheDtype | str,
+    ) -> None:
+        """Build whatever produces this indexer's keys.
+
+        For V4 that is a ``Compressor`` of the indexer's own, pooling hidden
+        states down to ``index_head_dim``: the checkpoint's ``indexer.wk`` /
+        ``indexer.k_norm`` are vestigial there (the loader ones/zeros-fills them,
+        ``modeling_deepseekv4.py:626``). V4.1 instead derives index keys from the
+        *main* compressor's pre-RoPE latent with a real ``wk``, so it has no
+        indexer compressor at all -- hence the hook rather than an unconditional
+        construction. See :class:`DeepseekV41Indexer`.
+        """
         self.compressor = Compressor(
             indexer_mla_params,
             layer_idx,
@@ -94,9 +151,6 @@ class DeepseekV4Indexer(Indexer):
             is_indexer=True,
             rotate_activation=HAS_FAST_HADAMARD,
         )
-        self.indexer_start_event = torch.cuda.Event()
-        self.weights_proj_event = torch.cuda.Event()
-        self.k_cache_update_event = torch.cuda.Event()
 
     def post_load_weights(self):
         # V4 does not use the V3 fused fp32 wk+weights_proj GEMM, and the
@@ -330,9 +384,14 @@ class DeepseekV4Indexer(Indexer):
         hidden_states: torch.Tensor,
         metadata: DeepseekV4TrtllmAttentionMetadata,
         position_ids: torch.Tensor,
+        latent: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor
     ]:
+        # V4 builds its index keys from `hidden_states` through its own compressor,
+        # so it has no use for the main compressor's latent. Accepted and ignored
+        # to keep one call signature across the generations.
+        del latent
         q_fp8, q_scale = self._project_and_quantize_q(qr, position_ids)
 
         weights = self.weights_proj(hidden_states)
@@ -362,8 +421,14 @@ class DeepseekV4Indexer(Indexer):
         pre_aux: Optional[
             Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
         ] = None,
+        latent: Optional[torch.Tensor] = None,
     ):
-        if do_multi_stream() and self.aux_stream is not None:
+        # The overlapped prepare exists to hide an *independent* key branch behind
+        # the Q GEMM. V4.1's key branch is not independent -- it consumes the main
+        # compressor's latent, produced on the caller's stream in the same layer --
+        # so `supports_overlapped_prepare` turns it off there rather than having the
+        # aux stream race a producer it cannot wait on.
+        if self.supports_overlapped_prepare and do_multi_stream() and self.aux_stream is not None:
             q_fp8, q_scale, k_fp8, k_scale, weights = self._run_overlapped_indexer_prepare(
                 qr,
                 hidden_states,
@@ -374,7 +439,7 @@ class DeepseekV4Indexer(Indexer):
         else:
             assert pre_aux is None, "pre_aux requires multi-stream mode"
             q_fp8, q_scale, k_fp8, k_scale, weights = self._run_serial_indexer_prepare(
-                qr, hidden_states, metadata, position_ids
+                qr, hidden_states, metadata, position_ids, latent=latent
             )
 
         # If there are no compressed tokens, return an topk indices buffer with all -1s in the tensor.
@@ -391,3 +456,218 @@ class DeepseekV4Indexer(Indexer):
                 q_scale=q_scale,
             )
         return topk_indices
+
+
+class DeepseekV41Indexer(DeepseekV4Indexer):
+    """The V4.1 indexer: index keys projected from the main compressor's latent.
+
+    V4 gives every indexer a ``Compressor`` of its own, pooling hidden states
+    straight down to ``index_head_dim``; its checkpoint's ``indexer.wk`` and
+    ``indexer.k_norm`` are vestigial and the loader fills them with ones/zeros.
+    V4.1 inverts that. Its indexer has no compressor at all -- ``wk`` is a real
+    ``Linear(head_dim -> index_head_dim)`` applied to the *main* compressor's
+    RoPE-free latent, so the index keys are a cheap reprojection of the
+    compressed KV rather than an independent compression of the hidden states
+    (model.py:516-517, :533-537).
+
+    Two consequences shape this class:
+
+    * Only a layer that compresses its own KV can build index keys, so ``wk`` /
+      ``k_norm`` exist exactly on ``kv_source_layer_ids`` (``owns_k`` at
+      model.py:499). The other four index sources (24, 28, 32, 36) own queries
+      and ``weights_proj`` but read keys from layer 20's cache, and their
+      checkpoint carries no ``wk`` at all -- building one would make the loader
+      demand a tensor that does not exist.
+    * The reference quantizes both queries and index keys with
+      ``fp4_act_quant`` (model.py:537, :549), so the faithful precision for this
+      generation is FP4, not the FP8 that V4's indexer uses.
+    """
+
+    # The key branch consumes the main compressor's latent, produced on the
+    # caller's stream in this same layer, so it cannot be hidden behind the Q
+    # GEMM on the aux stream the way V4's independent key branch can.
+    supports_overlapped_prepare = False
+
+    def __init__(
+        self,
+        quant_config: Optional[QuantConfig],
+        pos_embd_params: Optional[PositionalEmbeddingParams],
+        mla_params: Optional[MLAParams],
+        skip_create_weights_in_init: bool,
+        sparse_params: DeepSeekV4Params,
+        dtype: Optional[torch.dtype],
+        compress_ratio: int = 1,
+        layer_idx: int = 0,
+        aux_stream: Optional[torch.cuda.Stream] = None,
+        owns_index_keys: bool = True,
+        kv_source_layer_idx: Optional[int] = None,
+    ):
+        # The compressed latent this indexer reprojects is `head_dim` wide, and
+        # MLAParams spells that as its nope+rope split (the V4 family folds RoPE
+        # into head_dim rather than appending it, so 448 + 64 = 512). Resolved
+        # before super().__init__ because `_build_key_path` runs inside it.
+        self.compress_latent_dim = mla_params.qk_nope_head_dim + mla_params.qk_rope_head_dim
+        self.owns_index_keys = owns_index_keys
+        # Which layer's index-key cache this indexer scores against. Equal to
+        # `layer_idx` on an owner; on the four index sources that own no
+        # compressed KV (24, 28, 32, 36) it names the kv source they alias.
+        self.kv_source_layer_idx = layer_idx if owns_index_keys else kv_source_layer_idx
+        assert self.kv_source_layer_idx is not None, (
+            f"layer {layer_idx} builds a V4.1 indexer without owning index keys, so "
+            "its kv source layer must be given"
+        )
+        super().__init__(
+            quant_config,
+            pos_embd_params,
+            mla_params,
+            skip_create_weights_in_init,
+            sparse_params,
+            dtype,
+            compress_ratio,
+            layer_idx,
+            aux_stream,
+        )
+
+    def _build_key_path(
+        self,
+        indexer_mla_params: MLAParams,
+        layer_idx: int,
+        compress_ratio: int,
+        rms_norm_eps: float,
+        skip_create_weights_in_init: bool,
+        pos_embd_params: Optional[PositionalEmbeddingParams],
+        dtype: Optional[torch.dtype],
+        compressor_preset: KVCacheDtype | str,
+    ) -> None:
+        # No indexer compressor: the keys come from the main one. Bound to None
+        # rather than left absent so the inherited helpers that reach for it fail
+        # with an AttributeError on None instead of silently finding a V4 module.
+        self.compressor = None
+
+        # The base Indexer builds `wk` as Linear(hidden_size -> index_head_dim)
+        # in fp32 and `k_norm` as a LayerNorm (weight *and* bias). V4.1 needs
+        # Linear(head_dim -> index_head_dim) in bf16 and an RMSNorm, and needs
+        # both absent on a non-owner. Dropping the base modules keeps
+        # `named_parameters()` equal to the checkpoint's key set, which is what
+        # the weight loader diffs against.
+        del self.wk
+        del self.k_norm
+        if not self.owns_index_keys:
+            return
+
+        self.wk = Linear(
+            self.compress_latent_dim,
+            self.head_dim,
+            bias=False,
+            dtype=dtype,
+            quant_config=None,
+            skip_create_weights_in_init=skip_create_weights_in_init,
+            use_custom_cublas_mm=True,
+        )
+        # The reference uses `args.norm_eps`, which V4.1 sets to 1e-20. Keeping
+        # the 1e-6 the rest of this backend uses is numerically indistinguishable
+        # here: the norm runs over 128 activations whose mean square is O(1), so
+        # the two epsilons differ by ~5e-7 relative, four orders of magnitude
+        # under bf16's resolution -- and both send an all-zero row to zero. (mHC
+        # is the opposite case and does honor 1e-20, because its normalized
+        # quantities really do get that small.)
+        self.k_norm = RMSNorm(hidden_size=self.head_dim, eps=rms_norm_eps, dtype=dtype)
+
+    def _build_index_keys(
+        self,
+        latent: torch.Tensor,
+        metadata: DeepseekV4TrtllmAttentionMetadata,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Turn this layer's compressed latent into index keys and cache them.
+
+        ``k = k_norm(wk(latent))``, RoPE on the trailing ``rope_dim``, then the
+        same Hadamard-and-quantize the queries get, then a paged write into
+        ``INDEXER_COMPRESS`` (model.py:536-540). The whole tail after ``wk`` is
+        already a fused kernel on the compressor path, so it is reused verbatim:
+        ``k_norm`` stands in for the compressor's ``norm`` and the compressed
+        positions are the same ones the main compressor writes, because V4.1 gives
+        the index keys and the compressed KV the same ratio by construction.
+
+        One row per compressed position, so ``compressed_position_ids_cuda`` maps
+        group ``j`` to token position ``j * ratio`` -- exactly the reference's
+        ``freqs_cis[: seqlen - seqlen % ratio : ratio]``.
+
+        A zero-row ``latent`` reaches here on every decode step of a ratio-2 layer
+        that does not complete a pooling group, and ``wk`` cannot be asked to run
+        on it: ``cublas_mm`` fails the ``cublasLtMatmul`` call outright at ``M ==
+        0`` rather than returning the empty product. So the projection is
+        synthesized instead. The rest of the tail is deliberately still executed:
+        it allocates the zero-row ``(k, scale)`` pair the top-k expects and skips
+        its own kernel internally, and the top-k must still run, because it scores
+        this step's queries against the *cached* index keys -- returning no keys
+        here is not the same as having no keys.
+        """
+        rows = latent.new_empty((0, self.head_dim)) if latent.shape[0] == 0 else self.wk(latent)
+        return postprocess_scatter_compressed(
+            rows,
+            metadata,
+            layer_idx=self.layer_idx,
+            compress_ratio=self.compress_ratio,
+            norm_weight=self.k_norm.weight,
+            norm_eps=self.k_norm.variance_epsilon,
+            rotary_cos_sin=self.rotary_emb.rotary_cos_sin,
+            nope_head_dim=self.head_dim - self.rope_dim,
+            rope_head_dim=self.rope_dim,
+            kv_cache_dtype=self.indexer_cache_dtype,
+            # Must match `_quantize_q`. The Hadamard is orthogonal, so it cancels in
+            # the q.k dot product only if both sides get it, or neither.
+            #
+            # Note what is and is not shared here. The *decision* is shared -- this
+            # flag and `_quantize_q` both read `HAS_FAST_HADAMARD`, so a
+            # half-application cannot happen through this call site. The
+            # *implementation* is not: Q is rotated in Python by
+            # fast-hadamard-transform (`rotate_activation`, scale `head_dim**-0.5`),
+            # while K is rotated inside `compressor_postprocess_scatter` by that
+            # kernel's own Hadamard. Turning the package on therefore enables two
+            # independent implementations that have never been cross-validated
+            # against each other; if their normalization or butterfly ordering
+            # differs, every indexer logit is silently wrong while both sides look
+            # "rotated". The reference applies no Hadamard at all (there is no
+            # hadamard in `inference/`), so off-on-both is the reference-faithful
+            # setting and is what this bring-up has measured.
+            rotate_activation=HAS_FAST_HADAMARD,
+            is_indexer=True,
+        )
+
+    def _run_serial_indexer_prepare(self, qr, hidden_states, metadata, position_ids, latent=None):
+        q_fp8, q_scale = self._project_and_quantize_q(qr, position_ids)
+        weights = self._apply_weight_scale(self.weights_proj(hidden_states), q_scale)
+
+        if self.owns_index_keys:
+            assert latent is not None, (
+                f"layer {self.layer_idx} owns V4.1 index keys, so its own compressor's "
+                "pre-RoPE latent must be handed in; got None"
+            )
+            k_fp8, k_scale = self._build_index_keys(latent, metadata)
+            # Publish for the index sources downstream that share this kv source:
+            # they score with their own queries against these keys
+            # (``shared_attn.index_k`` at model.py:541).
+            metadata.v41_index_keys[self.layer_idx] = (k_fp8, k_scale)
+        else:
+            assert latent is None, (
+                f"layer {self.layer_idx} does not own V4.1 index keys, so it has no "
+                "compressor and should not have been handed a latent"
+            )
+            source = self.kv_source_layer_idx
+            assert source is not None, (
+                f"layer {self.layer_idx} reads index keys but has no kv source layer"
+            )
+            published = metadata.v41_index_keys.get(source)
+            assert published is not None, (
+                f"layer {self.layer_idx} needs layer {source}'s index keys, but that "
+                "layer has not published them in this forward pass"
+            )
+            k_fp8, k_scale = published
+
+        return q_fp8, q_scale, k_fp8, k_scale, weights
+
+    def precompute_aux(self, hidden_states, metadata):
+        # Nothing to overlap: V4.1's aux-stream work in the V4 path is the
+        # indexer compressor, which does not exist here. Returning None routes
+        # `forward` to the serial path.
+        return None

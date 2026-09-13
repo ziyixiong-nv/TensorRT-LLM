@@ -1071,6 +1071,14 @@ class PyTorchModelEngine(ModelEngine):
                 enable_in_graph_sampling=self.enable_in_graph_sampling,
             )
             self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
+            # A model whose forward computes state the graph captures the address
+            # of has no other chance to refresh it: a replay runs no Python. Let
+            # it register its own pre-replay hooks.
+            register_hooks = getattr(self.model,
+                                     "register_cuda_graph_pre_replay_hooks",
+                                     None)
+            if register_hooks is not None:
+                register_hooks(self.cuda_graph_runner)
             if self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE:
                 decoder_model = (self.model if isinstance(
                     self.model, DecoderModelForCausalLM) else getattr(

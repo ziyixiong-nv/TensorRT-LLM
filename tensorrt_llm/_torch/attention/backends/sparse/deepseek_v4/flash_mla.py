@@ -15,7 +15,7 @@ from tensorrt_llm.logger import logger
 from . import footer_scale_kv
 from .kernels import deepseek_v4_local_to_global_indices
 from .metadata import DeepseekV4TrtllmAttentionMetadata
-from .params import DEEPSEEK_V4_SPARSE_RATIO, DeepseekV4AttentionType
+from .params import DEEPSEEK_V4_VARIANT, DeepseekV4AttentionType, is_compress_layer, is_sparse_layer
 
 _BF16_CONTEXT_CHUNK_SIZE = 512
 
@@ -37,6 +37,17 @@ class DeepSeekV4FlashMLA:
         self._attention = attention
         self._layer_idx = attention.layer_idx
         self._compress_ratio = compress_ratio
+        # Resolve the layer's roles from the ratio *and* the model generation:
+        # V4.1 spells an unpooled long-range layer as ratio 1, which the V4
+        # `ratio > 1` test reads as SWA-only. Prefer the flags the attention
+        # backend already resolved; fall back for a directly-constructed helper.
+        variant = getattr(attention, "variant", DEEPSEEK_V4_VARIANT)
+        self._has_compressed = getattr(
+            attention, "has_compressed_kv", is_compress_layer(compress_ratio, variant)
+        )
+        self._is_indexed = getattr(
+            attention, "is_indexed", is_sparse_layer(compress_ratio, variant)
+        )
         self._num_heads = attention.num_heads
         self._qk_nope_head_dim = attention.mla_params.qk_nope_head_dim
         self._qk_rope_head_dim = attention.mla_params.qk_rope_head_dim
@@ -101,12 +112,12 @@ class DeepSeekV4FlashMLA:
         block_table_compressed = None
         compressed_local_indices = None
         compressed_buffer_ptr = 0
-        if self._compress_ratio > 1:
+        if self._has_compressed:
             compressed_buffer_ptr = metadata.compressed_buffer_ptrs[self._layer_idx]
             block_table_compressed = metadata.compress_block_tables[self._compress_ratio]
-            if self._compress_ratio == DEEPSEEK_V4_SPARSE_RATIO:
+            if self._is_indexed:
                 if topk_indices is None:
-                    raise ValueError("DeepSeek-V4 ratio-4 attention requires top-k indices")
+                    raise ValueError("DeepSeek-V4 indexed attention requires top-k indices")
                 compressed_local_indices = topk_indices
             else:
                 compressed_local_indices = metadata.compressed_local_indices_cuda[start_idx:end_idx]
@@ -126,6 +137,7 @@ class DeepSeekV4FlashMLA:
             compress_pool_base_ptr=compressed_buffer_ptr,
             compressed_buffer_ptr=compressed_buffer_ptr,
             compress_ratio=self._compress_ratio,
+            has_compressed=self._has_compressed,
             num_compressed_indices=metadata.max_compressed_indices[self._compress_ratio],
         )
         return global_indices, self._compress_ratio, window_size
@@ -301,7 +313,7 @@ class DeepSeekV4FlashMLA:
         kv_cache_manager = metadata.kv_cache_manager
         swa_pool = kv_cache_manager.get_buffers(self._layer_idx, DeepseekV4AttentionType.SWA)
         compressed_pool = None
-        if compress_ratio > 1:
+        if self._has_compressed:
             compressed_pool = kv_cache_manager.get_buffers(
                 self._layer_idx, DeepseekV4AttentionType.COMPRESS
             )
@@ -391,7 +403,7 @@ class DeepSeekV4FlashMLA:
             self._layer_idx, DeepseekV4AttentionType.SWA
         ).unsqueeze(2)
         compressed_fp8 = None
-        if self._compress_ratio > 1:
+        if self._has_compressed:
             compressed_fp8 = kv_cache_manager.get_buffers(
                 self._layer_idx, DeepseekV4AttentionType.COMPRESS
             ).unsqueeze(2)
@@ -404,7 +416,7 @@ class DeepSeekV4FlashMLA:
         )
 
         compressed_indices = None
-        if compress_ratio > 1:
+        if self._has_compressed:
             if compressed_fp8 is None:
                 raise RuntimeError("DeepSeek-V4 compressed FlashMLA cache is not initialized")
             compressed_indices = self._pad_sparse_indices(

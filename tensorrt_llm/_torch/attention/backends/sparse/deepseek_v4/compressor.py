@@ -61,6 +61,114 @@ def resolve_kv_cache_dtype(kv_cache_dtype: Union[str, KVCacheDtype]) -> KVCacheD
     return kv_cache_dtype
 
 
+def postprocess_scatter_compressed(
+    rows: torch.Tensor,
+    metadata: "DeepseekV4TrtllmAttentionMetadata",
+    *,
+    layer_idx: int,
+    compress_ratio: int,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    rotary_cos_sin: torch.Tensor,
+    nope_head_dim: int,
+    rope_head_dim: int,
+    kv_cache_dtype: KVCacheDtype,
+    rotate_activation: bool,
+    is_indexer: bool,
+    want_unquantized_copy: bool = False,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """RMSNorm + RoPE + Hadamard + quantize + paged write for one set of compressed rows.
+
+    Everything downstream of the pooling reduction, in one place. Three callers
+    reach it and they differ only in what produced ``rows``:
+
+    * :meth:`Compressor.forward` -- the pooled output of the reduction kernels.
+    * :meth:`DeepseekV41Compressor._forward_identity` -- a plain projection, one
+      row per token, because ratio 1 has nothing to reduce.
+    * :class:`~.indexer.DeepseekV41Indexer` -- ``wk`` applied to the main
+      compressor's latent. V4.1's indexer has no compressor of its own, so
+      without this split it would have to duplicate the tail.
+
+    ``rows`` is pre-normalization: the fused kernel applies ``norm_weight`` /
+    ``norm_eps`` itself. Positions, masks and page tables all come from
+    ``metadata`` keyed by ``compress_ratio``, which is why the caller passes the
+    ratio rather than a slice.
+
+    Returns the ``(data, scale)`` pair the caller should hand to the indexer top-k:
+    ``(fp4_or_fp8_rows, scale)`` when the cache is quantized, ``(copy, None)``
+    when ``want_unquantized_copy`` is set, and ``(rows, None)`` otherwise.
+    """
+    head_dim = nope_head_dim + rope_head_dim
+    bsz = metadata.num_contexts + metadata.num_generations
+    total_tokens = rows.shape[0]
+
+    if is_indexer:
+        compress_type = DeepseekV4AttentionType.INDEXER_COMPRESS
+        block_table = metadata.indexer_block_table(compress_ratio)
+    else:
+        compress_type = DeepseekV4AttentionType.COMPRESS
+        block_table = metadata.compress_block_tables[compress_ratio]
+    kv_cache = metadata.kv_cache_manager.get_buffers(layer_idx, compress_type)
+    compress_tokens_per_block = metadata.kv_cache_manager.compressed_block_sizes[layer_idx]
+
+    num_comp_tokens = metadata.new_comp_kv_lens_cuda[compress_ratio][:bsz]
+    cu_new_comp_kv = metadata.cu_new_comp_kv_cuda[compress_ratio]
+    start_pos = metadata.past_kv_lens_cuda[compress_ratio][:bsz]
+    position_ids = metadata.compressed_position_ids_cuda[compress_ratio][:total_tokens]
+    compressed_mask = metadata.compressed_mask_cuda[compress_ratio][:total_tokens]
+
+    unquantized_copy = torch.empty_like(rows) if want_unquantized_copy else None
+    quant_output = None
+    scale_output = None
+    # The kernel writes the quantized cache either way; these buffers are only the
+    # extra copy the index top-k consumes, so a main compressor never pays for them.
+    if is_indexer:
+        if kv_cache_dtype == KVCacheDtype.FP8_BLOCKWISE:
+            quant_output = torch.empty(
+                total_tokens, head_dim, dtype=torch.uint8, device=rows.device
+            )
+            scale_output = torch.empty(
+                total_tokens, head_dim // 128, dtype=torch.float32, device=rows.device
+            )
+        elif kv_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
+            quant_output = torch.empty(
+                total_tokens, head_dim // 2, dtype=torch.uint8, device=rows.device
+            )
+            scale_output = torch.empty(
+                total_tokens, head_dim // 32, dtype=torch.uint8, device=rows.device
+            )
+
+    torch.ops.trtllm.compressor_postprocess_scatter(
+        rows,
+        unquantized_copy,
+        norm_weight,
+        norm_eps,
+        rotary_cos_sin,
+        position_ids,
+        nope_head_dim,
+        rope_head_dim,
+        kv_cache,
+        num_comp_tokens,
+        cu_new_comp_kv,
+        start_pos,
+        block_table,
+        compressed_mask,
+        compress_tokens_per_block,
+        int(kv_cache_dtype),
+        rotate_activation,
+        quant_output,
+        scale_output,
+    )
+
+    if quant_output is not None:
+        if kv_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
+            return quant_output.view(torch.float4_e2m1fn_x2), scale_output
+        return quant_output.view(torch.float8_e4m3fn), scale_output
+    if unquantized_copy is not None:
+        return unquantized_copy, None
+    return rows, None
+
+
 class Compressor(nn.Module):
     """KV compressor using Triton kernels with paged memory management.
 
@@ -172,7 +280,7 @@ class Compressor(nn.Module):
         # Get block tables
         local_layer_idx = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
         if self.is_indexer:
-            block_table = metadata.indexer_k_cache_block_offsets
+            block_table = metadata.indexer_block_table(self.compress_ratio)
         else:
             block_table = metadata.compress_block_tables[self.compress_ratio]
         block_table_kv_state = metadata.sliding_block_tables[local_layer_idx, kv_type.value]
@@ -243,38 +351,8 @@ class Compressor(nn.Module):
                 next_n,
             )
 
-        # Scatter to cache with appropriate quantization (all modes fused)
-        start_pos = metadata.past_kv_lens_cuda[self.compress_ratio][:bsz]
-        total_tokens = kv_comp.shape[0]
-
-        # Allocate optional returned postprocess buffers for indexer paths.
-        kv_out = None
-        quant_output = None
-        scale_output = None
-        if self.is_indexer:
-            if self.kv_cache_dtype == KVCacheDtype.NONE:
-                kv_out = torch.empty_like(kv_comp)
-            elif self.kv_cache_dtype == KVCacheDtype.FP8_BLOCKWISE:
-                num_scale_blocks = self.head_dim // 128
-                quant_output = torch.empty(
-                    total_tokens, self.head_dim, dtype=torch.uint8, device=kv_comp.device
-                )
-                scale_output = torch.empty(
-                    total_tokens, num_scale_blocks, dtype=torch.float32, device=kv_comp.device
-                )
-            elif self.kv_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
-                num_scale_blocks = self.head_dim // 32
-                quant_output = torch.empty(
-                    total_tokens, self.head_dim // 2, dtype=torch.uint8, device=kv_comp.device
-                )
-                scale_output = torch.empty(
-                    total_tokens, num_scale_blocks, dtype=torch.uint8, device=kv_comp.device
-                )
-
-        position_ids = metadata.compressed_position_ids_cuda[self.compress_ratio][:total_tokens]
-        compressed_mask = metadata.compressed_mask_cuda[self.compress_ratio][:total_tokens]
-
         if self.footer_scale_cache and not self.is_indexer:
+            total_tokens = kv_comp.shape[0]
             self._footer_scale_postprocess_scatter(
                 kv_comp,
                 kv_cache,
@@ -282,43 +360,32 @@ class Compressor(nn.Module):
                 compress_tokens_per_block,
                 num_comp_tokens,
                 cu_new_comp_kv,
-                start_pos,
-                position_ids,
-                compressed_mask,
+                metadata.past_kv_lens_cuda[self.compress_ratio][:bsz],
+                metadata.compressed_position_ids_cuda[self.compress_ratio][:total_tokens],
+                metadata.compressed_mask_cuda[self.compress_ratio][:total_tokens],
                 bsz,
             )
             return kv_comp, None
 
-        # Fused postprocess + scatter: RMSNorm + RoPE + Hadamard + paged cache write
-        torch.ops.trtllm.compressor_postprocess_scatter(
+        # Fused postprocess + scatter: RMSNorm + RoPE + Hadamard + paged cache
+        # write. Only an indexer compressor wants the postprocessed rows handed
+        # back -- a main compressor's consumer reads the cache.
+        out = postprocess_scatter_compressed(
             kv_comp,
-            kv_out,
-            self.norm.weight,
-            self.norm.variance_epsilon,
-            self.rotary_emb.rotary_cos_sin,
-            position_ids,
-            self.nope_head_dim,
-            self.rope_head_dim,
-            kv_cache,
-            num_comp_tokens,
-            cu_new_comp_kv,
-            start_pos,
-            block_table,
-            compressed_mask,
-            compress_tokens_per_block,
-            int(self.kv_cache_dtype),
-            self.rotate_activation,
-            quant_output,
-            scale_output,
+            metadata,
+            layer_idx=self.layer_idx,
+            compress_ratio=self.compress_ratio,
+            norm_weight=self.norm.weight,
+            norm_eps=self.norm.variance_epsilon,
+            rotary_cos_sin=self.rotary_emb.rotary_cos_sin,
+            nope_head_dim=self.nope_head_dim,
+            rope_head_dim=self.rope_head_dim,
+            kv_cache_dtype=self.kv_cache_dtype,
+            rotate_activation=self.rotate_activation,
+            is_indexer=self.is_indexer,
+            want_unquantized_copy=self.is_indexer and self.kv_cache_dtype == KVCacheDtype.NONE,
         )
-
-        if quant_output is not None:
-            if self.kv_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
-                return quant_output.view(torch.float4_e2m1fn_x2), scale_output
-            return quant_output.view(torch.float8_e4m3fn), scale_output
-        if kv_out is not None:
-            return kv_out, None
-        return kv_comp, None
+        return out
 
     def enable_footer_scale_cache(self) -> None:
         assert not self.is_indexer, "the indexer compressor keeps its native cache layout"
@@ -391,3 +458,187 @@ class Compressor(nn.Module):
         footer_scale_kv.quant_scatter(
             pool, loc.to(torch.int32).contiguous(), rows, page_size=tokens_per_block
         )
+
+
+class DeepseekV41Compressor(Compressor):
+    """V4.1's KV compressor: the same softmax pooling, minus the learned APE.
+
+    Three deltas against V4, all visible in the reference ``Compressor``
+    (model.py:437-485):
+
+    * **No APE.** V4 adds a learned ``[compress_ratio, state_dim]`` bias inside
+      the pooling softmax; V4.1 has no such parameter and its checkpoint carries
+      none. The kernels compute ``sum_r kv[r,d] * softmax(score[r,d] + ape[r,d])``
+      (compressorKernels.cu:1031), so a zero APE *is* the V4.1 math exactly --
+      hence a zeros buffer rather than a parameter, and no kernel change.
+    * **Ratio 1 is a plain projection.** ``norm(wkv(x))`` with no gate, no fp32,
+      and no cross-step pooling state (model.py:461). The checkpoint has ``wkv``
+      but no ``wgate``, so the fused ``wkv_gate`` of the base class would demand
+      a tensor that does not exist; and there is nothing for the reduction
+      kernels to reduce, so the whole pooling stage is skipped.
+    * **fp32 above ratio 1.** The reference promotes ``wkv``/``wgate`` to fp32
+      for the pooling path (model.py:447-449) while leaving ratio 1 in bf16. Only
+      the projection is promoted -- ``norm`` stays in the model dtype, because
+      the reference normalizes after casting the pooled result back
+      (model.py:485).
+
+    The other V4.1-specific need is a *pre-RoPE* view of the compressed latent:
+    the indexer's ``wk`` consumes it (model.py:526), while the cache holds the
+    RoPE'd form. :meth:`latent_pre_rope` reproduces it from the kernel's pooled
+    output.
+    """
+
+    def __init__(
+        self,
+        mla_params: MLAParams,
+        layer_idx: int,
+        compress_ratio: int,
+        norm_eps: float,
+        skip_create_weights_in_init: bool,
+        pos_embd_params: PositionalEmbeddingParams,
+        dtype: Optional[torch.dtype] = torch.bfloat16,
+        kv_cache_dtype: Union[str, KVCacheDtype] = KVCacheDtype.NONE,
+        is_indexer: bool = False,
+        rotate_activation: bool = False,
+    ):
+        assert not is_indexer, (
+            "V4.1's Indexer has no compressor of its own: its keys are a "
+            "reprojection of this compressor's latent (model.py:516-517)."
+        )
+        self.is_pooling = compress_ratio > 1
+        super().__init__(
+            mla_params,
+            layer_idx,
+            compress_ratio,
+            norm_eps,
+            skip_create_weights_in_init,
+            pos_embd_params,
+            dtype=dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            is_indexer=is_indexer,
+            rotate_activation=rotate_activation,
+        )
+        assert not self.overlap, (
+            "V4.1 keeps one pooling group in flight (model.py:451-456), so no "
+            f"layer should be an overlap compressor (ratio {compress_ratio})"
+        )
+
+        # A zeros buffer where V4 has a learned parameter: still a valid fp32
+        # pointer for the kernels, but nothing the loader has to find a tensor
+        # for. Non-persistent so it never reaches a saved state dict either.
+        del self.ape
+        self.register_buffer(
+            "ape",
+            torch.zeros(compress_ratio, self.state_dim, dtype=torch.float32),
+            persistent=False,
+        )
+
+        if self.is_pooling:
+            # Only the pooling projection goes fp32; `norm` keeps the model dtype.
+            self.wkv_gate = Linear(
+                self.dim,
+                self.state_dim * 2,
+                bias=False,
+                dtype=torch.float32,
+                quant_config=None,
+                skip_create_weights_in_init=skip_create_weights_in_init,
+                use_custom_cublas_mm=True,
+            )
+        else:
+            del self.wkv_gate
+            self.wkv = Linear(
+                self.dim,
+                self.head_dim,
+                bias=False,
+                dtype=dtype,
+                quant_config=None,
+                skip_create_weights_in_init=skip_create_weights_in_init,
+                use_custom_cublas_mm=True,
+            )
+
+    def latent_pre_rope(self, kv_comp: torch.Tensor) -> torch.Tensor:
+        """The compressed latent as the indexer sees it: normalized, unrotated.
+
+        ``compressor_postprocess_scatter`` fuses RMSNorm, RoPE and the cache
+        write, so the intermediate the indexer needs is never materialized. It is
+        cheap to recompute -- one RMSNorm over the compressed tokens, of which
+        there are ``seqlen / compress_ratio`` -- and doing so keeps the fused
+        kernel on the cache path untouched.
+
+        An empty batch is routine, not exceptional: a ratio-2 layer completes a
+        pooling group only every other decode step, so half of this layer's
+        generation forwards produce no compressed row at all. It has to be
+        short-circuited rather than left to the kernel because the unfused ops on
+        this path do not tolerate zero rows the way the fused scatter does
+        (``postProcessScatterLaunch`` returns early at ``total_tokens == 0``):
+        flashinfer's RMSNorm launches ``grid.x == M`` and CUDA rejects a zero
+        grid with ``cudaErrorInvalidValue`` before the kernel runs.
+        """
+        if kv_comp.shape[0] == 0:
+            return kv_comp
+        return self.norm(kv_comp)
+
+    def forward(
+        self, x: torch.Tensor, metadata
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.is_pooling:
+            return super().forward(x, metadata)
+        return self._forward_identity(x, metadata)
+
+    def _forward_identity(
+        self, x: torch.Tensor, metadata
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """The ratio-1 path: project every token, then norm + RoPE + scatter.
+
+        With one token per group there is no reduction and no state, so the two
+        compressor reduction kernels are skipped entirely -- which is also why
+        this generation does not need them instantiated for ``COMPRESS_RATIO=1``.
+        Token ``i`` of the batch becomes compressed row ``i``, so the pooled
+        buffer the scatter expects is just the projection itself: the per-request
+        row counts in ``cu_new_comp_kv`` equal the per-request token counts at
+        this ratio, in the same order.
+        """
+        num_contexts = metadata.num_contexts
+        num_generations = metadata.num_generations
+        bsz = num_contexts + num_generations
+
+        total_num_comp_tokens = metadata.num_total_compressed_tokens[self.compress_ratio]
+        assert total_num_comp_tokens == x.shape[0], (
+            "a ratio-1 compressor produces one compressed token per input token, "
+            f"but metadata expects {total_num_comp_tokens} from {x.shape[0]} tokens"
+        )
+        kv_comp = self.wkv(x)
+        total_tokens = kv_comp.shape[0]
+
+        if self.footer_scale_cache:
+            self._footer_scale_postprocess_scatter(
+                kv_comp,
+                metadata.kv_cache_manager.get_buffers(
+                    self.layer_idx, DeepseekV4AttentionType.COMPRESS
+                ),
+                metadata.compress_block_tables[self.compress_ratio],
+                metadata.kv_cache_manager.compressed_block_sizes[self.layer_idx],
+                metadata.new_comp_kv_lens_cuda[self.compress_ratio][:bsz],
+                metadata.cu_new_comp_kv_cuda[self.compress_ratio],
+                metadata.past_kv_lens_cuda[self.compress_ratio][:bsz],
+                metadata.compressed_position_ids_cuda[self.compress_ratio][:total_tokens],
+                metadata.compressed_mask_cuda[self.compress_ratio][:total_tokens],
+                bsz,
+            )
+            return kv_comp, None
+
+        postprocess_scatter_compressed(
+            kv_comp,
+            metadata,
+            layer_idx=self.layer_idx,
+            compress_ratio=self.compress_ratio,
+            norm_weight=self.norm.weight,
+            norm_eps=self.norm.variance_epsilon,
+            rotary_cos_sin=self.rotary_emb.rotary_cos_sin,
+            nope_head_dim=self.nope_head_dim,
+            rope_head_dim=self.rope_head_dim,
+            kv_cache_dtype=self.kv_cache_dtype,
+            rotate_activation=self.rotate_activation,
+            is_indexer=False,
+        )
+        return kv_comp, None

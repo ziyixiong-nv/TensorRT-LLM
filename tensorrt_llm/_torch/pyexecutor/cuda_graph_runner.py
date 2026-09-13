@@ -166,6 +166,12 @@ class CUDAGraphRunner:
         # graph runner does not need to know about the sampler.
         self._sample_type_resolver: Optional[Callable[
             [ScheduledRequests, Optional[SampleType]], SampleType]] = None
+        # Called just before each replay, after the static input buffers are
+        # filled. For state a model computes inside its own forward and a graph
+        # therefore captures the address of: a replay runs no Python, so nothing
+        # else refreshes it. Registered by the engine on the model's behalf.
+        self._pre_replay_hooks: List[Callable[
+            [KeyType, int, Dict[str, Any], Dict[str, Any]], None]] = []
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[KeyType,
@@ -433,6 +439,19 @@ class CUDAGraphRunner:
     ) -> None:
         """Register how a runtime batch maps to its sampling tier."""
         self._sample_type_resolver = resolver
+
+    def register_pre_replay_hook(
+        self, hook: Callable[[KeyType, int, Dict[str, Any], Dict[str, Any]],
+                             None]
+    ) -> None:
+        """Register a callback to run immediately before every graph replay.
+
+        The hook receives ``(key, num_tokens, static_tensors, current_inputs)``. It runs
+        after the static input buffers have been filled and outside any capture region, so
+        it may issue device work on the current stream but must not allocate storage the
+        graph reads -- writes have to be in place, into the buffers capture recorded.
+        """
+        self._pre_replay_hooks.append(hook)
 
     def _resolve_sample_type(
         self,
@@ -819,6 +838,11 @@ class CUDAGraphRunner:
             static_encoder_hidden_states[:actual_num_encoder_tokens].copy_(
                 encoder_hidden_states)
             static_encoder_hidden_states[actual_num_encoder_tokens:].zero_()
+
+        if self._pre_replay_hooks:
+            num_tokens = self._get_num_tokens_for_key(key)
+            for hook in self._pre_replay_hooks:
+                hook(key, num_tokens, static_tensors, current_inputs)
 
         self.graphs[key].replay()
         output_ref = self.graph_outputs[key]

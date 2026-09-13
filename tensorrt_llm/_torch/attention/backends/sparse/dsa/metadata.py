@@ -24,8 +24,11 @@ from .cache_manager import is_dsa_cache_manager
 from .fused_metadata import fused_dsa_decode_metadata
 from .indexer import (
     _DG_SCHEDULE_BLOCK_KV,
+    _INDEXER_RATIO_HOST_BUFFER_FIELDS,
     Indexer,
     IndexerPrefillChunkMetadata,
+    IndexerRatioState,
+    PrimaryIndexerRatioState,
     _compute_slot_mappings,
     _effective_compress_ratio_divisor,
     _pick_dsl_expand,
@@ -208,13 +211,31 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # (tokens_per_block // compress_ratio), so slot mappings must be built
         # against that stride — not kv_cache_manager.tokens_per_block directly.
         tpb = self.kv_cache_manager.tokens_per_block
-        self._indexer_compress_ratio = _select_indexer_compress_ratio(self.compress_ratios)
+        # A cache manager that allocates INDEXER_COMPRESS pools knows exactly
+        # which ratios exist, so let it be authoritative; the ratio list alone
+        # cannot distinguish "layer runs at ratio r" from "ratio r owns a pool".
+        # V4 reports [4] and V4.1 reports [1, 2]. For plain DSA (no such
+        # attribute) fall back to the guess from the layer ratios.
+        pool_ratios = getattr(self.kv_cache_manager, "indexer_compress_ratios", None)
+        if pool_ratios:
+            self.indexer_compress_ratios = sorted(pool_ratios)
+        else:
+            self.indexer_compress_ratios = [_select_indexer_compress_ratio(self.compress_ratios)]
+        # The lowest ratio is the primary: its state is a live view onto this
+        # metadata's own attributes, so single-ratio models keep every existing
+        # ``metadata.slot_mapping_fp8``-style reference and every buffer exactly
+        # as they were.
+        self._indexer_compress_ratio = self.indexer_compress_ratios[0]
         if hasattr(self.kv_cache_manager, "compressed_block_sizes"):
             tpb = tpb // _effective_compress_ratio_divisor(self._indexer_compress_ratio)
         self._tokens_per_block = tpb
-        # Mirror the indexer's two-level GVR decision. The representative
-        # compress ratio matches every live indexer: the DeepSeek-V4 backend
-        # only builds indexers on cr=4 layers and plain DSA uses cr=1.
+        self._indexer_ratio_states = {
+            self._indexer_compress_ratio: PrimaryIndexerRatioState(self),
+        }
+        # Mirror the indexer's two-level GVR decision. The primary ratio decides
+        # for every indexer: GVR is a global topk-kernel choice, and a model with
+        # two indexer ratios (V4.1) must not have half its layers on a different
+        # top-k kernel than the other half.
         self.use_self_sampling_topk = use_self_sampling_gvr(
             enable_heuristic_topk=self.enable_gvr_topk,
             use_self_sampling_topk=sparse_metadata_params.use_self_sampling_topk,
@@ -357,15 +378,50 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.slot_mapping_fp8_fullkv = self.slot_mapping_fp8
             self.slot_mapping_scale_fullkv = self.slot_mapping_scale
 
-    def get_indexer_kv_lens(self, kv_lens: torch.Tensor) -> torch.Tensor:
-        if self._indexer_compress_ratio <= 1:
-            return kv_lens
-        return kv_lens // self._indexer_compress_ratio
+    def indexer_state(self, compress_ratio: int | None = None):
+        """The indexer metadata belonging to one compress ratio.
 
-    def get_indexer_max_seq_len(self) -> int:
-        if self._indexer_compress_ratio <= 1:
+        Callers pass the ratio of the layer they are running
+        (``Indexer.compress_ratio``). A single-ratio model returns its sole state
+        regardless of what is asked for: plain DSA layers carry the default ratio
+        1 while their cache manager may report a different pool ratio, and there
+        is no ambiguity to resolve when there is only one.
+        """
+        states = self._indexer_ratio_states
+        if compress_ratio is None or len(states) == 1:
+            return states[self._indexer_compress_ratio]
+        state = states.get(compress_ratio)
+        if state is None:
+            raise KeyError(
+                f"No indexer metadata for compress ratio {compress_ratio}; "
+                f"available ratios are {sorted(states)}"
+            )
+        return state
+
+    def host_indexer_block_table(self, compress_ratio: int | None = None) -> torch.Tensor:
+        """Host INDEXER_COMPRESS page table for one compress ratio.
+
+        Base DSA has a single pool, so the ratio is ignored here; DeepSeek-V4
+        overrides this to reach its ratio-keyed tables. Fetched through a method
+        rather than stored on the state because a draft forward rebinds the
+        primary table (see prepare_for_draft_forward) and a snapshot would
+        outlive the swap.
+        """
+        return self.host_indexer_k_cache_block_offsets
+
+    def get_indexer_kv_lens(
+        self, kv_lens: torch.Tensor, compress_ratio: int | None = None
+    ) -> torch.Tensor:
+        ratio = self._indexer_compress_ratio if compress_ratio is None else compress_ratio
+        if ratio <= 1:
+            return kv_lens
+        return kv_lens // ratio
+
+    def get_indexer_max_seq_len(self, compress_ratio: int | None = None) -> int:
+        ratio = self._indexer_compress_ratio if compress_ratio is None else compress_ratio
+        if ratio <= 1:
             return self.kv_cache_manager.max_seq_len
-        return max(1, self.kv_cache_manager.max_seq_len // self._indexer_compress_ratio)
+        return max(1, self.kv_cache_manager.max_seq_len // ratio)
 
     def warmup_cute_dsl_radix_topk(self, next_n: int) -> None:
         """Pre-compile CuTe DSL radix variants not covered by engine warmup."""
@@ -517,6 +573,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             and self.num_generations > 0
             and self.num_contexts == 0
             and not self.use_fp8_ds_mla
+            # The fused kernel takes one page table, one slot mapping and one
+            # tokens_per_block, so it can only serve a single indexer ratio.
+            and len(self._indexer_ratio_states) == 1
         )
 
         # The draft loop can rewrite seq_lens after prepare() built this map.
@@ -525,6 +584,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.seq_lens_cuda[: self.num_seqs], self.num_tokens
             ).to(self.req_idx_per_token.dtype)
 
+        # Primary ratio only, deliberately. These mappings feed the indexer
+        # K-cache *scatter*, which DeepSeek-V4 and V4.1 override to a no-op (their
+        # compressor already scatters INDEXER_COMPRESS), so a secondary ratio has
+        # no consumer for them. The prefill *gather* mappings are per-ratio and
+        # are built in Indexer.prepare.
         if self.kv_cache_manager is not None and self.num_tokens > 0 and not fused_eligible:
             seq_lens = self.seq_lens_cuda[: self.num_seqs]
             # Runtime cached lengths after overlap/spec-dec correction.
@@ -577,25 +641,35 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     out=self.gen_cached_token_indptr[1 : self.num_generations + 1],
                 )
             gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
-            gen_indexer_kv_lens = self.get_indexer_kv_lens(gen_kv_lens)
-            self.gen_indexer_kv_lens_cuda_runtime = gen_indexer_kv_lens
-            next_n_cap = self.kv_lens_cuda_2d.shape[1]
-            self.kv_lens_cuda_2d[: self.num_generations, :next_n_cap].copy_(
-                gen_indexer_kv_lens.unsqueeze(-1).expand(-1, next_n_cap)
-            )
-            scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-                gen_indexer_kv_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, self.num_sms
-            )
-            self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
-            if self.max_draft_tokens > 0 and not self.use_expanded_buffers_for_mtp:
-                scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
-                    self.kv_lens_cuda_2d[: self.num_generations, :next_n_cap],
-                    _DG_SCHEDULE_BLOCK_KV,
-                    self.num_sms,
+            # One decode schedule per indexer ratio: a ratio-2 layer scans half
+            # as many compressed rows per request as a ratio-1 layer, and the
+            # DeepGEMM paged-MQA schedule is a function of exactly those lengths.
+            # Single-ratio models loop once and write the same buffers as before.
+            for state in self._indexer_ratio_states.values():
+                gen_indexer_kv_lens = self.get_indexer_kv_lens(gen_kv_lens, state.compress_ratio)
+                state.gen_indexer_kv_lens_cuda_runtime = gen_indexer_kv_lens
+                next_n_cap = state.kv_lens_cuda_2d.shape[1]
+                state.kv_lens_cuda_2d[: self.num_generations, :next_n_cap].copy_(
+                    gen_indexer_kv_lens.unsqueeze(-1).expand(-1, next_n_cap)
                 )
-                self.scheduler_metadata_buffer_full_next_n.copy_(
-                    scheduler_metadata_buffer_full_next_n, non_blocking=True
+                scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
+                    gen_indexer_kv_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, self.num_sms
                 )
+                state.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
+                if self.max_draft_tokens > 0 and not self.use_expanded_buffers_for_mtp:
+                    scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
+                        state.kv_lens_cuda_2d[: self.num_generations, :next_n_cap],
+                        _DG_SCHEDULE_BLOCK_KV,
+                        self.num_sms,
+                    )
+                    state.scheduler_metadata_buffer_full_next_n.copy_(
+                        scheduler_metadata_buffer_full_next_n, non_blocking=True
+                    )
+            # The expanded-MTP and DSL-expand buffers below are primary-ratio
+            # only. Both are speculative-decoding paths (max_draft_tokens >= 1),
+            # and _create_secondary_indexer_ratio_states refuses to build a
+            # secondary ratio when max_draft_tokens > 0.
+            gen_indexer_kv_lens = self.gen_indexer_kv_lens_cuda_runtime
             if self.use_expanded_buffers_for_mtp:
                 num_draft_tokens = 1 + self.max_draft_tokens
                 num_tokens = self.num_generations * num_draft_tokens
@@ -1028,6 +1102,77 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._create_radix_aux_buffers(capture_graph)
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
+        self._create_secondary_indexer_ratio_states(capture_graph=capture_graph)
+
+    def _secondary_indexer_ratio_buffer_shapes(self) -> dict:
+        """Shape/dtype of every ratio-dependent buffer, keyed by field name.
+
+        Mirrors the primary allocations above; kept as one table so a new
+        ratio-dependent buffer cannot be added to the primary and silently
+        forgotten for the secondary.
+        """
+        return {
+            "cu_seqlen_ks": ((self.max_num_tokens,), torch.int32),
+            "cu_seqlen_ke": ((self.max_num_tokens,), torch.int32),
+            "slot_mapping_fp8": ((self.max_num_tokens,), torch.int64),
+            "slot_mapping_scale": ((self.max_num_tokens,), torch.int64),
+            "scheduler_metadata_buffer": ((self.num_sms + 1, 2), torch.int32),
+            "scheduler_metadata_buffer_full_next_n": ((self.num_sms + 1, 2), torch.int32),
+            "kv_lens_cuda_2d": ((self.max_num_sequences, 1 + self.max_draft_tokens), torch.int32),
+        }
+
+    def _create_secondary_indexer_ratio_states(self, capture_graph=False) -> None:
+        """Give every indexer ratio above the primary its own metadata + buffers.
+
+        Only DeepSeek-V4.1 gets here: its index-key owners split across an
+        unpooled (ratio 1) and a pooled (ratio 2) INDEXER_COMPRESS pool, so the
+        two groups disagree on how many compressed rows a context has and cannot
+        share a slot mapping, a causal window, or a decode schedule. Everything
+        else has exactly one ratio and this is a no-op, which is what keeps V4 and
+        plain DSA bit-identical.
+        """
+        secondary_ratios = self.indexer_compress_ratios[1:]
+        if not secondary_ratios:
+            return
+        if self.max_draft_tokens > 0:
+            # prepare_for_spec_decode writes the expanded MTP buffers
+            # (kv_lens_expanded_cuda, block_table_expanded,
+            # scheduler_metadata_buffer_expanded) outside Indexer.prepare, so
+            # they exist for the primary ratio only. V4.1's heterogeneous MTP
+            # layers are not constructed yet, so refuse rather than run a
+            # secondary ratio against the primary's expanded schedule.
+            raise NotImplementedError(
+                "Speculative decoding with more than one indexer compress ratio "
+                f"is not supported yet (ratios {self.indexer_compress_ratios}, "
+                f"max_draft_tokens={self.max_draft_tokens})"
+            )
+        base_tokens_per_block = self.kv_cache_manager.tokens_per_block
+        shapes = self._secondary_indexer_ratio_buffer_shapes()
+        for ratio in secondary_ratios:
+            initial = {
+                "_indexer_compress_ratio": ratio,
+                "_tokens_per_block": (
+                    base_tokens_per_block // _effective_compress_ratio_divisor(ratio)
+                ),
+            }
+            for name, (shape, dtype) in shapes.items():
+                initial[name] = self.get_empty(
+                    self.cuda_graph_buffers,
+                    shape,
+                    # Ratio-suffixed so the buffer cache hands back distinct
+                    # storage rather than aliasing the primary's.
+                    cache_name=f"{name}_cr{ratio}",
+                    dtype=dtype,
+                    capture_graph=capture_graph,
+                )
+            for name in _INDEXER_RATIO_HOST_BUFFER_FIELDS:
+                device_name = name[len("host_") :]
+                initial[name] = torch.zeros_like(
+                    initial[device_name],
+                    device="cpu",
+                    pin_memory=prefer_pinned(),
+                )
+            self._indexer_ratio_states[ratio] = IndexerRatioState(**initial)
 
     def _create_kv_lens_2d_buffer(self, capture_graph=False):
         """Pre-allocated buffer for the DeepGEMM 2D context_lens API.

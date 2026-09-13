@@ -55,6 +55,7 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
     _resolve_fp8_ds_mla_head_dim,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
+    PrimaryIndexerRatioState,
     transform_local_topk_and_prepare_pool_view_grouped,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.params import use_self_sampling_gvr
@@ -472,6 +473,13 @@ def test_shared_topk_lifecycle(monkeypatch):
     )
     metadata._create_kv_lens_2d_buffer = Mock()
     metadata.create_expanded_buffers = Mock()
+    # `__post_init__` is bypassed here, so publish the single-ratio indexer state
+    # it would have installed. `create_buffers_for_indexer` reads it to decide
+    # whether any *secondary* ratio needs its own buffers -- for one ratio, none
+    # does.
+    metadata.indexer_compress_ratios = [1]
+    metadata._indexer_compress_ratio = 1
+    metadata._indexer_ratio_states = {1: PrimaryIndexerRatioState(metadata)}
 
     with patch(
         "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.prefer_pinned",
@@ -1305,8 +1313,20 @@ def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
         cache_manager.shutdown()
 
 
-def create_indexer(sparse_attn_config, layer_idx=0):
-    """Helper to create an Indexer for testing."""
+def create_indexer(sparse_attn_config, layer_idx=0, pretrained_config=None, compress_ratio=1):
+    """Helper to create an Indexer for testing.
+
+    ``pretrained_config`` is forwarded to ``to_sparse_params`` because several
+    architecture facts -- ``rms_norm_eps`` and the three V4.1 candidate-prefilter
+    values -- are read off the checkpoint config rather than off the user-facing
+    sparse config, so they are unreachable without it.
+
+    ``compress_ratio`` is passed explicitly rather than left at the class default
+    for the same reason production passes it (``deepseek_v4/backend.py:110``
+    reads ``compress_ratios[layer_idx]`` and forwards it): a test that lets it
+    default to 1 cannot tell a correctly-forwarded ratio from one that was never
+    forwarded at all, since 1 is also the value most release layers hold.
+    """
     # Create RopeParams
     rope_params = RopeParams(
         dim=64,  # qk_rope_head_dim
@@ -1329,7 +1349,7 @@ def create_indexer(sparse_attn_config, layer_idx=0):
             self.q_lora_rank = 512  # Example q_lora_rank
             self.qk_rope_head_dim = 64
 
-    sparse_params = sparse_attn_config.to_sparse_params()
+    sparse_params = sparse_attn_config.to_sparse_params(pretrained_config=pretrained_config)
     mla_params = MLAParams(sparse_params.index_head_dim)
 
     # Mock RotaryEmbedding since we're only testing cache management, not rope functionality
@@ -1348,6 +1368,7 @@ def create_indexer(sparse_attn_config, layer_idx=0):
             skip_create_weights_in_init=True,  # Skip weight creation for test
             sparse_params=sparse_params,
             dtype=torch.bfloat16,
+            compress_ratio=compress_ratio,
             layer_idx=layer_idx,
         )
 
@@ -1673,6 +1694,14 @@ def _create_mock_metadata(
             if hasattr(self.kv_cache_manager, "compressed_block_sizes"):
                 tpb = tpb // _effective_compress_ratio_divisor(self._indexer_compress_ratio)
             self._tokens_per_block = tpb
+            self.indexer_compress_ratios = [self._indexer_compress_ratio]
+            # `__post_init__` is bypassed here, so mirror the one piece of it the
+            # indexer now depends on: the per-ratio state map. A single
+            # `PrimaryIndexerRatioState` is a live view onto this object, so every
+            # `metadata.<field>` assignment below is what the indexer reads.
+            self._indexer_ratio_states = {
+                self._indexer_compress_ratio: PrimaryIndexerRatioState(self)
+            }
             self.kv_lens_cuda_runtime = kv_lens.cuda()
             self.indexer_k_cache_block_offsets = torch.zeros(
                 [batch_size, cache_manager.max_blocks_per_seq],

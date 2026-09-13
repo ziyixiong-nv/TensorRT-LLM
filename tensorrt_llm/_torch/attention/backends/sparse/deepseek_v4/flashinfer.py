@@ -94,7 +94,7 @@ def run_flashinfer_sparse_mla(
     window = attn.sparse_attention_config.window_size
     swa_lens = (positions + 1).clamp(max=window).to(torch.int32)
 
-    if attn.compress_ratio > 1:
+    if attn.has_compressed_kv:
         if extra_indices is None:
             raise RuntimeError("Compressed DeepSeek-V4 layers require extra sparse indices.")
         extra_lens = (
@@ -123,7 +123,7 @@ def run_flashinfer_sparse_mla(
     )
 
     sm_scale = 1.0 / (attn.q_scaling * math.sqrt(attn.head_dim))
-    swa_pool = footer_scale_kv.get_pool_2d(metadata, DeepseekV4AttentionType.SWA, 1)
+    swa_pool = footer_scale_kv.get_pool_2d(metadata, DeepseekV4AttentionType.SWA, compress_ratio=0)
     swa_pool_paged = swa_pool.view(-1, footer_scale_kv.PAGE_SIZE, footer_scale_kv.TOKEN_BYTES)
     extra_pool_paged = None
     if extra_pool is not None:

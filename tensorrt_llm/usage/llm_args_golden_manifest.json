@@ -1683,6 +1683,13 @@
     },
     {
       "allowed_values": [],
+      "annotation": "Optional[List[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.index_source_layer_ids"
+    },
+    {
+      "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
       "kind": "value",
@@ -1738,6 +1745,13 @@
       "converter": "allowlist",
       "kind": "categorical",
       "path": "sparse_attention_config.kt_cache_dtype"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.kv_source_layer_ids"
     },
     {
       "allowed_values": [],
@@ -1887,6 +1901,16 @@
       "converter": "",
       "kind": "value",
       "path": "sparse_attention_config.use_self_sampling_topk"
+    },
+    {
+      "allowed_values": [
+        "v4",
+        "v41"
+      ],
+      "annotation": "Literal['v4', 'v41']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "sparse_attention_config.variant"
     },
     {
       "allowed_values": [],

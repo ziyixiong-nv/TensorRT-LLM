@@ -167,6 +167,11 @@ def get_pool_2d(
         base_ptr = manager.swa_pool_ptr
         block_tokens = manager.tokens_per_block
         layers = list(manager.pp_layers)
+        # Every layer shares one SWA pool, so the ratio selects nothing here.
+        # Normalize it out of the cache key: V4 callers pass 1 and V4.1 callers
+        # would pass 0 or a real compressed ratio, and all of them must land on
+        # the same view of the same memory.
+        compress_ratio = None
     else:
         base_ptr = manager.compress_pool_ptrs[compress_ratio]
         layers = [
@@ -227,12 +232,14 @@ def append_swa(
         req_id=req_id,
         block_table_swa=block_table_swa,
         swa_local_indices=positions.unsqueeze(1).contiguous(),
-        swa_pool_base_ptr=metadata.sparse_mla_base_ptrs[1],
+        swa_pool_base_ptr=metadata.swa_pool_base_ptr,
         swa_buffer_ptr=metadata.swa_buffer_ptrs[attn.layer_idx],
         tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
         token_stride=TOKEN_BYTES,
     ).view(-1)
-    swa_pool = get_pool_2d(metadata, DeepseekV4AttentionType.SWA, 1, page_size=page_size)
+    swa_pool = get_pool_2d(
+        metadata, DeepseekV4AttentionType.SWA, compress_ratio=0, page_size=page_size
+    )
     quant_scatter(swa_pool, loc, latent_rows, page_size=page_size)
 
 

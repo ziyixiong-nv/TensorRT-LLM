@@ -34,6 +34,8 @@ from tokenizers import Regex, normalizers
 from torch import nn
 from transformers import AutoTokenizer
 
+from ..embedding import get_masked_input_and_mask
+
 # Default Engram embedding vocabulary size per n-gram level.
 # Derived from the DeepSeek-V3 tokenizer vocab size (129280) scaled by 5.
 _DEFAULT_ENGRAM_VOCAB_SIZE = 129280 * 5
@@ -381,10 +383,19 @@ class EngramHashProvider:
 
         self._multipliers: Dict[int, torch.Tensor] = {}
         self._modules: Dict[int, List[torch.Tensor]] = {}
+        # The same moduli as plain Python ints. They are static, so reading them
+        # out of the device tensors above with `.item()` inside the per-head hash
+        # loop costs one host sync per (layer, n-gram, head) -- 48 per forward on
+        # V4.1-Flash -- for values known at construction time.
+        self._moduli_ints: Dict[int, List[List[int]]] = {}
         for layer_id in config.layer_ids:
             self._multipliers[layer_id] = hash_mapping.layer_multipliers[layer_id].clone()
             self._modules[layer_id] = [
                 torch.tensor(ngram_head_sizes, dtype=torch.long)
+                for ngram_head_sizes in hash_mapping.vocab_size_across_layers[layer_id]
+            ]
+            self._moduli_ints[layer_id] = [
+                [int(size) for size in ngram_head_sizes]
                 for ngram_head_sizes in hash_mapping.vocab_size_across_layers[layer_id]
             ]
 
@@ -398,6 +409,22 @@ class EngramHashProvider:
         self._cached_hashes: Optional[Dict[int, torch.Tensor]] = None
         self._cached_hashes_store: Dict[tuple, Dict[int, torch.Tensor]] = {}
 
+        # Per-request history of compressed token ids, so that an n-gram at a
+        # decode step can reach the tokens that preceded it. Without this the
+        # look-back can only see the tokens inside the current forward, which is
+        # correct for a prefill and wrong for every generation step: a decode
+        # forward carries exactly one token per sequence, so every n-gram would
+        # degenerate to (pad, ..., pad, tok). Mirrors ``NgramHashState.cache`` in
+        # the reference implementation, which keeps the same per-sequence buffer
+        # for the same reason.
+        #
+        # Rows are grown on demand rather than sized from `max_batch_size` up
+        # front: the column count is `max_seq_len`, so a fixed allocation costs
+        # hundreds of MiB on a long-context config that may never use it.
+        self._history: Optional[torch.Tensor] = None
+        self._history_row_of: Dict[int, int] = {}
+        self._history_free_rows: List[int] = []
+
     def _ensure_on_device(self, device: torch.device):
         """Move hash tensors to the specified device (lazy, once)."""
         if self._device == device:
@@ -408,10 +435,145 @@ class EngramHashProvider:
             self._modules[layer_id] = [m.to(device) for m in self._modules[layer_id]]
         self._device = device
 
+    # Sentinel for a history cell that was never written. The reference uses the
+    # same value for the same purpose (`NgramHashState.DEAD`), where it marks a
+    # token excluded from n-gram formation; here it additionally covers cells no
+    # forward has reached yet, which happens when a row is recycled between
+    # requests or when prefix reuse skips part of a prompt. Either way an n-gram
+    # that reaches such a cell must be dropped, not hashed against garbage.
+    _DEAD = -1
+
+    def _reserve_history_rows(
+        self,
+        request_ids: List[int],
+        min_columns: int,
+        device: torch.device,
+    ) -> List[int]:
+        """Map each request id to a stable history row, allocating as needed.
+
+        Rows are recycled: a request that has left the batch may have finished,
+        and nothing notifies us when it does. Reclaiming a row that is merely
+        idle is still safe because a request only re-enters the batch through a
+        context phase, which rewrites its history from position zero -- and any
+        cell that phase does not cover reads back ``_DEAD`` and is dropped.
+        """
+        rows = self._history.shape[0] if self._history is not None else 0
+        columns = self._history.shape[1] if self._history is not None else 0
+        needed_rows = max(rows, 1)
+        while needed_rows < len(request_ids):
+            needed_rows *= 2
+        needed_columns = max(columns, 1)
+        while needed_columns < min_columns:
+            needed_columns *= 2
+
+        if self._history is None or needed_rows > rows or needed_columns > columns:
+            grown = torch.full(
+                (needed_rows, needed_columns),
+                self._DEAD,
+                dtype=torch.int32,
+                device=device,
+            )
+            if self._history is not None and self._history.device == device:
+                grown[:rows, :columns] = self._history
+            else:
+                # A device change invalidates the row map along with the buffer.
+                self._history_row_of = {}
+            self._history = grown
+            self._history_free_rows = [
+                row for row in range(needed_rows) if row not in set(self._history_row_of.values())
+            ]
+
+        live = set(request_ids)
+        assigned: List[int] = []
+        for request_id in request_ids:
+            row = self._history_row_of.get(request_id)
+            if row is None:
+                if not self._history_free_rows:
+                    # Evict any row held by a request outside this batch. One is
+                    # guaranteed to exist: the buffer has at least as many rows
+                    # as the batch has requests.
+                    stale = [rid for rid in self._history_row_of if rid not in live]
+                    assert stale, (
+                        "engram history has no free row and every row belongs to a "
+                        f"request in this batch (rows={self._history.shape[0]}, "
+                        f"batch={len(request_ids)})"
+                    )
+                    for rid in stale:
+                        self._history_free_rows.append(self._history_row_of.pop(rid))
+                row = self._history_free_rows.pop()
+                # A recycled row still holds the previous request's tokens, which
+                # would otherwise be hashed into this one's first n-grams.
+                self._history[row].fill_(self._DEAD)
+                self._history_row_of[request_id] = row
+            assigned.append(row)
+        return assigned
+
+    def _lookback_from_history(
+        self,
+        compressed: torch.Tensor,
+        position_ids: torch.Tensor,
+        seq_lens_host: torch.Tensor,
+        request_ids: List[int],
+        max_seq_len: Optional[int],
+    ) -> List[torch.Tensor]:
+        """Return the shifted n-gram inputs, reading across forward boundaries.
+
+        Writes this forward's compressed ids into each request's row at their
+        absolute positions, then gathers the ``max_ngram_size`` look-back slots
+        out of the row. This replaces left-padding the current forward's token
+        window, which silently substitutes ``pad_id`` for real history.
+        """
+        device = compressed.device
+        positions = position_ids.view(-1).long()
+        num_tokens = compressed.shape[0]
+
+        # Sizing from the runtime's sequence-length ceiling keeps this off the
+        # critical path: reading the true maximum off `positions` would mean a
+        # device-to-host sync on every forward, and the ceiling is known up
+        # front. Only a caller that cannot supply it pays for the sync.
+        min_columns = max_seq_len
+        if min_columns is None:
+            min_columns = int(positions.max().item()) + 1 if num_tokens else 1
+        rows = self._reserve_history_rows(request_ids, min_columns, device)
+        # Expanded on the host and copied once, rather than by a device-side
+        # `repeat_interleave`: the latter has to read the counts back to size its
+        # output, which is a full sync on the critical path.
+        row_of_token = torch.repeat_interleave(
+            torch.tensor(rows, dtype=torch.long),
+            seq_lens_host[: len(rows)].to(torch.long),
+        ).to(device=device, non_blocking=True)
+        assert row_of_token.shape[0] == num_tokens, (
+            f"engram history: seq_lens sum to {row_of_token.shape[0]} tokens but the "
+            f"forward carries {num_tokens}"
+        )
+
+        self._history[row_of_token, positions] = compressed.to(torch.int32)
+
+        shifts: List[torch.Tensor] = []
+        # `blocked` accumulates: once a shorter look-back is unusable every longer
+        # one is too, so a single dead cell truncates the n-gram rather than
+        # leaving a hole in the middle of it. This is the reference's rule.
+        blocked = torch.zeros(num_tokens, dtype=torch.bool, device=device)
+        for shift in range(self.config.max_ngram_size):
+            source = self._history[row_of_token, (positions - shift).clamp_min(0)]
+            blocked = blocked | (positions < shift) | (source == self._DEAD)
+            shifts.append(
+                torch.where(
+                    blocked,
+                    torch.full_like(source, self._pad_id),
+                    source,
+                ).to(compressed.dtype)
+            )
+        return shifts
+
     def compute_hashes(
         self,
         input_ids: torch.Tensor,
         seq_lens: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        request_ids: Optional[List[int]] = None,
+        seq_lens_host: Optional[torch.Tensor] = None,
+        max_seq_len: Optional[int] = None,
     ) -> Dict[int, torch.Tensor]:
         """Compute hash indices on GPU using PyTorch ops.
 
@@ -428,6 +590,14 @@ class EngramHashProvider:
             seq_lens: Optional 1-D tensor of per-sequence lengths.  When
                 provided, shifted n-gram windows that would cross a
                 sequence boundary are replaced with ``pad_id``.
+            position_ids: Optional absolute position of each token, shape
+                ``[T]``.  Together with ``request_ids`` this enables the
+                per-request history buffer, which is what lets a generation
+                step's n-grams reach the tokens that came before it.  Without
+                both, the look-back is confined to this forward's tokens --
+                correct for a whole-prompt prefill, wrong for decode.
+            request_ids: Optional per-sequence request ids in the same order as
+                ``seq_lens``, used to key the history buffer.
 
         Returns:
             Dictionary mapping layer_id to hash indices as torch.Tensor
@@ -452,16 +622,29 @@ class EngramHashProvider:
 
         (T,) = compressed.shape
 
-        # 2. Pre-compute shifted versions (left-padded with pad_id)
-        shifts = [compressed]
-        for k in range(1, self.config.max_ngram_size):
-            padded = torch.nn.functional.pad(compressed, (k, 0), value=self._pad_id)
-            shifts.append(padded[:T])
+        use_history = (
+            position_ids is not None and request_ids is not None and seq_lens_host is not None
+        )
+        if use_history:
+            # 2. Shifted versions read out of the per-request history, which
+            # spans forwards. Absolute positions and per-request rows make the
+            # sequence-boundary masking below unnecessary: each sequence owns a
+            # row and its own position origin, so a look-back cannot reach
+            # another sequence's tokens in the first place.
+            shifts = self._lookback_from_history(
+                compressed, position_ids, seq_lens_host, list(request_ids), max_seq_len
+            )
+        else:
+            # 2. Pre-compute shifted versions (left-padded with pad_id)
+            shifts = [compressed]
+            for k in range(1, self.config.max_ngram_size):
+                padded = torch.nn.functional.pad(compressed, (k, 0), value=self._pad_id)
+                shifts.append(padded[:T])
 
         # 2b. When input_ids is a packed/flattened tensor containing multiple
         # sequences, mask out shifted positions that cross sequence boundaries
         # so n-gram hashes stay within each sequence.
-        if seq_lens is not None and seq_lens.numel() > 1:
+        if not use_history and seq_lens is not None and seq_lens.numel() > 1:
             cum_lens = torch.cumsum(seq_lens, dim=0)
             seq_starts = torch.cat(
                 [
@@ -491,9 +674,9 @@ class EngramHashProvider:
                 for k in range(1, n):
                     mix = torch.bitwise_xor(mix, shifts[k] * multipliers[k])
 
-                moduli = self._modules[layer_id][n_gram_index]
+                moduli = self._moduli_ints[layer_id][n_gram_index]
                 for j in range(self.config.n_head_per_ngram):
-                    head_hash = mix % int(moduli[j].item())
+                    head_hash = mix % moduli[j]
                     all_hashes.append(head_hash)
 
             result[layer_id] = torch.stack(all_hashes, dim=1)
@@ -515,6 +698,59 @@ class EngramHashProvider:
             self._cached_hashes = result
         return self._cached_hashes
 
+    def refresh_captured_hashes(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        seq_lens: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        request_ids: Optional[List[int]] = None,
+        seq_lens_host: Optional[torch.Tensor] = None,
+        max_seq_len: Optional[int] = None,
+    ) -> Dict[int, torch.Tensor]:
+        """Recompute the cached hashes in place, for a step that will be replayed.
+
+        ``compute_hashes`` is called from inside ``DeepseekV4Model.forward``, so a CUDA
+        graph replay -- which runs no Python -- never reaches it. The captured graph then
+        reads whatever the last eager forward left in these buffers: the warmup batch's
+        n-grams early on, some other request's prefill later. Measured on 8 ranks: 15
+        consecutive replays over 15 distinct inputs produce a single distinct hash value.
+
+        This is the host-side counterpart of that capture short-circuit. It must run at the
+        replay boundary, before ``graph.replay()``, where the runner's static input buffers
+        are already filled but no capture is in progress.
+
+        The shape guard is the point of the method. ``compute_hashes`` writes in place only
+        when it recognises the shape; on a new shape it allocates (``:687``) and the caller
+        gets a plausible return value while the graph keeps replaying stale hashes. That is
+        a silent wrong answer, so it is converted into a crash here.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "EngramHashProvider.refresh_captured_hashes() must not be called while the "
+                "stream is capturing. It is the replay-path counterpart of the capture "
+                "short-circuit in compute_hashes(), not a way around it."
+            )
+
+        known_shapes = set(self._cached_hashes_store)
+        result = self.compute_hashes(
+            input_ids,
+            seq_lens=seq_lens,
+            position_ids=position_ids,
+            request_ids=request_ids,
+            seq_lens_host=seq_lens_host,
+            max_seq_len=max_seq_len,
+        )
+        shape_key = tuple(tuple(v.shape) for v in result.values())
+        if shape_key not in known_shapes:
+            raise RuntimeError(
+                f"EngramHashProvider.refresh_captured_hashes() computed hashes of shape "
+                f"{shape_key}, for which no captured graph is reading a buffer (known "
+                f"shapes: {sorted(known_shapes)}). The recomputed values went into a fresh "
+                "allocation, so the graph about to replay would still read stale hashes."
+            )
+        return result
+
     @property
     def layer_ids(self) -> List[int]:
         """Return the list of layer IDs that have Engram modules."""
@@ -524,6 +760,22 @@ class EngramHashProvider:
     def vocab_size_across_layers(self) -> Dict[int, List[List[int]]]:
         """Return the vocabulary sizes for each layer and head."""
         return self._vocab_size_across_layers
+
+
+def _bucket_offsets(list_of_N: List[int]) -> torch.Tensor:
+    """Exclusive prefix sum over per-head bucket sizes: each head's base row.
+
+    One definition shared by both multi-head embedding classes below. The bucket
+    layout is the contract between the per-head hash indices ``EngramHashProvider``
+    computes and the flat table they index, and the two classes must agree on it
+    (see ``DeepseekV41Engram._make_multi_head_embedding``). Two copies would drift
+    into silently wrong lookups rather than a shape error, since both tables have
+    the same total row count.
+    """
+    offsets = [0]
+    for n in list_of_N[:-1]:
+        offsets.append(offsets[-1] + n)
+    return torch.tensor(offsets, dtype=torch.long)
 
 
 class MultiHeadEmbedding(nn.Module):
@@ -538,11 +790,7 @@ class MultiHeadEmbedding(nn.Module):
         self.num_heads = len(list_of_N)
         self.embedding_dim = D
 
-        offsets = [0]
-        for n in list_of_N[:-1]:
-            offsets.append(offsets[-1] + n)
-
-        self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.long))
+        self.register_buffer("offsets", _bucket_offsets(list_of_N))
 
         total_N = sum(list_of_N)
         self.embedding = nn.Embedding(num_embeddings=total_N, embedding_dim=D, dtype=dtype)
@@ -684,6 +932,34 @@ class Engram(nn.Module):
       - **No conv state for generation**: See ``ShortConv`` docstring.
     """
 
+    def _make_multi_head_embedding(self, list_of_N: List[int], D: int) -> nn.Module:
+        """Build the n-gram table.
+
+        A hook rather than a class attribute because the alternative
+        implementation (:class:`ShardedFp8MultiHeadEmbedding`) takes different
+        constructor arguments, and because the table has to be built *instead of*
+        the dense one, never alongside it: DeepSeek-V4.1's tables are 384 M rows,
+        so materializing an ``nn.Embedding`` for them would try to allocate
+        ~197 GiB before the subclass got a chance to replace it.
+        """
+        return MultiHeadEmbedding(list_of_N=list_of_N, D=D, dtype=self.config.dtype)
+
+    def _make_short_conv(self) -> Optional[nn.Module]:
+        """Build the depthwise convolution, or return None if there isn't one.
+
+        DeepSeek-V4.1's Engram has no convolution at all (its checkpoint ships no
+        conv weights), so its subclass returns None and overrides ``forward``.
+        """
+        config = self.config
+        return ShortConv(
+            hidden_size=config.hidden_size,
+            kernel_size=config.kernel_size,
+            dilation=config.max_ngram_size,
+            hc_mult=config.hc_mult,
+            norm_eps=config.norm_eps,
+            dtype=config.dtype,
+        )
+
     def __init__(
         self,
         layer_id: int,
@@ -722,20 +998,16 @@ class Engram(nn.Module):
 
         dtype = config.dtype
 
-        self.multi_head_embedding = MultiHeadEmbedding(
-            list_of_N=vocab_sizes_flat,
-            D=embed_dim_per_head,
-            dtype=dtype,
+        # Kept so subclasses (and weight-loading checks) can see the per-head
+        # bucket sizes without re-deriving them from the table's offsets.
+        self.vocab_sizes_flat = list(vocab_sizes_flat)
+        self.embed_dim_per_head = embed_dim_per_head
+
+        self.multi_head_embedding = self._make_multi_head_embedding(
+            vocab_sizes_flat, embed_dim_per_head
         )
 
-        self.short_conv = ShortConv(
-            hidden_size=config.hidden_size,
-            kernel_size=config.kernel_size,
-            dilation=config.max_ngram_size,
-            hc_mult=config.hc_mult,
-            norm_eps=config.norm_eps,
-            dtype=dtype,
-        )
+        self.short_conv = self._make_short_conv()
 
         engram_hidden_size = (config.max_ngram_size - 1) * config.n_embed_per_ngram
         hc = config.hc_mult
@@ -779,13 +1051,26 @@ class Engram(nn.Module):
         if self.stream is not None:
             # Fork: let the engram stream wait for any pending main-stream work
             # (e.g. hash computation) before we start the embedding lookup.
-            self.stream.wait_stream(torch.cuda.current_stream())
+            caller_stream = torch.cuda.current_stream()
+            self.stream.wait_stream(caller_stream)
+            # `hash_indices` was allocated on the caller's stream but is read on
+            # ours. Ordering alone is not enough: the caching allocator frees a
+            # block against its *allocating* stream, so once the caller drops its
+            # reference the block can be handed to another caller-stream
+            # allocation while this lookup is still reading it.
+            hash_indices.record_stream(self.stream)
             with torch.cuda.stream(self.stream):
                 embeddings = self.multi_head_embedding(hash_indices)
                 embeddings = embeddings.flatten(start_dim=-2)
                 if dtype is not None:
                     embeddings = embeddings.to(dtype)
                 self.sync_event.record()
+            # The mirror image, and the one that actually corrupts decode:
+            # `embeddings` is allocated here but consumed on the caller's stream
+            # a whole layer stack later. Without this the block returns to *this*
+            # stream's pool as soon as the caller's cache dict drops, and the next
+            # step's lookup reissues it underneath a still-pending read.
+            embeddings.record_stream(caller_stream)
         else:
             embeddings = self.multi_head_embedding(hash_indices)
             embeddings = embeddings.flatten(start_dim=-2)
@@ -844,3 +1129,137 @@ class Engram(nn.Module):
 
         output = value + self.short_conv(value)
         return output
+
+
+class ShardedFp8MultiHeadEmbedding(nn.Module):
+    """Row-sharded fp8 n-gram table, dequantized on lookup.
+
+    The dense :class:`MultiHeadEmbedding` above keeps its table in the compute
+    dtype and replicates it on every rank. That is fine for a table of a few
+    hundred thousand rows; it is not an option for DeepSeek-V4.1, whose two
+    Engram tables hold 384_006_168 and 384_016_682 rows of 256 lanes. In bf16
+    that is ~197 GiB *each*, replicated -- more than a whole node. Stored as the
+    checkpoint stores them (fp8 e4m3 rows plus one e8m0 exponent per 32 lanes)
+    and sharded over the rank dimension, the pair costs ~24.7 GiB per rank at
+    TP=8, which is what makes the model loadable at all.
+
+    Mirrors the reference ``ParallelEngramEmbedding``
+    (``<checkpoint>/inference/model.py:296-325``) exactly: contiguous row shards,
+    out-of-shard indices masked to row 0 and then zeroed, an in-place dequant to
+    ``dtype``, and a sum all-reduce to reassemble. Every rank looks up every
+    index, so the mask -- not the index arithmetic -- is what keeps the sum
+    correct: without zeroing, each rank would contribute row 0 of its own shard
+    for the indices it does not own.
+
+    Note the shard is over the *concatenated* table (all heads' bucket ranges
+    end to end), not per head. Head ranges are already disjoint via ``offsets``,
+    so one flat shard split is both simpler and better balanced than sharding
+    each head's range separately.
+    """
+
+    def __init__(
+        self,
+        list_of_N: List[int],
+        D: int,
+        block_size: int = 32,
+        dtype: Optional[torch.dtype] = None,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+    ):
+        super().__init__()
+        if D % block_size != 0:
+            raise ValueError(
+                f"Engram embedding dim {D} is not a multiple of the fp8 block size "
+                f"{block_size}; the checkpoint stores one exponent per block, so a "
+                "partial trailing block has no scale to dequantize it with."
+            )
+        self.num_heads = len(list_of_N)
+        self.embedding_dim = D
+        self.block_size = block_size
+        self.dtype = dtype if dtype is not None else torch.bfloat16
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+
+        self.register_buffer("offsets", _bucket_offsets(list_of_N))
+
+        self.num_embeddings = sum(list_of_N)
+        # Ceil-divide and let the last rank hold a short tail rather than
+        # distributing the remainder, so `vocab_start_idx` stays a plain
+        # multiplication -- same split the reference uses.
+        self.part_num_embeddings = (self.num_embeddings + tp_size - 1) // tp_size
+        self.vocab_start_idx = tp_rank * self.part_num_embeddings
+        self.vocab_end_idx = min(
+            self.vocab_start_idx + self.part_num_embeddings, self.num_embeddings
+        )
+
+        self.weight = nn.Parameter(
+            torch.empty(self.part_num_embeddings, D, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        self.scale = nn.Parameter(
+            torch.empty(self.part_num_embeddings, D // block_size, dtype=torch.float8_e8m0fnu),
+            requires_grad=False,
+        )
+
+    def load_weights(self, weights: List[Dict]) -> None:
+        """Copy this rank's contiguous row shard out of the full table.
+
+        Takes the slice rather than the whole tensor because the checkpoint
+        shards nothing: both ``weight`` and ``scale`` arrive full height. The
+        source is indexed lazily (``weights[...][start:end]`` on a safetensors
+        slice) so the un-owned rows are never faulted into host memory -- reading
+        the full 98 GiB table on every rank to then keep an eighth of it would
+        make loading unworkable regardless of GPU capacity.
+        """
+        weights = weights[0] if isinstance(weights, list) else weights
+        start, end = self.vocab_start_idx, self.vocab_end_idx
+        for name, param in (("weight", self.weight), ("scale", self.scale)):
+            src = weights[name]
+            shard = src[start:end]
+            if not isinstance(shard, torch.Tensor):
+                shard = torch.as_tensor(shard)
+            rows = shard.shape[0]
+            if rows != param.shape[0]:
+                # Only the final rank can be short, and only by the ceil-divide
+                # remainder. Anything else means the table is not the size the
+                # bucket layout says it is, which would silently rehash it.
+                if self.tp_rank != self.tp_size - 1 or rows > param.shape[0]:
+                    raise ValueError(
+                        f"Engram {name}: rank {self.tp_rank}/{self.tp_size} expected "
+                        f"{param.shape[0]} rows in [{start}, {end}) of a "
+                        f"{self.num_embeddings}-row table but the checkpoint tensor "
+                        f"yielded {rows}."
+                    )
+                param.data[:rows].copy_(shard.to(param.dtype))
+                # Tail padding must dequantize to exactly zero, not to garbage:
+                # a masked index lands on row 0 of the shard, but a *valid* index
+                # can never reach the pad rows, so zeroing is belt-and-braces
+                # against an out-of-range hash.
+                param.data[rows:].zero_()
+            else:
+                param.data.copy_(shard.to(param.dtype))
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """``[T, num_heads]`` bucket-local indices -> ``[T, num_heads, D]``.
+
+        The all-reduce is left to the caller (see
+        ``DeepseekV41Engram.precompute``): it runs on the Engram side stream, so
+        issuing a collective from inside this module would order it against the
+        wrong stream.
+        """
+        indices = input_ids + self.offsets
+        # The shared vocab-parallel shard mask, not a private reimplementation:
+        # ``VocabParallelEmbedding`` and the LM head both go through it, and a
+        # third copy of the convention in this package would drift into silently
+        # zeroed rows -- which the caller's sum all-reduce then makes
+        # indistinguishable from a real embedding -- rather than into an error.
+        # It returns the *drop* mask, already unsqueezed to broadcast over ``D``.
+        local, drop = get_masked_input_and_mask(indices, self.vocab_start_idx, self.vocab_end_idx)
+
+        values = torch.nn.functional.embedding(local, self.weight)
+        scales = torch.nn.functional.embedding(local, self.scale)
+        out = values.float().unflatten(-1, (-1, self.block_size)) * scales.float().unsqueeze(-1)
+        out = out.flatten(-2).to(self.dtype)
+        # In place: ``out`` is this call's own dequant result, so the out-of-place
+        # form only bought a second ``[T, num_heads, D]`` allocation and a copy.
+        return out.masked_fill_(drop, 0)

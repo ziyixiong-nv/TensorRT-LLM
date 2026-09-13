@@ -908,6 +908,53 @@ def load_pretrained_config(model_name_or_path: str,
             text_dict["quantization_config"] = quantization_config
         model_config = Qwen4ExpTextConfig.from_dict(text_dict)
         model_config.architectures = ["Qwen4ExpForCausalLM"]
+    elif model_type in ("deepseek_v41", "deepseek_v41_text"):
+        # DeepSeek-V4.1-Flash. The released checkpoint is a composite config
+        # (``deepseek_v41`` with a nested ``deepseek_v41_text`` tower and a
+        # ``deepseek_v41_vision`` tower); a standalone text checkpoint publishes
+        # the text config flat. Keep the composite in the nested case so
+        # ``vision_config`` survives for the eventual VLM wrapper -- the composite
+        # forwards every public text field, so downstream code that reads e.g.
+        # ``pretrained_config.num_hidden_layers`` keeps working (which also makes
+        # ``_mirror_text_subconfig_attrs`` a no-op here, leaving one owner for
+        # those 59 fields instead of a copy on each level).
+        #
+        # ``architectures`` is pinned to the text CausalLM on both levels: the
+        # text tower is the supported path, and routing the composite to a
+        # ``ForConditionalGeneration`` that does not exist yet would make the
+        # released checkpoint unloadable. Flip the outer entry to
+        # ``DeepseekV41ForConditionalGeneration`` when the vision path lands,
+        # behind a multimodal detector ahead of this branch (see the Kimi-K3 and
+        # Qwen4-Exp pairs above for the shape).
+        #
+        # A branch rather than a ``_CONFIG_REGISTRY`` entry because the registry
+        # only resolves a class and calls ``from_pretrained``: it has nowhere to
+        # resolve the dtype (V4.1 declares ``dtype`` at the top level only, so the
+        # text tower would come out with ``dtype=None`` and the KV-cache byte
+        # sizing divides by ``None.itemsize``) or to pin ``text_config``'s
+        # ``architectures``, which the released config.json does not carry.
+        # ``quantization_config`` propagation is *not* done here -- it lives in
+        # ``DeepseekV41Config.__init__`` so that every construction path
+        # (``AutoConfig``, ``from_dict``, direct construction in tests) gets it,
+        # not just this call site.
+        from tensorrt_llm._torch.configs import (DeepseekV41Config,
+                                                 DeepseekV41TextConfig)
+        nested_text = config_dict.get("text_config")
+        if isinstance(nested_text, dict) and nested_text:
+            resolved_dtype = _resolve_composite_torch_dtype(
+                config_dict, nested_text)
+            model_config = DeepseekV41Config.from_dict(config_dict, **kwargs)
+            model_config.text_config.architectures = ["DeepseekV41ForCausalLM"]
+            model_config.text_config.torch_dtype = resolved_dtype
+            model_config.torch_dtype = resolved_dtype
+        else:
+            # ``dict(config_dict)`` already carries the top-level
+            # ``quantization_config``, and ``DeepseekV41TextConfig`` propagates it
+            # in ``__init__`` (see the note above), so the flat branch needs no
+            # hoisting step of its own.
+            model_config = DeepseekV41TextConfig.from_dict(
+                dict(config_dict), **kwargs)
+        model_config.architectures = ["DeepseekV41ForCausalLM"]
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

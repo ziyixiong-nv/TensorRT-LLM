@@ -769,6 +769,41 @@ def _first_new_block_key(
     return key
 
 
+def _effective_partial_reuse(requested: bool, supported: bool, manager_name: str) -> bool:
+    """Resolve ``enable_partial_reuse`` against a manager's support for it.
+
+    Split out of ``KVCacheManagerV2.__init__`` so the decision can be exercised
+    without standing up a manager, the same reason ``_first_new_block_key`` above is
+    a free function.
+
+    Warns rather than raises when the two disagree. Full-block reuse is unaffected
+    and still sound, so the useful outcome is that the caller's request keeps working
+    with only the unsound part switched off; raising would turn a recoverable
+    misconfiguration into a failed load. Staying silent would be the wrong call in
+    the other direction -- a caller who asked for partial reuse and quietly did not
+    get it has no way to explain their hit rate.
+
+    ``MambaHybridCacheManager`` reaches the same outcome by deep-copying
+    ``kv_cache_config`` and clearing the field on the copy. That is equivalent for one
+    subclass; this is a class-level flag instead because it is enforced once in the
+    base for every subclass, it composes with ``_supports_reuse_match_backoff`` on the
+    same class, and it costs no deep copy. The trade is that ``kv_cache_config`` keeps
+    the caller's value, so anything in the V2 path that needs the *effective* setting
+    must read ``self.enable_partial_reuse`` -- which is why ``_build_base_config``
+    does.
+    """
+    if requested and not supported:
+        logger.warning(
+            f"{manager_name} does not support partial-block reuse; forcing "
+            f"enable_partial_reuse=False. Full-block reuse is unaffected. This "
+            f"manager has pools that are not addressed at tokens_per_block token "
+            f"granularity, so a prefix stopping mid-block would inherit boundary "
+            f"rows computed from tokens that prefix does not contain."
+        )
+        return False
+    return requested
+
+
 def _locate_accepted_draft_tokens(requests: List[LlmRequest]):
     num_accepted_draft_tokens = []
     accepted_draft_tokens_indices = []
@@ -940,6 +975,19 @@ class KVCacheManagerV2(BaseResourceManager):
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
+    # A subclass whose pools are not all addressed at `tokens_per_block` token
+    # granularity opts out of *partial*-block reuse. Full-block reuse stays on.
+    #
+    # Partial reuse hands a sequence a prefix that stops mid-block. That is sound
+    # only if every pool of that layer maps token i to a fixed slot derivable from
+    # i alone. A pool holding one row per N tokens, or one row pooled *over* a
+    # window of tokens, does not: its boundary row is a function of tokens the
+    # matched prefix does not include, so the new sequence inherits a row that was
+    # computed from a longer sequence than its own. Nothing raises -- the row is
+    # well-formed, just not the row this sequence would have produced -- so the
+    # symptom is a small perturbation that flips an argmax a couple of steps into
+    # decode, which reads as ordinary sampling variation rather than as a bug.
+    _supports_partial_reuse = True
 
     def __init__(
         self,
@@ -1066,6 +1114,15 @@ class KVCacheManagerV2(BaseResourceManager):
         self.reuse_match_backoff = draft_prompt_lookahead(spec_config) or 0
         if not self._supports_reuse_match_backoff:
             self.reuse_match_backoff = 0
+        # Resolved here, next to reuse_match_backoff, because both are read by
+        # _build_base_config further down this same __init__. Setting either one
+        # after that call leaves the backend config built against an attribute
+        # that does not exist yet.
+        self.enable_partial_reuse = _effective_partial_reuse(
+            kv_cache_config.enable_partial_reuse,
+            self._supports_partial_reuse,
+            type(self).__name__,
+        )
         # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
         self._kv_reserve_draft_tokens = self.max_total_draft_tokens
         if (
@@ -1502,7 +1559,6 @@ class KVCacheManagerV2(BaseResourceManager):
             self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
 
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
-        self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
         self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
         enable_conversation_manager = (
             self.enable_block_reuse
@@ -2270,7 +2326,12 @@ class KVCacheManagerV2(BaseResourceManager):
             typical_step=typical_step,
             constraints=constraints,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
-            enable_partial_reuse=kv_cache_config.enable_partial_reuse,
+            # self, not kv_cache_config: __init__ may have forced this off for a
+            # manager whose pools cannot take a mid-block prefix. Re-reading the
+            # config here would let the two predicates drift and hand the backend
+            # the unsound setting anyway -- the same reason `reuse_match_backoff`
+            # below is read off self.
+            enable_partial_reuse=self.enable_partial_reuse,
             # Keep the lookahead evidence and its backoff in the same tree match.
             # A paired scheduler caps the claim by retaining D evidence past the
             # common usable depth, so this still trims exactly once.

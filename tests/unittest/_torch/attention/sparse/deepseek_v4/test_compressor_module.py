@@ -133,6 +133,19 @@ class DummyAttentionMetadata:
         self.kv_lens_cuda_runtime = None  # Set by caller
         self.cached_token_lens_cuda = None  # Set by caller
 
+    def indexer_block_table(self, compress_ratio: int) -> torch.Tensor:
+        """Part of the metadata contract ``Compressor.forward`` depends on.
+
+        The real metadata keeps one INDEXER_COMPRESS page table per compression
+        ratio, because DeepSeek-V4.1 indexes at two ratios whose pools differ in
+        page scale. Every configuration this double is built for has a single
+        indexer pool, and ``indexer_k_cache_block_offsets`` *is* that pool's
+        table, so the ratio is accepted and ignored rather than asserted on:
+        these tests drive one layer at a time and the pool it addresses is fixed
+        by construction.
+        """
+        return self.indexer_k_cache_block_offsets
+
 
 # ============================================================================
 # Reference Implementation (DO NOT MODIFY)

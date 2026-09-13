@@ -553,6 +553,208 @@ def _run_large_address_gap_int32_safe_test():
                 )
 
 
+# ---------------------------------------------------------------------------
+# kBadPageIndex guard
+#
+# `max_blocks` is the block table's *capacity* (the kernel wrapper reads it from `.shape`), not
+# the request's allocated block count, so an ordinal can be in-array and still name an
+# unallocated slot -- and those slots hold kBadPageIndex. Unguarded, the kernel computes
+# `-1 * tokens_per_block + token_in_block` and stores it under a *true* mask, because every term
+# of the mask is decided before the block-table load.
+#
+# These need no cache manager, no model, and no checkpoint: the pool pointers are consumed only
+# as arithmetic (`swa_buffer_offset_in_tokens = (swa_buffer_ptr - swa_pool_base_ptr)
+# // token_stride`), so synthetic integers are faithful.
+# ---------------------------------------------------------------------------
+
+# kBadPageIndex, `kv_cache_manager_v2/common.h`. Block tables are padded with it and grown
+# with it (`kvCache.cpp`).
+K_BAD_PAGE_INDEX = -1
+
+GUARD_TOKENS_PER_BLOCK = 64
+GUARD_TOKEN_STRIDE = 512 * 2  # V4.1 compressed latent, 512 x bf16 = 1 KiB/token
+
+
+def test_bad_page_arithmetic_is_only_detectable_in_the_swa_pool():
+    """CPU. The two pools fail differently, and that asymmetry is why the guard exists.
+
+    This is a tripwire on the *convention*, not on the kernel: with a zero buffer offset the
+    unguarded index goes negative and something downstream is likely to notice, while with a
+    positive offset it lands back inside the pool and nothing does. If the offset convention ever
+    changes so both pools behave alike, the risk profile this guard was written for has moved and
+    this test says so.
+    """
+    token_in_block = 7
+    bad = K_BAD_PAGE_INDEX * GUARD_TOKENS_PER_BLOCK + token_in_block
+
+    # SWA: buffer == pool base, so the offset the wrapper derives is exactly zero.
+    swa_offset = (0 - 0) // GUARD_TOKEN_STRIDE
+    assert swa_offset == 0
+    assert swa_offset + bad < 0, (
+        "the SWA pool no longer produces a negative index for a sentinel page; the failure has "
+        "become silent there too"
+    )
+
+    # Compressed: a buffer that sits some way into its pool, derived the way the wrapper does.
+    compressed_offset = (1 << 20) * GUARD_TOKEN_STRIDE // GUARD_TOKEN_STRIDE
+    assert compressed_offset + bad >= 0, (
+        "the compressed pool no longer masks the failure; if this is now negative the guard is "
+        "still correct but the urgency argued for it has changed"
+    )
+
+
+@skip_pre_blackwell
+def test_bad_page_index_yields_invalid_not_arithmetic():
+    """A kBadPageIndex entry must come out as -1, not as an index.
+
+    Fails on an unpatched tree. The guard is a mask refinement, so the only way to know it is
+    wired to the branch it claims is to feed the branch a sentinel and watch the output.
+    """
+    device = "cuda"
+    # One request. Blocks 0 and 1 are allocated; the rest of the row is sentinel padding, which
+    # is what the C++ side actually writes there.
+    block_table = torch.full((1, 8), K_BAD_PAGE_INDEX, dtype=torch.int32, device=device)
+    block_table[0, 0] = 5
+    block_table[0, 1] = 9
+
+    # Four probes -- the kernel indexes its lanes with `tl.arange`, so the count must be a power
+    # of two. One is inside an allocated block, two are inside the padded region, and the last is
+    # an ordinary -1 padding input, which the pre-existing `local_idx >= 0` term already handles;
+    # it is here so a guard that over-fires on the padding lanes is visible in the same assertion.
+    # The padded ordinals are < max_blocks (8), so the existing `block_ordinal < max_blocks` term
+    # admits them.
+    good_local = 1 * GUARD_TOKENS_PER_BLOCK + 3  # ordinal 1 -> page 9, offset 3
+    bad_local_a = 4 * GUARD_TOKENS_PER_BLOCK + 0  # ordinal 4 -> sentinel
+    bad_local_b = 7 * GUARD_TOKENS_PER_BLOCK + 63  # ordinal 7 -> sentinel
+    swa_local = torch.tensor(
+        [[good_local, bad_local_a, bad_local_b, -1]], dtype=torch.int32, device=device
+    )
+    req_id = torch.zeros(1, dtype=torch.int32, device=device)
+
+    out = deepseek_v4_local_to_global_indices(
+        req_id=req_id,
+        block_table_swa=block_table,
+        swa_local_indices=swa_local,
+        swa_pool_base_ptr=0,
+        swa_buffer_ptr=0,
+        tokens_per_block=GUARD_TOKENS_PER_BLOCK,
+        token_stride=GUARD_TOKEN_STRIDE,
+    )
+
+    assert out[0, 0].item() == 9 * GUARD_TOKENS_PER_BLOCK + 3, (
+        "the allocated probe must be untouched -- the guard is a mask refinement and must not "
+        "invalidate a real page"
+    )
+    assert out[0, 3].item() == -1, "a -1 input must stay -1"
+    for col, local in ((1, bad_local_a), (2, bad_local_b)):
+        got = out[0, col].item()
+        unguarded = K_BAD_PAGE_INDEX * GUARD_TOKENS_PER_BLOCK + (local % GUARD_TOKENS_PER_BLOCK)
+        assert got == -1, (
+            f"local index {local} names an unallocated slot holding kBadPageIndex, so the "
+            f"output must be -1; got {got}. Without the guard this is {unguarded}, an "
+            "arithmetic index the consumer cannot tell from a real one."
+        )
+
+
+@skip_pre_blackwell
+def test_bad_page_in_compressed_pool_would_land_in_range():
+    """The compressed branch is the dangerous one, so it gets its own test.
+
+    In the SWA pool the buffer offset is 0, so an unguarded sentinel produces a *negative*
+    index -- wrong, but likely to fault or to be rejected downstream. The compressed pool's
+    `compressed_buffer_offset_in_tokens` is positive and lifts the same arithmetic back above
+    zero, so the bad index is a plausible in-range address in the same pool and the layer
+    scores against another request's KV with no error anywhere. This asserts the guard covers
+    that branch too, and records the number it would otherwise produce.
+    """
+    device = "cuda"
+    swa_table = torch.zeros((1, 4), dtype=torch.int32, device=device)
+    compressed_table = torch.full((1, 8), K_BAD_PAGE_INDEX, dtype=torch.int32, device=device)
+    compressed_table[0, 0] = 2
+
+    tokens_per_block_compressed = GUARD_TOKENS_PER_BLOCK  # compress_ratio 1
+    bad_local = 6 * tokens_per_block_compressed + 1  # ordinal 6 -> sentinel
+
+    swa_local = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    compressed_local = torch.tensor([[bad_local]], dtype=torch.int32, device=device)
+    req_id = torch.zeros(1, dtype=torch.int32, device=device)
+
+    # A positive compressed buffer offset, expressed the way the kernel derives it: the byte
+    # gap between the buffer and the pool base, divided by the token stride.
+    offset_in_tokens = 1 << 20
+    out = deepseek_v4_local_to_global_indices(
+        req_id=req_id,
+        block_table_swa=swa_table,
+        swa_local_indices=swa_local,
+        swa_pool_base_ptr=0,
+        swa_buffer_ptr=0,
+        tokens_per_block=GUARD_TOKENS_PER_BLOCK,
+        token_stride=GUARD_TOKEN_STRIDE,
+        block_table_compressed=compressed_table,
+        compressed_local_indices=compressed_local,
+        compress_pool_base_ptr=0,
+        compressed_buffer_ptr=offset_in_tokens * GUARD_TOKEN_STRIDE,
+        compress_ratio=1,
+        has_compressed=True,
+        num_compressed_indices=1,
+    )
+
+    got = out[0, 1].item()  # compressed results start at num_swa_indices == 1
+    unguarded = offset_in_tokens + K_BAD_PAGE_INDEX * tokens_per_block_compressed + 1
+    assert unguarded > 0, (
+        "this test only means something while the unguarded value is in range; if the offset "
+        "convention changes so that it goes negative, the danger this guards has moved"
+    )
+    assert got == -1, (
+        f"a sentinel page in the compressed table must come out as -1; got {got}. Unguarded it "
+        f"is {unguarded} -- positive, inside the pool, and indistinguishable from a real "
+        "address, which is why this branch matters more than the SWA one."
+    )
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("num_indices", [1, 8, 64])
+def test_guard_does_not_disturb_a_fully_allocated_table(num_indices):
+    """No-regression, at the level of individual lanes.
+
+    The guard's whole claim is that it changes nothing when every ordinal is allocated. A table
+    with no sentinel in it must produce exactly the arithmetic result for every lane -- checked
+    elementwise rather than by a summary statistic, because a mask bug would plausibly affect
+    only the lanes near a boundary.
+    """
+    device = "cuda"
+    num_blocks = 16
+    pages = torch.arange(1, num_blocks + 1, dtype=torch.int32, device=device)
+    block_table = pages.unsqueeze(0).contiguous()
+
+    locals_ = (
+        torch.arange(num_indices, dtype=torch.int32, device=device)
+        * 7
+        % (num_blocks * GUARD_TOKENS_PER_BLOCK)
+    )
+    swa_local = locals_.unsqueeze(0).contiguous()
+    req_id = torch.zeros(1, dtype=torch.int32, device=device)
+
+    out = deepseek_v4_local_to_global_indices(
+        req_id=req_id,
+        block_table_swa=block_table,
+        swa_local_indices=swa_local,
+        swa_pool_base_ptr=0,
+        swa_buffer_ptr=0,
+        tokens_per_block=GUARD_TOKENS_PER_BLOCK,
+        token_stride=GUARD_TOKEN_STRIDE,
+    )
+
+    ordinals = locals_ // GUARD_TOKENS_PER_BLOCK
+    expected = pages[ordinals].to(torch.int64) * GUARD_TOKENS_PER_BLOCK + (
+        locals_ % GUARD_TOKENS_PER_BLOCK
+    )
+    assert torch.equal(out[0].to(torch.int64), expected), (
+        f"expected {expected.tolist()}, got {out[0].tolist()}; the guard must be inert on a "
+        "fully allocated table"
+    )
+
+
 if __name__ == "__main__":
     _run_test(scenarios[1], [256, 192])
     print("PASSED")

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
@@ -23,6 +24,8 @@ from utils.util import skip_pre_blackwell
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4CacheManager
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
+    DEEPSEEK_V4_VARIANT,
+    DEEPSEEK_V41_VARIANT,
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
 )
@@ -34,6 +37,10 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.pyexecutor._util import CacheCost
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheManagerV2,
+    _effective_partial_reuse,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
@@ -41,6 +48,7 @@ from tensorrt_llm._utils import binding_to_torch_dtype
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
+from tensorrt_llm.logger import logger as trtllm_logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BatchDesc, KVCacheDesc, PageIndexMode
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
@@ -59,6 +67,122 @@ def test_typical_seq_len_preserves_deepseek_v4_fallback(
     manager.max_seq_len = 1024
 
     assert manager._get_typical_seq_len(KvCacheConfig(avg_seq_len=avg_seq_len)) == expected
+
+
+def _resolve_capturing_warnings(
+    monkeypatch, requested: bool, supported: bool, manager_name: str
+) -> Tuple[bool, List[str]]:
+    """Run the partial-reuse resolver with TensorRT-LLM's logger captured.
+
+    Not ``caplog``: ``tensorrt_llm.logger.logger`` is TensorRT-LLM's own object, not a
+    stdlib ``logging.Logger``, so it never propagates to the root handler pytest
+    installs and ``caplog.text`` stays empty no matter what was logged. An assertion
+    written against it would be unfalsifiable in one direction and unsatisfiable in the
+    other. Patching the method the resolver actually calls keeps both honest.
+
+    Patched on the logger object rather than on the importing module, because
+    ``kv_cache_manager_v2`` binds it with ``from tensorrt_llm.logger import logger`` --
+    both names are the same singleton, and setting the attribute on the object holds
+    whichever name the code under test happens to reach it by. Note that
+    ``import tensorrt_llm.logger`` does not give you the module: the package re-exports
+    the instance under that name, shadowing its own submodule.
+    """
+    messages: List[str] = []
+    monkeypatch.setattr(trtllm_logger, "warning", messages.append)
+    return _effective_partial_reuse(requested, supported, manager_name), messages
+
+
+class TestPartialReuseOptOut:
+    """Partial-block reuse must stay off for this manager.
+
+    Why these are worth their upkeep: the defect they guard was found empirically and
+    is *silent*. One fixed prompt, greedy decoding, one process per arm --
+    ``enable_block_reuse=False``, ``enable_block_reuse=True``, and a cold default
+    process all emitted byte-identical ids, while the second ``generate()`` call in a
+    reuse-on process diverged at decode step 2 and produced a different, still fluent,
+    still on-topic paragraph. Clearing only ``enable_partial_reuse`` restored exact
+    agreement on an otherwise identical second call, so it is the whole factor and not
+    merely correlated with one: being the second call is not sufficient, which is what
+    rules out request-to-request state leakage as well as full-block reuse.
+
+    The mechanism is structural rather than numerical. The reuse radix tree matches at
+    one global token granularity, but for the COMPRESS / COMPRESSOR / INDEXER roles
+    the block size is *not* ``tokens_per_block`` (see ``compressed_block_sizes``): a
+    row covers N tokens, or is pooled over a window of them. A prefix that stops
+    mid-block therefore hands the new sequence rows covering tokens that prefix does
+    not own. They are well-formed, so nothing raises and no assertion fires -- which is
+    exactly why the opt-out needs a test rather than a comment.
+
+    These tests pin the plumbing only: the flag, the resolution rule, and the hand-off
+    to the backend config. They cannot show the model emitting the right tokens, and
+    they did not catch that the first version of the fix assigned the attribute after
+    ``_build_base_config`` had already read it. The construction tests elsewhere in
+    this file did.
+    """
+
+    def test_deepseek_v4_manager_opts_out(self) -> None:
+        assert DeepseekV4CacheManager._supports_partial_reuse is False
+
+    def test_the_base_manager_still_supports_it(self) -> None:
+        # The opt-out has to be a narrowing of a supported default. If someone
+        # "simplifies" by flipping the base to False, partial reuse silently dies for
+        # every model in the repo and this file's opt-out looks redundant.
+        assert KVCacheManagerV2._supports_partial_reuse is True
+
+    @pytest.mark.parametrize(
+        ("requested", "supported", "expected"),
+        [
+            (True, True, True),
+            (True, False, False),  # the only case that overrides the caller
+            (False, True, False),
+            (False, False, False),
+        ],
+    )
+    def test_resolution_truth_table(self, requested: bool, supported: bool, expected: bool) -> None:
+        assert _effective_partial_reuse(requested, supported, "FakeManager") is expected
+
+    def test_forcing_it_off_warns_and_names_the_manager(self, monkeypatch) -> None:
+        # Silent would be the wrong failure mode in the other direction: a caller who
+        # asked for partial reuse and did not get it would have no way to explain
+        # their hit rate. The manager name has to be in the message because the whole
+        # point is that only *some* managers opt out.
+        result, messages = _resolve_capturing_warnings(
+            monkeypatch, True, False, "DeepseekV4CacheManager"
+        )
+
+        assert result is False
+        assert len(messages) == 1
+        assert "DeepseekV4CacheManager" in messages[0]
+        assert "enable_partial_reuse=False" in messages[0]
+
+    @pytest.mark.parametrize(("requested", "supported"), [(True, True), (False, False)])
+    def test_honouring_the_request_stays_quiet(
+        self, monkeypatch, requested: bool, supported: bool
+    ) -> None:
+        # Both quiet cases, not just one: warning when the caller asked for partial
+        # reuse and got it would be noise on every supported manager, and warning when
+        # they never asked for it would be noise on every unsupported one.
+        result, messages = _resolve_capturing_warnings(
+            monkeypatch, requested, supported, "SomeOtherManager"
+        )
+
+        assert result is requested
+        assert messages == []
+
+    def test_the_backend_config_reads_the_effective_value(self) -> None:
+        """``_build_base_config`` must not re-read the raw ``kv_cache_config``.
+
+        This is the regression that would silently undo the whole fix: the flag and
+        the warning would still be there, the unit tests above would still pass, and
+        the backend would still be handed ``True``. A source check rather than a
+        behavioural one because ``_build_base_config`` needs a fully constructed
+        manager, and standing one up would test the stub instead of the code. The
+        sibling ``test_indexer_hadamard_coupling.py`` pins a hand-off the same way and
+        for the same reason.
+        """
+        source = inspect.getsource(KVCacheManagerV2._build_base_config)
+        assert "enable_partial_reuse=self.enable_partial_reuse" in source
+        assert "enable_partial_reuse=kv_cache_config.enable_partial_reuse" not in source
 
 
 def test_cache_size_estimation_uses_model_attention_layer_count():
@@ -314,16 +438,27 @@ class TestDeepseekV4CacheManager:
         spec_config: object | None = None,
         indexer_k_dtype: str | None = None,
         enable_swa_scratch_reuse: bool = True,
+        variant: str = DEEPSEEK_V4_VARIANT,
+        kv_source_layer_ids: Optional[List[int]] = None,
     ) -> Tuple[DeepseekV4CacheManager, DeepSeekV4SparseAttentionConfig]:
-        """Helper to create a DeepseekV4CacheManager for testing."""
+        """Helper to create a DeepseekV4CacheManager for testing.
+
+        ``variant`` selects which generation's ``compress_ratios`` encoding the
+        list is written in. It is passed through rather than inferred because the
+        same integer means different things in each: V4's ``1`` is an SWA-only
+        layer while V4.1's ``1`` is a genuine unpooled long-range layer.
+        """
 
         # Create sparse attention config
         config_kwargs = {}
         if indexer_k_dtype is not None:
             config_kwargs["indexer_k_dtype"] = indexer_k_dtype
+        if kv_source_layer_ids is not None:
+            config_kwargs["kv_source_layer_ids"] = kv_source_layer_ids
         sparse_attn_config = DeepSeekV4SparseAttentionConfig(
             index_head_dim=self.index_head_dim,
             window_size=self.window_size,
+            variant=variant,
             compress_ratios=compress_ratios,
             **config_kwargs,
         )
@@ -369,6 +504,302 @@ class TestDeepseekV4CacheManager:
         )
 
         return cache_manager, sparse_attn_config
+
+    # ------------------------------------------------------------------
+    # DeepSeek-V4.1 compress-ratio encoding
+    # ------------------------------------------------------------------
+    # V4.1's `compress_ratios` are true pooling factors from {0, 1, 2}, not the
+    # role sentinels {0, 4, 128} that V4 uses. The collision is on `1`: V4 only
+    # ever produces it by normalizing a 0 (i.e. an SWA-only layer), while a V4.1
+    # `1` is a genuine long-range layer whose compressor is the identity. These
+    # tests pin the resulting role map so a future refactor cannot quietly
+    # collapse the two encodings back together.
+
+    # 6 layers: SWA-only, pooled, pooled, unpooled, unpooled, SWA-only. Shaped
+    # like the real 40-layer checkpoint (leading 0s, a run of 2s, a run of 1s)
+    # but small enough to allocate on one GPU.
+    V41_RATIOS = [0, 2, 2, 1, 1, 0]
+
+    def _layer_roles(
+        self, cache_manager: DeepseekV4CacheManager, layer: int
+    ) -> set[DeepseekV4AttentionType]:
+        return {
+            attn_type
+            for (layer_idx, attn_type) in cache_manager._layer_attn_to_layer_id
+            if layer_idx == layer
+        }
+
+    def test_v41_ratios_assign_roles_by_pooling_factor(self) -> None:
+        """Each V4.1 ratio maps to exactly the buffers its reference module needs."""
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=2,
+            max_seq_len=1024,
+            compress_ratios=self.V41_RATIOS,
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            variant=DEEPSEEK_V41_VARIANT,
+        )
+        try:
+            for layer, ratio in enumerate(self.V41_RATIOS):
+                roles = self._layer_roles(cache_manager, layer)
+                expected = {DeepseekV4AttentionType.SWA}
+                if ratio > 0:
+                    # Every long-range layer is indexed (model.py:775-778), so
+                    # COMPRESS never appears without INDEXER_COMPRESS.
+                    expected |= {
+                        DeepseekV4AttentionType.COMPRESS,
+                        DeepseekV4AttentionType.INDEXER_COMPRESS,
+                    }
+                if ratio > 1:
+                    # Only a genuinely pooling compressor carries a cross-step
+                    # accumulator; ratio 1 is `norm(wkv(x))` (model.py:461).
+                    expected |= {
+                        DeepseekV4AttentionType.COMPRESSOR_KV,
+                        DeepseekV4AttentionType.COMPRESSOR_SCORE,
+                    }
+                assert roles == expected, f"layer {layer} (ratio {ratio}) got {roles}"
+
+            # V4.1's Indexer owns no compressor of its own (model.py:496-525), so
+            # neither indexer-compressor role may be allocated anywhere.
+            all_roles = {attn_type for _, attn_type in cache_manager._layer_attn_to_layer_id}
+            assert DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV not in all_roles
+            assert DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE not in all_roles
+
+            # Roles added together share one manager LayerId, which is what lets
+            # the COMPRESS/INDEXER_COMPRESS pair share a page table.
+            for layer, ratio in enumerate(self.V41_RATIOS):
+                if ratio == 0:
+                    continue
+                ids = cache_manager._layer_attn_to_layer_id
+                assert (
+                    ids[layer, DeepseekV4AttentionType.COMPRESS]
+                    == ids[layer, DeepseekV4AttentionType.INDEXER_COMPRESS]
+                )
+                if ratio > 1:
+                    assert (
+                        ids[layer, DeepseekV4AttentionType.COMPRESSOR_KV]
+                        == ids[layer, DeepseekV4AttentionType.COMPRESSOR_SCORE]
+                    )
+        finally:
+            cache_manager.shutdown()
+
+    def test_v41_dependent_layers_alias_their_kv_source(self) -> None:
+        """A shared compressed cache is allocated once, on the source layer.
+
+        V4.1 has 4 KV sources for 38 long-range layers, so allocating per layer
+        would reserve ~9.5x the compressed footprint to hold duplicates of the
+        same bytes. The dependents resolve to the source's ``LayerId`` instead,
+        which is what makes ``get_buffers(dependent, COMPRESS)`` return the
+        source's pages with no copy and no special case at the call sites.
+        """
+        # Sources at 1 and 3: layer 2 depends on 1 (ratio 2), layer 4 on 3
+        # (ratio 1). Both groups are ratio-uniform, as they are in the real
+        # config -- aliasing across a ratio boundary is asserted against.
+        ratios = self.V41_RATIOS
+        kv_sources = [1, 3]
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=2,
+            max_seq_len=1024,
+            compress_ratios=ratios,
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            variant=DEEPSEEK_V41_VARIANT,
+            kv_source_layer_ids=kv_sources,
+        )
+        compressed_roles = (
+            DeepseekV4AttentionType.COMPRESS,
+            DeepseekV4AttentionType.INDEXER_COMPRESS,
+        )
+        try:
+            ids = cache_manager._layer_attn_to_layer_id
+            for dependent, source in ((2, 1), (4, 3)):
+                for role in compressed_roles:
+                    assert ids[dependent, role] == ids[source, role], (
+                        f"layer {dependent} must share layer {source}'s {role.name}"
+                    )
+            # The two sources must not collapse into each other: aliasing has to
+            # be "dependent -> its own source", not "everything -> one pool".
+            assert (
+                ids[1, DeepseekV4AttentionType.COMPRESS] != ids[3, DeepseekV4AttentionType.COMPRESS]
+            )
+
+            # A dependent runs no compressor, so it carries no pooling
+            # accumulator -- not even an aliased one. Layer 2 is ratio 2, which
+            # *would* have COMPRESSOR_* if it owned its cache (asserted by
+            # test_v41_ratios_assign_roles_by_pooling_factor), so this
+            # distinguishes ownership from the ratio.
+            assert self._layer_roles(cache_manager, 2) == {
+                DeepseekV4AttentionType.SWA,
+                DeepseekV4AttentionType.COMPRESS,
+                DeepseekV4AttentionType.INDEXER_COMPRESS,
+            }
+            assert DeepseekV4AttentionType.COMPRESSOR_KV in self._layer_roles(cache_manager, 1)
+
+            aliased_ids = {
+                role: {ids[layer, role] for layer, r in enumerate(ratios) if r > 0}
+                for role in compressed_roles
+            }
+        finally:
+            cache_manager.shutdown()
+
+        # The saving is the point, so measure it rather than inferring it. Note
+        # that `get_buffers` cannot serve as the witness: it returns the whole
+        # *pool's* base view, so two layers in one pool report the same
+        # `data_ptr()` whether or not they alias. The count of distinct LayerIds
+        # is what tracks how many `AttentionLayerConfig`s were reserved.
+        unaliased, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=2,
+            max_seq_len=1024,
+            compress_ratios=ratios,
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            variant=DEEPSEEK_V41_VARIANT,
+            # No sources declared: `owns_compressed_kv` degrades to
+            # `is_compress_layer`, i.e. the pre-sharing behaviour.
+        )
+        try:
+            unaliased_ids = {
+                role: {
+                    unaliased._layer_attn_to_layer_id[layer, role]
+                    for layer, r in enumerate(ratios)
+                    if r > 0
+                }
+                for role in compressed_roles
+            }
+        finally:
+            unaliased.shutdown()
+
+        for role in compressed_roles:
+            assert len(unaliased_ids[role]) == 4, (
+                f"expected all four long-range layers to reserve their own {role.name}"
+            )
+            assert len(aliased_ids[role]) == len(kv_sources), (
+                f"{role.name} must be reserved once per KV source, not once per layer; "
+                f"got {len(aliased_ids[role])} for sources {kv_sources}"
+            )
+
+    def test_v41_aliasing_rejects_a_mixed_ratio_sharing_group(self) -> None:
+        """A sharing group must be ratio-uniform, or the pooled positions differ.
+
+        Compressed row *j* means token *j x ratio*, so a ratio-1 layer reading a
+        ratio-2 layer's cache would silently attend to the wrong positions. The
+        real config never does this (every group is uniform), which is exactly
+        why a regression here would be invisible without a check.
+        """
+        with pytest.raises(AssertionError, match="ratio-uniform"):
+            cache_manager, _ = self._create_deepseek_v4_cache_manager(
+                tokens_per_block=self.tokens_per_block,
+                max_batch_size=2,
+                max_seq_len=1024,
+                # Layer 3 (ratio 1) would alias onto source layer 1 (ratio 2).
+                compress_ratios=self.V41_RATIOS,
+                dtype=DataType.BF16,
+                compressor_dtype=DataType.FLOAT,
+                variant=DEEPSEEK_V41_VARIANT,
+                kv_source_layer_ids=[1],
+            )
+            cache_manager.shutdown()
+
+    def test_v41_block_sizes_and_pools_follow_the_pooling_factor(self) -> None:
+        """Pooling divides the compressed block size; ratio 0/1 do not shrink it."""
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=2,
+            max_seq_len=1024,
+            compress_ratios=self.V41_RATIOS,
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            variant=DEEPSEEK_V41_VARIANT,
+        )
+        try:
+            # A ratio-0 layer's entry is never read (it owns no compressed
+            # buffers); it must still be a safe value rather than a div-by-zero.
+            assert cache_manager.compressed_block_sizes == [
+                self.tokens_per_block,
+                self.tokens_per_block // 2,
+                self.tokens_per_block // 2,
+                self.tokens_per_block,
+                self.tokens_per_block,
+                self.tokens_per_block,
+            ]
+
+            # One COMPRESS pool per distinct ratio that has a compressed branch,
+            # keyed by ratio rather than by the V4 {4, 128} literals. Both are
+            # indexed, so both also get an INDEXER_COMPRESS pool.
+            assert sorted(cache_manager.compress_pool_ptrs) == [1, 2]
+            assert sorted(cache_manager._compress_pool_meta) == [1, 2]
+            assert sorted(cache_manager._indexer_compress_pool_meta) == [1, 2]
+
+            # With more than one indexer pool the manager must refuse to guess.
+            # Silently returning the ratio-1 table for a ratio-2 layer would
+            # scatter indexer keys into the wrong pages and read as an accuracy
+            # bug rather than a wiring bug.
+            with pytest.raises(RuntimeError, match="compress_ratio is required"):
+                cache_manager.copy_batch_indexer_compress_block_tables(
+                    host_block_table=torch.zeros(
+                        2, cache_manager.max_blocks_per_seq, dtype=torch.int32
+                    ),
+                    request_ids=[],
+                    beam_width=1,
+                    num_contexts=0,
+                    num_seqs=0,
+                )
+        finally:
+            cache_manager.shutdown()
+
+    @pytest.mark.parametrize(
+        ("variant", "expect_long_range"),
+        [(DEEPSEEK_V4_VARIANT, False), (DEEPSEEK_V41_VARIANT, True)],
+        ids=["v4_sees_swa_only", "v41_sees_long_range"],
+    )
+    def test_ratio_one_means_different_things_per_variant(
+        self, variant: str, expect_long_range: bool
+    ) -> None:
+        """The irreducible collision: ``1`` is SWA-only in V4, long-range in V4.1.
+
+        ``[0, 1, 1, 0]`` is a legal ratio list under both encodings, which makes
+        it the sharpest available control. Under V4, ``normalize_compress_ratios``
+        rewrites the ``0``\\ s to ``1`` and ``is_compress_layer`` is ``ratio > 1``,
+        so *no* layer gets a compressed cache. Under V4.1 the two ``1``\\ s are
+        genuine unpooled long-range layers and must get one. A single int cannot
+        encode both role and pooling factor, so if this test ever passes for both
+        variants with the same expectation, the variant is being ignored.
+        """
+        ratios = [0, 1, 1, 0]
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=2,
+            max_seq_len=1024,
+            compress_ratios=ratios,
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+            variant=variant,
+        )
+        try:
+            long_range = {
+                DeepseekV4AttentionType.COMPRESS,
+                DeepseekV4AttentionType.INDEXER_COMPRESS,
+            }
+            for layer, ratio in enumerate(ratios):
+                roles = self._layer_roles(cache_manager, layer)
+                if expect_long_range and ratio == 1:
+                    assert roles == {DeepseekV4AttentionType.SWA} | long_range
+                else:
+                    assert roles == {DeepseekV4AttentionType.SWA}
+            # Unpooled compressors keep no cross-step accumulator either way.
+            all_roles = {attn_type for _, attn_type in cache_manager._layer_attn_to_layer_id}
+            assert DeepseekV4AttentionType.COMPRESSOR_KV not in all_roles
+            assert DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV not in all_roles
+            # A single unambiguous indexer pool: V4.1 may then be asked for the
+            # compatibility table without naming a ratio.
+            assert sorted(cache_manager._indexer_compress_pool_meta) == (
+                [1] if expect_long_range else []
+            )
+        finally:
+            cache_manager.shutdown()
 
     def _create_request(self, request_id: int, prompt_len: int) -> LlmRequest:
         """Helper to create a test LlmRequest.

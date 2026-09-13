@@ -14,13 +14,20 @@ from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import prefer_pinned
 
 from ..dsa.metadata import DSAtrtllmAttentionMetadata
+from .candidate_prefilter import CandidatePublication
 from .indexer import DeepseekV4Indexer
 from .params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
-    DEEPSEEK_V4_SPARSE_RATIO,
+    DEEPSEEK_V4_VARIANT,
+    DEEPSEEK_V41_VARIANT,
     DeepseekV4AttentionType,
     DeepSeekV4MetadataParams,
+    compress_ratio_has_attention,
     is_compress_layer,
+    is_dense_compress_layer,
+    is_sparse_layer,
+    pool_factor,
+    swa_only_ratio,
 )
 
 if TYPE_CHECKING:
@@ -45,10 +52,42 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self.num_total_compressed_tokens = {}
         self.max_ctx_compressed_tokens = {}
         self._ctx_output_sizes: Optional[Dict[int, int]] = None
+        # V4.1 cross-layer channels, keyed by *producing* layer index. Both are
+        # per-forward-pass scratch, not persistent state, and both exist because
+        # V4.1 splits work a layer used to do for itself across layers:
+        #
+        # * `v41_index_keys`: the postprocessed index keys of a kv source, for the
+        #   index sources sharing it (24/28/32/36 -> 20). Only the single-pass
+        #   prefill path in `sparse_attn_indexer` dereferences these; the decode
+        #   and chunked-prefill paths read the cache, which the manager already
+        #   aliases onto the source's pages, so nothing is published for them.
+        # * `v41_topk_indices`: the selection an index source computed, for the
+        #   ~30 indexed layers that build no `Indexer` at all.
+        # * `v41_candidate_blocks`: the candidate source's level-one output, for the
+        #   later index sources that mask their scores with it. Indexed by *global
+        #   query row* rather than by tile or chunk, so a consumer whose own tiling
+        #   happens to differ still slices the rows it is about to score. Rows the
+        #   producer did not write stay at -1, which `apply_candidate_blocks` reads
+        #   as "keep nothing" -- so it is guarded rather than trusted, by the
+        #   host-side counters carried alongside it.
+        #
+        # Cleared at the top of `prepare()` so a stale entry can never satisfy a
+        # consumer whose producer did not run this step.
+        self.v41_index_keys: Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
+        self.v41_topk_indices: Dict[int, torch.Tensor] = {}
+        self.v41_candidate_blocks: Dict[int, CandidatePublication] = {}
+        # Consumer-side, so keyed by the *consuming* layer rather than the producer
+        # and therefore not part of the publication record above. Host-side ints
+        # only -- no device read, so this is safe on a captured path.
+        self.v41_candidate_rows_consumed: Dict[int, int] = {}
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DeepSeekV4MetadataParams):
             raise ValueError("DeepSeek-V4 sparse attention metadata params are not set")
         self.window_size = sparse_metadata_params.window_size
+        # Which generation's `compress_ratios` encoding this model uses. The same
+        # integer means different things in V4 and V4.1 (see `params.py`), so every
+        # ratio predicate below has to be told which.
+        self.variant = getattr(sparse_metadata_params, "variant", DEEPSEEK_V4_VARIANT)
         window_size = self.window_size
         assert window_size == 128, (
             f"Dual-pool sparse MLA requires window_size == 128, which equals to the"
@@ -60,33 +99,29 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # torch.compile traces. Avoids repeated set→list conversion and
         # guarantees stable specialization keys.
         self._compress_ratios_sorted = sorted(self.compress_ratio_set)
-        _supported_ratios = {1, 4, 128}
+        self._swa_only_ratio = swa_only_ratio(self.variant)
+        _supported_ratios = {0, 1, 2} if self.variant == DEEPSEEK_V41_VARIANT else {1, 4, 128}
         _unsupported = self.compress_ratio_set - _supported_ratios
         assert not _unsupported, (
-            f"Unsupported compress ratios {_unsupported}. Only {_supported_ratios} are supported."
+            f"Unsupported compress ratios {_unsupported} for variant {self.variant!r}. "
+            f"Only {_supported_ratios} are supported."
         )
 
+        # Which (ratio, role) pairs this model actually instantiates. Driven off
+        # `compress_ratio_has_attention` rather than a per-ratio if/elif chain:
+        # the roles a ratio needs are a property of the ratio's *semantics*, and
+        # those differ per variant (V4.1 has no INDEXER_COMPRESSOR_* at all, and
+        # its ratio-1 layers are indexed where V4's ratio-1 layers are SWA-only).
+        # The SWA entry is keyed by the SWA-only sentinel rather than by the
+        # layer's own ratio, matching how the SWA pool is shared model-wide.
         attention_types = []
         for compress_ratio in self.compress_ratio_set:
-            if compress_ratio == 1:
-                attention_types.append((1, DeepseekV4AttentionType.SWA))
-            elif compress_ratio == 4:
-                attention_types.append((1, DeepseekV4AttentionType.SWA))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESS))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_KV))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_SCORE))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESS))
-                attention_types.append(
-                    (compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV)
-                )
-                attention_types.append(
-                    (compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE)
-                )
-            else:
-                attention_types.append((1, DeepseekV4AttentionType.SWA))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESS))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_KV))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_SCORE))
+            attention_types.append((self._swa_only_ratio, DeepseekV4AttentionType.SWA))
+            for attn_type in DeepseekV4AttentionType:
+                if attn_type == DeepseekV4AttentionType.SWA:
+                    continue
+                if compress_ratio_has_attention(compress_ratio, attn_type, self.variant):
+                    attention_types.append((compress_ratio, attn_type))
         self.attention_type_set = set(attention_types)
 
         # Create buffers for the compressor
@@ -201,25 +236,74 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
 
-        # Compute max_compressed_indices for CUDA graph compatibility.
-        # For ratio=4, the indexer selects index_topk compressed tokens.
-        # For ratio=128, use max_seq_len / 128 rounded up to next power of 2
-        raw_128 = math.ceil(self.max_seq_len / 128)
-        po2_128 = 1 << (raw_128 - 1).bit_length() if raw_128 > 0 else 1
-        self.max_compressed_indices = {
-            1: 0,  # No compressed indices
-            4: self.sparse_mla_topk,  # index_topk from indexer
-            128: po2_128,  # All compressed tokens, rounded to power of 2
-        }
+        # Compute max_compressed_indices for CUDA graph compatibility. Three
+        # cases, by what the layer does with its compressed cache:
+        #  * no compressed branch  -> 0 indices.
+        #  * indexed (sparse)      -> the indexer selects exactly index_topk.
+        #  * dense compressed      -> the whole compressed cache, i.e.
+        #    ceil(max_seq_len / ratio) rounded up to a power of two.
+        # For V4 this reproduces {1: 0, 4: sparse_mla_topk, 128: po2(max_seq_len/128)}
+        # exactly. V4.1 indexes every long-range layer, so it has no dense case.
+        self.max_compressed_indices = {}
+        for compress_ratio in self._compress_ratios_sorted:
+            if not is_compress_layer(compress_ratio, self.variant):
+                self.max_compressed_indices[compress_ratio] = 0
+            elif is_sparse_layer(compress_ratio, self.variant):
+                self.max_compressed_indices[compress_ratio] = self.sparse_mla_topk
+            else:
+                raw = math.ceil(self.max_seq_len / pool_factor(compress_ratio))
+                self.max_compressed_indices[compress_ratio] = (
+                    1 << (raw - 1).bit_length() if raw > 0 else 1
+                )
 
-        # Compressed local indices for compress_ratio=128
-        # Note: ratio=4 uses dynamic topk_indices from indexer, so we only pre-allocate for ratio=128
+        # Compressed local indices, used only by dense-compressed layers: an
+        # indexed layer passes the indexer's dynamic topk_indices instead. Sized
+        # to the widest dense ratio, and floored at one column so a model with no
+        # dense layer (every V4.1 model) still gets a well-formed dummy rather
+        # than a zero-width tensor.
+        self._max_dense_compressed_indices = max(
+            (
+                self.max_compressed_indices[compress_ratio]
+                for compress_ratio in self._compress_ratios_sorted
+                if is_dense_compress_layer(compress_ratio, self.variant)
+            ),
+            default=0,
+        )
         self.compressed_local_indices_cuda = self.get_empty(
             self.cuda_graph_buffers,
-            (self.max_num_tokens, self.max_compressed_indices[128]),
+            (self.max_num_tokens, max(self._max_dense_compressed_indices, 1)),
             cache_name="compressed_local_indices_cuda",
             dtype=torch.int32,
             capture_graph=capture_graph,
+        )
+
+        # There is one shared `compressed_local_indices` buffer, so at most one
+        # dense-compressed ratio can be expressed. V4 has exactly one (128) and
+        # V4.1 has none; a second would need a per-ratio buffer, so refuse rather
+        # than silently indexing one ratio's cache with another's stride.
+        dense_ratios = [
+            compress_ratio
+            for compress_ratio in self._compress_ratios_sorted
+            if is_dense_compress_layer(compress_ratio, self.variant)
+        ]
+        if len(dense_ratios) > 1:
+            raise NotImplementedError(
+                f"At most one dense-compressed ratio is supported, got {dense_ratios}."
+            )
+        self._dense_compress_ratio = dense_ratios[0] if dense_ratios else 1
+
+        # (ratio, pool_factor, kind) per ratio, precomputed so the compiled
+        # index builder never re-derives variant semantics inside a graph.
+        # kind: 0 = SWA only, 1 = indexed (top-k), 2 = dense compressed.
+        self._ratio_specs = tuple(
+            (
+                compress_ratio,
+                pool_factor(compress_ratio),
+                0
+                if not is_compress_layer(compress_ratio, self.variant)
+                else (1 if is_sparse_layer(compress_ratio, self.variant) else 2),
+            )
+            for compress_ratio in self._compress_ratios_sorted
         )
 
         # Sliding-window caches use per-layer page indices and are indexed by
@@ -253,8 +337,42 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 capture_graph=capture_graph,
             )
             for compress_ratio in self._compress_ratios_sorted
-            if is_compress_layer(compress_ratio)
+            if is_compress_layer(compress_ratio, self.variant)
         }
+
+        # One INDEXER_COMPRESS page table per indexer pool. The pools differ in
+        # page scale, so one table cannot address both: a ratio-2 layer indexing
+        # through the ratio-1 table would scatter its keys into pages that belong
+        # to another ratio's sequences.
+        #
+        # The first (lowest) ratio keeps using the DSA-inherited
+        # `indexer_k_cache_block_offsets` pair, so V4 -- which has exactly one
+        # indexer pool -- allocates nothing extra and every inherited DSA call
+        # site keeps reading the same tensor it always did. It is reached through
+        # the attribute rather than cached in the dict below because a draft
+        # forward *rebinds* that attribute to the draft manager's buffers
+        # (dsa/metadata.py:311); a snapshot taken here would silently outlive
+        # the swap. Only V4.1's second pool is new.
+        indexer_ratios = self.kv_cache_manager.indexer_compress_ratios
+        assert indexer_ratios, (
+            "no INDEXER_COMPRESS pool exists on this rank, but the DeepSeek-V4 "
+            "metadata is only built for models with an indexer"
+        )
+        self._primary_indexer_ratio = indexer_ratios[0]
+        self.indexer_compress_block_tables: Dict[int, torch.Tensor] = {}
+        self.host_indexer_compress_block_tables: Dict[int, torch.Tensor] = {}
+        for compress_ratio in indexer_ratios[1:]:
+            device_table = self.get_empty(
+                self.cuda_graph_buffers,
+                tuple(self.indexer_k_cache_block_offsets.shape),
+                cache_name=f"indexer_compress_block_tables_{compress_ratio}",
+                dtype=self.indexer_k_cache_block_offsets.dtype,
+                capture_graph=capture_graph,
+            )
+            self.indexer_compress_block_tables[compress_ratio] = device_table
+            self.host_indexer_compress_block_tables[compress_ratio] = torch.zeros_like(
+                device_table, device="cpu", pin_memory=prefer_pinned()
+            )
 
         # sparse_mla_topk_lens: actual token count per token for each compress_ratio (SWA + compressed)
         # Shape: [max_num_tokens] per compress_ratio
@@ -289,24 +407,76 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self._init_draft_sparse_buffers()
 
     def prepare_for_indexer_k_cache(self):
-        """Prepare the shared indexer K-cache decode table for DSA kernels."""
-        # INDEXER_COMPRESS uses shared page indices, so the generic DSA
-        # indexer path only needs one 2D block table.
-        self.kv_cache_manager.copy_batch_indexer_compress_block_tables(
-            self.host_indexer_k_cache_block_offsets,
-            self.request_ids,
-            beam_width=self.beam_width,
-            num_contexts=self.num_contexts,
-            num_seqs=self.num_seqs,
-        )
-        self.indexer_k_cache_block_offsets[: self.num_seqs].copy_(
-            self.host_indexer_k_cache_block_offsets[: self.num_seqs],
-            non_blocking=True,
-        )
-        # Columns beyond each sequence's allocated indexer blocks contain BAD_PAGE_INDEX (-1).
-        # CUDA-graph padded token slots may still compute scatter addresses from those columns
-        # before being ignored, so map them to block 0, matching the base DSA metadata path.
-        self.indexer_k_cache_block_offsets.clamp_(min=0)
+        """Prepare the indexer K-cache decode tables for DSA kernels."""
+        # INDEXER_COMPRESS uses shared page indices, so each pool needs only one
+        # 2D block table. V4 has a single pool, so this loop runs once over the
+        # inherited buffers and does exactly what it always did.
+        tables = [
+            (
+                self._primary_indexer_ratio,
+                self.indexer_k_cache_block_offsets,
+                self.host_indexer_k_cache_block_offsets,
+            )
+        ]
+        tables += [
+            (ratio, table, self.host_indexer_compress_block_tables[ratio])
+            for ratio, table in self.indexer_compress_block_tables.items()
+        ]
+        for compress_ratio, device_table, host_table in tables:
+            self.kv_cache_manager.copy_batch_indexer_compress_block_tables(
+                host_table,
+                self.request_ids,
+                beam_width=self.beam_width,
+                num_contexts=self.num_contexts,
+                num_seqs=self.num_seqs,
+                compress_ratio=compress_ratio,
+            )
+            device_table[: self.num_seqs].copy_(
+                host_table[: self.num_seqs],
+                non_blocking=True,
+            )
+            # Columns beyond each sequence's allocated indexer blocks contain BAD_PAGE_INDEX (-1).
+            # CUDA-graph padded token slots may still compute scatter addresses from those columns
+            # before being ignored, so map them to block 0, matching the base DSA metadata path.
+            device_table.clamp_(min=0)
+
+    def indexer_block_table(self, compress_ratio: int) -> torch.Tensor:
+        """The INDEXER_COMPRESS page table a layer of this ratio must address.
+
+        Every caller has its layer's ratio to hand, so this is a lookup rather
+        than a guess: handing a ratio-2 layer the ratio-1 table would scatter its
+        index keys into another pool's pages, which reads as an accuracy bug
+        rather than a wiring bug.
+        """
+        if compress_ratio == self._primary_indexer_ratio:
+            return self.indexer_k_cache_block_offsets
+        table = self.indexer_compress_block_tables.get(compress_ratio)
+        if table is None:
+            raise RuntimeError(
+                f"no INDEXER_COMPRESS page table for compress ratio {compress_ratio}; "
+                f"this rank has pools for "
+                f"{sorted([self._primary_indexer_ratio, *self.indexer_compress_block_tables])}"
+            )
+        return table
+
+    def host_indexer_block_table(self, compress_ratio: Optional[int] = None) -> torch.Tensor:
+        """The host mirror of :meth:`indexer_block_table`.
+
+        The slot-mapping computation runs on the CPU copy (it feeds a pinned
+        host->device copy), so it needs the same per-ratio selection the device
+        path gets. ``None`` means "the primary ratio" and is what plain DSA and
+        every single-pool caller resolve to.
+        """
+        if compress_ratio is None or compress_ratio == self._primary_indexer_ratio:
+            return self.host_indexer_k_cache_block_offsets
+        table = self.host_indexer_compress_block_tables.get(compress_ratio)
+        if table is None:
+            raise RuntimeError(
+                f"no host INDEXER_COMPRESS page table for compress ratio {compress_ratio}; "
+                f"this rank has pools for "
+                f"{sorted([self._primary_indexer_ratio, *self.host_indexer_compress_block_tables])}"
+            )
+        return table
 
     def prepare_for_block_tables(self):
         """Prepare block tables for sliding-window and compressed attention."""
@@ -351,12 +521,13 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self._prepare_deepseek_v4_indices_compiled(
             token_positions,
             window_size,
-            self.max_compressed_indices[128],
+            self._max_dense_compressed_indices,
+            self._dense_compress_ratio,
             self.sparse_mla_topk,
             self.swa_local_indices_cuda,
             self.compressed_local_indices_cuda,
             self.sparse_mla_topk_lens,
-            self._compress_ratios_sorted,
+            self._ratio_specs,
         )
 
     @staticmethod
@@ -364,12 +535,13 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     def _prepare_deepseek_v4_indices_compiled(
         token_positions: torch.Tensor,
         window_size: int,
-        max_compressed_indices_128: int,
+        max_dense_compressed_indices: int,
+        dense_compress_ratio: int,
         sparse_mla_topk: int,
         swa_local_indices_buf: torch.Tensor,
         compressed_local_indices_buf: torch.Tensor,
         sparse_mla_topk_lens_bufs: Dict[int, torch.Tensor],
-        compress_ratios: list,
+        ratio_specs: tuple,
     ):
         """Build SWA indices, compressed indices, and topk_lens in one fused graph."""
         device = token_positions.device
@@ -383,50 +555,57 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         swa_indices = torch.where(swa_indices > positions, -1, swa_indices).to(torch.int32)
         swa_local_indices_buf[:num_tokens] = swa_indices
 
-        # ── Compressed local indices (ratio=128) ──
-        # Hardcoded 128: compressed_local_indices only applies to ratio=128
-        # layers. This is a design constraint — see compress_ratio_set
-        # validation in __post_init__ which restricts ratios to {1, 4, 128}.
-        num_valid = (token_positions + 1) // 128
-        comp_col = torch.arange(max_compressed_indices_128, dtype=torch.int32, device=device)
+        # ── Compressed local indices (dense-compressed layers only) ──
+        # An indexed layer passes the indexer's dynamic topk_indices instead, so
+        # this buffer serves the single dense ratio (V4's 128). V4.1 has none, in
+        # which case `max_dense_compressed_indices` is 0 and the loop below writes
+        # a zero-width slice of the 1-column dummy.
+        num_valid = (token_positions + 1) // dense_compress_ratio
+        comp_col = torch.arange(max_dense_compressed_indices, dtype=torch.int32, device=device)
         valid_mask = comp_col.unsqueeze(0) < num_valid.unsqueeze(1)
         comp_indices = torch.where(
             valid_mask,
             comp_col.unsqueeze(0).expand(num_tokens, -1),
             torch.full(
-                (num_tokens, max_compressed_indices_128), -1, dtype=torch.int32, device=device
+                (num_tokens, max_dense_compressed_indices), -1, dtype=torch.int32, device=device
             ),
         )
-        compressed_local_indices_buf[:num_tokens] = comp_indices
+        compressed_local_indices_buf[:num_tokens, :max_dense_compressed_indices] = comp_indices
 
         # ── sparse_mla_topk_lens per compress_ratio ──
-        # Dual-pool layout:
-        # - compress_ratio=1: min(kv_len, window_size) — actual valid SWA count
-        # - compress_ratio=4: window_size + min(kv_len // 4, sparse_mla_topk)
-        #   (fixed 128 SWA slots + compressed valid count)
-        # - compress_ratio=128: window_size + kv_len // 128
-        #   (fixed 128 SWA slots + compressed valid count)
-        # For ratio>1, the SWA region always occupies exactly window_size (128)
-        # slots. Invalid SWA positions are padded with -1 in the index buffer.
+        # Dual-pool layout, by what the layer does with its compressed cache:
+        # - SWA only  : min(kv_len, window_size) — actual valid SWA count.
+        # - indexed   : window_size + min(kv_len // pool, sparse_mla_topk).
+        # - dense     : window_size + kv_len // pool.
+        # For any layer with a compressed branch, the SWA region always occupies
+        # exactly window_size (128) slots; invalid SWA positions are padded with
+        # -1 in the index buffer.
+        #
+        # For V4 this is the former ratio 1 / 4 / 128 chain verbatim. For V4.1 the
+        # kinds land on ratios 0 / {1, 2} / none, so a ratio-1 layer correctly
+        # gets an *indexed* length over an unpooled cache rather than V4's
+        # SWA-only length.
         kv_lens = token_positions + 1
-        for compress_ratio in compress_ratios:
-            if compress_ratio == 1:
+        for compress_ratio, pool, kind in ratio_specs:
+            if kind == 0:
                 total_count = kv_lens.clamp(max=window_size)
-            elif compress_ratio == 4:
-                compressed_count = (kv_lens // compress_ratio).clamp(max=sparse_mla_topk)
-                total_count = window_size + compressed_count
-            elif compress_ratio == 128:
-                compressed_count = kv_lens // compress_ratio
-                total_count = window_size + compressed_count
+            elif kind == 1:
+                total_count = window_size + (kv_lens // pool).clamp(max=sparse_mla_topk)
             else:
-                raise ValueError(f"Unsupported compress_ratio: {compress_ratio}")
+                total_count = window_size + kv_lens // pool
             sparse_mla_topk_lens_bufs[compress_ratio][:num_tokens] = total_count.to(torch.int32)
 
     def _build_cache_buffer_data_pointers(
         self, manager: "DeepseekV4CacheManager", compress_ratios_by_layer: list[int]
-    ) -> tuple[dict[int, int], dict[int, int], dict[int, int]]:
+    ) -> tuple[int, dict[int, int], dict[int, int], dict[int, int]]:
         """Build sparse cache pointers for a target or draft manager."""
-        sparse_mla_base_ptrs = {1: manager.swa_pool_ptr}
+        # Keyed by a layer's compress ratio and read as that layer's *aux* pool:
+        # the compressed pool for a long-range layer, and the SWA pool for an
+        # SWA-only layer (which has no compressed cache of its own). The SWA-only
+        # sentinel is 1 in V4 but 0 in V4.1, where 1 is a real compressed pool —
+        # seeding the literal 1 would hand V4.1's ratio-1 layers the SWA pool.
+        # Callers that always want the SWA pool use `swa_pool_base_ptr` instead.
+        sparse_mla_base_ptrs = {self._swa_only_ratio: manager.swa_pool_ptr}
         for ratio, compress_pool_ptr in manager.compress_pool_ptrs.items():
             sparse_mla_base_ptrs[ratio] = compress_pool_ptr
 
@@ -434,9 +613,14 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         compressed_buffer_ptrs = {
             layer_idx: manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS).data_ptr()
             for layer_idx in manager.pp_layers
-            if is_compress_layer(compress_ratios_by_layer[layer_idx])
+            if is_compress_layer(compress_ratios_by_layer[layer_idx], self.variant)
         }
-        return sparse_mla_base_ptrs, swa_buffer_ptrs, compressed_buffer_ptrs
+        return (
+            manager.swa_pool_ptr,
+            sparse_mla_base_ptrs,
+            swa_buffer_ptrs,
+            compressed_buffer_ptrs,
+        )
 
     def _init_cache_buffer_data_pointers(self):
         # If MTP is enabled, enlarge the compress ratios by max_draft_tokens - 1.
@@ -444,6 +628,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.max_draft_tokens - 1
         )
         (
+            self.swa_pool_base_ptr,
             self.sparse_mla_base_ptrs,
             self.swa_buffer_ptrs,
             self.compressed_buffer_ptrs,
@@ -454,6 +639,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self.draft_sliding_block_tables = None
         self.draft_sparse_mla_base_ptrs = None
         self.draft_swa_buffer_ptrs = None
+        self.draft_swa_pool_base_ptr = None
 
         draft_mgr = self.draft_kv_cache_manager
         from .cache_manager import DeepseekV4CacheManager
@@ -464,10 +650,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # Current DSv4 MTP layers are SWA-only. Fail fast if a future model
         # introduces a compressed or indexer MTP layer.
         draft_ratio = self.compress_ratios[-1]
-        if draft_ratio != 1:
+        if is_compress_layer(draft_ratio, self.variant):
             raise NotImplementedError(
                 "Separate DeepSeek-V4 draft KV cache supports only SWA-only "
-                f"(compress_ratio 1) MTP draft layers; got ratio {draft_ratio}."
+                f"(compress_ratio {self._swa_only_ratio}) MTP draft layers; "
+                f"got ratio {draft_ratio}."
             )
 
         draft_block_table_shape = (
@@ -485,6 +672,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
         extend_compress_ratios = self.compress_ratios + [draft_ratio] * (self.max_draft_tokens - 1)
         (
+            self.draft_swa_pool_base_ptr,
             self.draft_sparse_mla_base_ptrs,
             self.draft_swa_buffer_ptrs,
             _,
@@ -494,6 +682,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         "sliding_block_tables",
         "sparse_mla_base_ptrs",
         "swa_buffer_ptrs",
+        # The SWA pool address is manager-specific, so a draft forward that runs
+        # against a separate draft cache has to swap it too. It used to be read
+        # out of `sparse_mla_base_ptrs[1]`, which came along for free; now that
+        # it is its own field it has to be listed here explicitly.
+        "swa_pool_base_ptr",
     )
 
     def prepare_for_draft_forward(self) -> dict | None:
@@ -515,6 +708,14 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     def prepare(self):
         assert self.kv_cache_manager is not None
         assert self.request_ids is not None
+
+        # Drop last step's cross-layer handoffs. Holding them would both keep
+        # dead activations alive for a whole step and let a consumer silently
+        # score against the previous batch if its producer were skipped.
+        self.v41_index_keys.clear()
+        self.v41_topk_indices.clear()
+        self.v41_candidate_blocks.clear()
+        self.v41_candidate_rows_consumed.clear()
 
         self.kv_cache_manager.compute_sliding_block_tables(
             self.request_ids,
@@ -562,7 +763,10 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # For indices conversion
         self.prepare_for_indices_conversion()
 
-        has_sparse_layers = DEEPSEEK_V4_SPARSE_RATIO in self.compress_ratio_set
+        has_sparse_layers = any(
+            is_sparse_layer(compress_ratio, self.variant)
+            for compress_ratio in self.compress_ratio_set
+        )
 
         # For block offsets
         self.prepare_for_block_tables()
@@ -601,12 +805,17 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             # Prefill path: need per-request tensor ops for ctx scalar metadata.
             ctx_output_sizes = {}
             for compress_ratio in self.compress_ratio_set:
-                new_comp_kv_lens = kv_lens_slice // compress_ratio - cached_slice // compress_ratio
+                # Divide by the *pooling factor*, not the raw ratio: V4.1 spends
+                # ratio 0 on "SWA only", and such a layer still needs an entry in
+                # every per-ratio table even though nothing reads it. Identity on
+                # every V4 ratio.
+                pool = pool_factor(compress_ratio)
+                new_comp_kv_lens = kv_lens_slice // pool - cached_slice // pool
                 cu_new = new_comp_kv_lens.cumsum(0)
                 num_ctx_compressed_tokens = cu_new[num_contexts - 1].item()
                 ctx_output_sizes[compress_ratio] = num_ctx_compressed_tokens
                 num_gen_compressed_tokens = num_generations * (
-                    (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
+                    (num_gen_tokens_per_seq + pool - 1) // pool
                 )
                 self.num_total_compressed_tokens[compress_ratio] = (
                     num_ctx_compressed_tokens + num_gen_compressed_tokens
@@ -618,8 +827,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             # Decode-only: scalars depend only on num_generations and
             # num_gen_tokens_per_seq, no per-request tensor ops needed.
             for compress_ratio in self.compress_ratio_set:
+                pool = pool_factor(compress_ratio)
                 self.num_total_compressed_tokens[compress_ratio] = num_generations * (
-                    (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
+                    (num_gen_tokens_per_seq + pool - 1) // pool
                 )
                 self.max_ctx_compressed_tokens[compress_ratio] = 0
 
@@ -763,10 +973,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     ):
         """Compute per-ratio compressed/past/new kv lens and cu_new_comp."""
         for compress_ratio in compress_ratios:
-            compressed_kv = (kv_lens // compress_ratio).to(torch.int)
+            pool = pool_factor(compress_ratio)
+            compressed_kv = (kv_lens // pool).to(torch.int)
             compressed_kv_lens_bufs[compress_ratio][:batch_size] = compressed_kv
 
-            past_kv = (cached_tokens // compress_ratio).to(torch.int)
+            past_kv = (cached_tokens // pool).to(torch.int)
             past_kv_lens_bufs[compress_ratio][:batch_size] = past_kv
 
             new_comp = compressed_kv - past_kv
@@ -828,7 +1039,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         device = past_kv_lens_bufs[compress_ratios[0]].device
         batch_size = num_contexts + num_generations
         for compress_ratio in compress_ratios:
-            new_gen_comp = (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
+            pool = pool_factor(compress_ratio)
+            new_gen_comp = (num_gen_tokens_per_seq + pool - 1) // pool
             gen_comp = num_generations * new_gen_comp
             output_offset = gen_output_offsets[compress_ratio]
             cu_new_comp = cu_new_comp_kv_bufs[compress_ratio]
@@ -838,7 +1050,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             req_idx = req_idx.clamp(min=num_contexts, max=batch_size - 1)
             offset_in_req = output_idx - cu_new_comp[req_idx]
             past_kv_lens = past_kv_lens_bufs[compress_ratio]
-            result = ((past_kv_lens[req_idx] + offset_in_req) * compress_ratio).to(torch.int)
+            result = ((past_kv_lens[req_idx] + offset_in_req) * pool).to(torch.int)
             compressed_position_ids_bufs[compress_ratio][
                 output_offset : output_offset + gen_comp
             ] = result
@@ -903,5 +1115,5 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             ctx_req = torch.searchsorted(ctx_cu[1:], ctx_idx, right=True)
             ctx_offset = ctx_idx - ctx_cu[ctx_req]
             compressed_position_ids_bufs[compress_ratio][:total_ctx_comp] = (
-                (past_kv[:num_contexts][ctx_req] + ctx_offset) * compress_ratio
+                (past_kv[:num_contexts][ctx_req] + ctx_offset) * pool_factor(compress_ratio)
             ).to(torch.int)

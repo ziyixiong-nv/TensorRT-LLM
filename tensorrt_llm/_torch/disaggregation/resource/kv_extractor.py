@@ -535,9 +535,16 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
 
     # Virtual layers: build inverse mapping internal_layer_id -> (model_layer, attn_type)
     # and encode as model_layer * num_attn_types + attn_type_value
+    # `setdefault`, not assignment: the mapping is many-to-one under DeepSeek-V4.1,
+    # where long-range layers that share a compressed cache all resolve to the
+    # LayerId of the layer that allocated it. The owner is inserted first (it
+    # precedes its dependents in layer order), so keeping the first entry names the
+    # owner. Keeping the last would name whichever dependent happened to come last
+    # on this rank, which differs between PP ranks and would break the peer
+    # matching this ID is required to be consistent for.
     inverse = {}
     for (model_layer, attn_type), layer_id in manager._layer_attn_to_layer_id.items():
-        inverse[layer_id] = (model_layer, attn_type.value)
+        inverse.setdefault(layer_id, (model_layer, attn_type.value))
 
     # Use the full enum range for consistent encoding across all PP ranks.
     # Different PP ranks may have different subsets of attention types (e.g.,

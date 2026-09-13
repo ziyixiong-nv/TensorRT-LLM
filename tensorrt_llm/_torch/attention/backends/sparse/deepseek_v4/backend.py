@@ -30,11 +30,21 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .cache_manager import get_token_bytes
-from .compressor import Compressor
-from .indexer import DeepseekV4Indexer
+from .compressor import Compressor, DeepseekV41Compressor
+from .indexer import DeepseekV4Indexer, DeepseekV41Indexer
 from .kernels import deepseek_v4_local_to_global_indices
 from .metadata import DeepseekV4TrtllmAttentionMetadata
-from .params import DeepseekV4AttentionType, DeepSeekV4Params
+from .params import (
+    DEEPSEEK_V4_VARIANT,
+    DEEPSEEK_V41_VARIANT,
+    DeepseekV4AttentionType,
+    DeepSeekV4Params,
+    is_compress_layer,
+    is_sparse_layer,
+    owns_compressed_kv,
+    owns_index_topk,
+    source_layer_for,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
@@ -97,9 +107,70 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
 
         self.sparse_attention_config = sparse_attention_config
         self.compress_ratio = sparse_attention_config.compress_ratios[layer_idx]
+        # `compress_ratio` is both a pooling factor and a role sentinel, and the
+        # two generations encode the roles differently (see `params.py`). Resolve
+        # the roles once here so the rest of the backend never re-derives them
+        # from the raw integer: V4.1's ratio 1 is a long-range layer where V4's
+        # ratio 1 is SWA-only, so `ratio > 1` is not a portable test.
+        self.variant = getattr(sparse_attention_config, "variant", DEEPSEEK_V4_VARIANT)
+        self.has_compressed_kv = is_compress_layer(self.compress_ratio, self.variant)
+        self.is_indexed = is_sparse_layer(self.compress_ratio, self.variant)
+        # `has_compressed_kv` / `is_indexed` say what this layer *reads*; these say
+        # what it *produces*. V4 always produces what it reads, so both collapse to
+        # the pair above and the V4 path is unchanged. V4.1 splits them: 4 of its 38
+        # long-range layers own a Compressor and 8 own an Indexer, and the rest read
+        # the nearest preceding source's output. A non-owner must not build the
+        # module (it has no weights for it) and must not allocate the cache (nothing
+        # would write it); it is pointed at its source's buffer instead, see
+        # `DeepseekV4TrtllmAttentionMetadata._build_cache_buffer_data_pointers`.
+        self.kv_source_layer_ids = sparse_params.kv_source_layer_ids
+        self.index_source_layer_ids = sparse_params.index_source_layer_ids
+        self.owns_compressed_kv = owns_compressed_kv(
+            layer_idx, self.compress_ratio, self.kv_source_layer_ids, self.variant
+        )
+        self.owns_indexer = owns_index_topk(
+            layer_idx, self.compress_ratio, self.index_source_layer_ids, self.variant
+        )
+        # Whose compressed KV / top-k this layer consumes. Identity for an owner.
+        self.kv_source_layer_idx = (
+            source_layer_for(layer_idx, self.kv_source_layer_ids)
+            if self.has_compressed_kv
+            else None
+        )
+        self.index_source_layer_idx = (
+            source_layer_for(layer_idx, self.index_source_layer_ids) if self.is_indexed else None
+        )
+        if self.has_compressed_kv and self.kv_source_layer_ids:
+            assert self.kv_source_layer_idx is not None, (
+                f"layer {layer_idx} reads a compressed-KV cache but no layer in "
+                f"kv_source_layer_ids={list(self.kv_source_layer_ids)} runs at or "
+                "before it, so nothing would ever write that cache."
+            )
+        if self.is_indexed and self.index_source_layer_ids:
+            assert self.index_source_layer_idx is not None, (
+                f"layer {layer_idx} reads an index top-k but no layer in "
+                f"index_source_layer_ids={list(self.index_source_layer_ids)} runs "
+                "at or before it, so no selection would ever be published."
+            )
 
-        if self.compress_ratio == 4:
-            self.indexer = DeepseekV4Indexer(
+        if self.owns_indexer:
+            indexer_kwargs = {}
+            if self.variant == DEEPSEEK_V41_VARIANT:
+                indexer_cls = DeepseekV41Indexer
+                # V4.1's index keys are a reprojection of the compressed latent, so
+                # only a layer that compresses its own KV can build them
+                # (``owns_k`` at model.py:499). The four index sources that are not
+                # KV sources read keys from their kv source's cache and carry no
+                # `wk` in the checkpoint.
+                indexer_kwargs["owns_index_keys"] = self.owns_compressed_kv
+                # Which cache a non-owner scores against. Also the key into
+                # `metadata.v41_index_keys` on the single-pass prefill path,
+                # where the keys are handed over as activations rather than read
+                # back out of the cache.
+                indexer_kwargs["kv_source_layer_idx"] = self.kv_source_layer_idx
+            else:
+                indexer_cls = DeepseekV4Indexer
+            self.indexer = indexer_cls(
                 quant_config,
                 pos_embd_params,
                 mla_params,
@@ -109,15 +180,22 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 self.compress_ratio,
                 layer_idx,
                 aux_stream,
+                **indexer_kwargs,
             )
 
-        if self.compress_ratio > 1:
-            rms_norm_eps = 1e-6
+        if self.owns_compressed_kv:
+            # The reference passes `args.norm_eps` at every compressor call site.
+            # V4 ships 1e-6 and V4.1 ships 1e-20, so take it from the resolved
+            # sparse params rather than hardcoding either generation's value.
+            rms_norm_eps = sparse_params.rms_norm_eps
             has_fp8_kv_cache = False
             if quant_config is not None:
                 has_fp8_kv_cache = quant_config.layer_quant_mode.has_fp8_kv_cache()
             kv_cache_dtype = "fp8_pertensor" if has_fp8_kv_cache else "default"
-            self.compressor = Compressor(
+            compressor_cls = (
+                DeepseekV41Compressor if self.variant == DEEPSEEK_V41_VARIANT else Compressor
+            )
+            self.compressor = compressor_cls(
                 mla_params,
                 layer_idx,
                 self.compress_ratio,
@@ -151,7 +229,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         sparse_args.sparse_attn_kv_lens = metadata.sparse_mla_topk_lens[self.compress_ratio][
             start_idx:end_idx
         ]
-        if self.compress_ratio > 1:
+        if self.has_compressed_kv:
             sparse_args.aux_kv_cache_pool_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
         else:
             sparse_args.aux_kv_cache_pool_ptr = None
@@ -199,7 +277,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         kv_cache_manager = metadata.kv_cache_manager
         attention_input_type = forward_args.attention_input_type
 
-        swa_pool_base_ptr = metadata.sparse_mla_base_ptrs[1]
+        swa_pool_base_ptr = metadata.swa_pool_base_ptr
 
         # Get cached buffer pointers
         swa_buffer_ptr = metadata.swa_buffer_ptrs[layer_idx]
@@ -216,6 +294,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             DeepseekV4AttentionType.SWA,
             has_fp8_kv_cache,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            variant=self.variant,
         )
 
         # Select token range based on phase
@@ -237,17 +316,17 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             local_layer_idx, DeepseekV4AttentionType.SWA.value
         ]
 
-        if self.compress_ratio > 1:
+        if self.has_compressed_kv:
             compressed_buffer_ptr = metadata.compressed_buffer_ptrs[layer_idx]
             compress_pool_base_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
             block_table_compressed = metadata.compress_block_tables[self.compress_ratio]
-            if self.compress_ratio == 4:
+            if self.is_indexed:
                 sparse_backend_args = forward_args.sparse_backend_args
                 assert sparse_backend_args is not None, (
-                    "sparse_backend_args is required when compress_ratio=4"
+                    "sparse_backend_args is required for an indexed layer"
                 )
                 topk_indices = sparse_backend_args.topk_indices
-                assert topk_indices is not None, "topk_indices is required when compress_ratio=4"
+                assert topk_indices is not None, "topk_indices is required for an indexed layer"
                 compressed_local_indices = topk_indices
             else:
                 compressed_local_indices = metadata.compressed_local_indices_cuda[start_idx:end_idx]
@@ -305,6 +384,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             compress_pool_base_ptr=compress_pool_base_ptr,
             compressed_buffer_ptr=compressed_buffer_ptr,
             compress_ratio=self.compress_ratio,
+            has_compressed=self.has_compressed_kv,
             num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
             **sched_kwargs,
             split_extra=self.use_fp8_ds_mla,

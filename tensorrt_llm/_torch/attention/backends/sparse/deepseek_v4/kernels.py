@@ -106,7 +106,16 @@ def _deepseek_v4_local_to_global_kernel(
     swa_full_mask = swa_valid_mask & swa_valid_block
 
     swa_bt_ptr = block_table_swa_ptr + req * bt_swa_stride0 + swa_block_ordinal * bt_swa_stride1
-    swa_page_index = tl.load(swa_bt_ptr, mask=swa_full_mask, other=0)
+    # `other=-1` rather than 0: a masked-off lane must not look like page 0, and -1 fails the
+    # sentinel check below, which keeps the two mask terms consistent.
+    swa_page_index = tl.load(swa_bt_ptr, mask=swa_full_mask, other=-1)
+    # `max_blocks_swa` is the block table's *capacity* (`.shape[1]`), not this request's allocated
+    # block count, so an in-array ordinal can still name an unallocated slot -- and those slots
+    # hold kBadPageIndex == -1 (`kv_cache_manager_v2/common.h`, filled by `kvCache.cpp`).
+    # Unchecked, `-1 * tokens_per_block + token_in_block` becomes an index that is merely *wrong*
+    # rather than invalid: negative in the SWA pool, but a plausible in-range address in the
+    # compressed pool, where the buffer offset lifts it back above zero.
+    swa_full_mask = swa_full_mask & (swa_page_index >= 0)
 
     swa_global_index = (
         swa_buffer_offset_in_tokens + swa_page_index * tokens_per_block_swa + swa_token_in_block
@@ -139,7 +148,11 @@ def _deepseek_v4_local_to_global_kernel(
             + req * bt_compressed_stride0
             + compressed_block_ordinal * bt_compressed_stride1
         )
-        compressed_page_index = tl.load(compressed_bt_ptr, mask=compressed_full_mask, other=0)
+        compressed_page_index = tl.load(compressed_bt_ptr, mask=compressed_full_mask, other=-1)
+        # Same sentinel, and this is the branch where an unguarded -1 is dangerous rather than
+        # merely wrong: `compressed_buffer_offset_in_tokens` is positive, so the bad index lands
+        # inside the pool instead of before it. See the SWA branch above.
+        compressed_full_mask = compressed_full_mask & (compressed_page_index >= 0)
 
         compressed_global_index = (
             compressed_buffer_offset_in_tokens
@@ -178,6 +191,7 @@ def deepseek_v4_local_to_global_indices(
     compress_pool_base_ptr: int = 0,  # int64: base address of compress pool
     compressed_buffer_ptr: int = 0,
     compress_ratio: int = 1,
+    has_compressed: bool | None = None,
     num_compressed_indices: int = 0,  # max number of compressed indices
     # Optional FMHA scheduler prologue (see the kernel docstring)
     fmha_tile_counter: torch.Tensor | None = None,
@@ -216,7 +230,13 @@ def deepseek_v4_local_to_global_indices(
             Use -1 for invalid/padding indices.
         compress_pool_base_ptr: Base address of compress pool
         compressed_buffer_ptr: Base address of compressed buffer (optional)
-        compress_ratio: Compression ratio (1: no compression, >1: with compression)
+        compress_ratio: Pooling factor of the compressed cache. Only used to scale
+            compressed indices; it does not decide *whether* there is a compressed
+            cache, because the two DeepSeek-V4 generations encode that differently
+            (V4.1 ratio 1 is a real unpooled compressed cache). Pass has_compressed
+            explicitly when the caller knows the layer's role.
+        has_compressed: Whether the layer has a compressed cache. Defaults to
+            ``compress_ratio > 1``, which is the V4 rule.
         num_compressed_indices: Max number of compressed indices for CUDA graph compatibility
             Output width = num_swa_indices + num_compressed_indices.
         split_extra: Return separate SWA and compressed index tensors.
@@ -238,7 +258,8 @@ def deepseek_v4_local_to_global_indices(
 
     assert swa_local_indices.shape[0] == num_tokens
 
-    has_compressed = compress_ratio > 1
+    if has_compressed is None:
+        has_compressed = compress_ratio > 1
     if split_extra and has_compressed and num_compressed_indices == 0:
         raise ValueError(
             "split_extra=True with compressed inputs requires num_compressed_indices > 0"
@@ -249,10 +270,10 @@ def deepseek_v4_local_to_global_indices(
 
     if has_compressed:
         assert block_table_compressed is not None, (
-            "block_table_compressed required when compress_ratio > 1"
+            "block_table_compressed required for a compressed layer"
         )
         assert compressed_local_indices is not None, (
-            "compressed_local_indices required when compress_ratio > 1"
+            "compressed_local_indices required for a compressed layer"
         )
         assert block_table_compressed.dtype == torch.int32, (
             f"block_table_compressed must be int32, got {block_table_compressed.dtype}"

@@ -402,6 +402,13 @@ def select_indexer_chunk_size(configured_chunk_size: int, max_k_compressed: int)
 
 
 def _select_indexer_compress_ratio(compress_ratios: List[int]) -> int:
+    """Guess the single ratio an indexer runs at from a layer-ratio list.
+
+    Only a fallback for cache managers that do not publish
+    ``indexer_compress_ratios`` (plain DSA). A ratio list alone cannot say which
+    ratios actually own an INDEXER_COMPRESS pool -- V4.1's ``{0, 1, 2}`` has two
+    -- so prefer the cache manager's list whenever it exists.
+    """
     if 4 in compress_ratios:
         return 4
     if 1 in compress_ratios:
@@ -411,6 +418,113 @@ def _select_indexer_compress_ratio(compress_ratios: List[int]) -> int:
 
 def _effective_compress_ratio_divisor(compress_ratio: int) -> int:
     return compress_ratio if compress_ratio > 1 else 1
+
+
+# Indexer metadata that is a function of one compress ratio. Every field here is
+# derived by dividing a token count by that ratio: how many compressed rows a
+# context contributes (``num_ctx_kv_tokens``), where those rows live in the pool
+# (``slot_mapping_*``), the causal window over them (``cu_seqlen_k*``), and the
+# decode schedule built from their lengths.
+#
+# V4 and plain DSA index at exactly one ratio, so one set has always been
+# enough. V4.1 indexes at two: its index-key owners ``kv_source_layer_ids ==
+# [2, 8, 14, 20]`` have ratios ``[2, 2, 2, 1]``, so a ratio-2 layer owns half as
+# many compressed rows as the ratio-1 arithmetic claims. Sharing one set makes a
+# ratio-2 layer's logits window over-reach the keys that exist, and when a short
+# context rounds down to zero rows it hands a 0-row tensor to the FP4 MQA-logits
+# kernel -- whose TMA descriptor then carries a zero global dimension and the
+# driver rejects it outright.
+#
+# The names match the metadata attributes these fields used to be, so the lowest
+# ratio's state can be a live view onto the metadata itself and every existing
+# ``metadata.slot_mapping_fp8``-style reference keeps working unchanged.
+_INDEXER_RATIO_STATE_FIELDS = (
+    "_indexer_compress_ratio",
+    "_tokens_per_block",
+    "num_ctx_kv_tokens",
+    "cu_seqlen_ks",
+    "cu_seqlen_ke",
+    "slot_mapping_fp8",
+    "slot_mapping_scale",
+    "host_slot_mapping_fp8",
+    "host_slot_mapping_scale",
+    "slot_mapping_fp8_fullkv",
+    "slot_mapping_scale_fullkv",
+    "indexer_prefill_chunks",
+    "scheduler_metadata_buffer",
+    "scheduler_metadata_buffer_full_next_n",
+    "kv_lens_cuda_2d",
+    "gen_indexer_kv_lens_cuda_runtime",
+)
+
+# The host mirrors among the above. The *device* buffers needing storage of their
+# own for a secondary ratio are not listed here: they are exactly the keys of
+# ``_secondary_indexer_ratio_buffer_shapes()``, which has to name each of them
+# anyway to give its shape, and a second list beside it could only drift.
+_INDEXER_RATIO_HOST_BUFFER_FIELDS = (
+    "host_slot_mapping_fp8",
+    "host_slot_mapping_scale",
+)
+
+
+class IndexerRatioStateBase:
+    """Common accessors over :data:`_INDEXER_RATIO_STATE_FIELDS`."""
+
+    __slots__ = ()
+
+    @property
+    def compress_ratio(self) -> int:
+        """The INDEXER_COMPRESS pool ratio this state belongs to."""
+        return self._indexer_compress_ratio
+
+    @property
+    def compress_ratio_divisor(self) -> int:
+        """The divisor to apply to token counts (ratios 0 and 1 both divide by 1)."""
+        return _effective_compress_ratio_divisor(self._indexer_compress_ratio)
+
+    @property
+    def tokens_per_block(self) -> int:
+        """Entries per page in this ratio's INDEXER_COMPRESS pool."""
+        return self._tokens_per_block
+
+
+class IndexerRatioState(IndexerRatioStateBase):
+    """Storage for a secondary compress ratio (V4.1's second indexer pool)."""
+
+    __slots__ = _INDEXER_RATIO_STATE_FIELDS
+
+    def __init__(self, **initial):
+        for name in _INDEXER_RATIO_STATE_FIELDS:
+            setattr(self, name, initial.get(name))
+
+
+class PrimaryIndexerRatioState(IndexerRatioStateBase):
+    """The lowest ratio's state, as a live view onto the metadata's attributes.
+
+    V4 and plain DSA only ever have this one, so nothing about their buffers,
+    their draft-forward rebinding, or the several hundred existing
+    ``metadata.<field>`` references changes: a read or write here lands on the
+    metadata attribute of the same name.
+    """
+
+    __slots__ = ("_metadata",)
+
+    def __init__(self, metadata):
+        object.__setattr__(self, "_metadata", metadata)
+
+    def __getattr__(self, name):
+        if name in _INDEXER_RATIO_STATE_FIELDS:
+            # Some fields (the *_fullkv aliases) are assigned lazily by the
+            # first prepare, so a missing attribute means "not built yet"
+            # rather than a typo; consumers assert on None.
+            return getattr(self._metadata, name, None)
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        if name in _INDEXER_RATIO_STATE_FIELDS:
+            setattr(self._metadata, name, value)
+            return
+        object.__setattr__(self, name, value)
 
 
 def compute_cu_seqlen_kv_bounds_with_cache(
@@ -619,6 +733,47 @@ class Indexer(nn.Module):
         self.layer_idx = layer_idx
         self.compress_ratio = compress_ratio
 
+        # V4.1 candidate prefilter roles. Derived from the layer index rather than
+        # passed in, so there is no second copy of the classification to fall out
+        # of sync with `configs/deepseek_v41.py`'s descriptors -- and
+        # `test_indexer_candidate_roles_match_descriptors` pins that the two
+        # derivations agree for every layer of the release config.
+        #
+        # `consumes_candidates` drops the descriptor's `is_index_source` term
+        # because only index sources construct an Indexer at all, so it is
+        # already true here.
+        # Imported here rather than at module scope: `deepseek_v4/__init__` pulls
+        # in its own indexer, which imports this module, so a top-level import
+        # would close a cycle. Same reason as the lazy imports in
+        # `_publish_candidate_blocks` / `_apply_candidate_blocks` below.
+        from ..deepseek_v4.candidate_prefilter import candidate_prefilter_is_on
+
+        self.candidate_source_layer_id = getattr(sparse_params, "candidate_source_layer_id", None)
+        self.candidate_topk_blocks = int(getattr(sparse_params, "candidate_topk_blocks", 0) or 0)
+        self.candidate_block_size = int(getattr(sparse_params, "candidate_block_size", 0) or 0)
+        self._candidate_prefilter_enabled = candidate_prefilter_is_on(
+            self.candidate_source_layer_id,
+            self.candidate_topk_blocks,
+            self.candidate_block_size,
+        )
+        self.is_candidate_source = self._candidate_prefilter_enabled and layer_idx == int(
+            self.candidate_source_layer_id
+        )
+        self.consumes_candidates = self._candidate_prefilter_enabled and layer_idx > int(
+            self.candidate_source_layer_id
+        )
+        # Level one's block ids are *row-local* -- block b of row r spans
+        # `row_starts[r] + b * block_size` -- so they only mean the same thing to
+        # producer and consumer while both anchor at the same `cu_seqlen_ks`, i.e.
+        # while both share a compress ratio (see `apply_candidate_blocks`'s
+        # docstring). In the release this holds without effort: layers 20-39 are
+        # the ratio-1 band and the source is layer 20, so the ratio-2 index
+        # sources (2/8/14) all precede it and never consume. Asserted at the
+        # consumer rather than relied on: a future checkpoint that moved the
+        # source into the pooled band would otherwise mask with ids from a
+        # different column space.
+        self._candidate_ratio = compress_ratio
+
         self.wq_b = Linear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -803,6 +958,7 @@ class Indexer(nn.Module):
     def prepare_one_prefill_chunk(
         metadata: DSAtrtllmAttentionMetadata,
         chunk_specs: List[Tuple[int, int, int, int]],
+        state: IndexerRatioStateBase,
     ) -> IndexerPrefillChunkMetadata:
         """
         Build metadata for one prefill chunk for indexer forward pass.
@@ -814,13 +970,13 @@ class Indexer(nn.Module):
                         - token_start_in_req, token_end_in_req are indices into current batch context tokens
                         - For multi-request: multiple specs from different requests (full requests)
                         - For intra-request: single spec from one request's Q-block
+            state: The indexer metadata for the compress ratio being prepared. Every
+                   token count below is in that ratio's compressed KV space.
 
         Note: Cached token counts are derived from metadata.host_ctx_cached_token_indptr
         """
-        device = metadata.cu_seqlen_ks.device
-        compress_ratio = _effective_compress_ratio_divisor(
-            _select_indexer_compress_ratio(metadata.compress_ratios)
-        )
+        device = state.cu_seqlen_ks.device
+        compress_ratio = state.compress_ratio_divisor
         if len(chunk_specs) == 1:
             # Single request or intra-request Q-block
             req_idx, token_start_in_req, token_end_in_req, req_cum_start = chunk_specs[0]
@@ -931,7 +1087,10 @@ class Indexer(nn.Module):
         )
 
     @staticmethod
-    def build_indexer_params(metadata: DSAtrtllmAttentionMetadata) -> Optional[IndexerParams]:
+    def build_indexer_params(
+        metadata: DSAtrtllmAttentionMetadata,
+        state: Optional[IndexerRatioStateBase] = None,
+    ) -> Optional[IndexerParams]:
         kv_cache_manager = metadata.kv_cache_manager
         if kv_cache_manager is None or not hasattr(kv_cache_manager, "index_head_dim"):
             return None
@@ -940,17 +1099,16 @@ class Indexer(nn.Module):
         data_bytes_per_token = (
             head_dim // 2 if getattr(kv_cache_manager, "use_fp4", False) else head_dim
         )
-        compress_ratio = _effective_compress_ratio_divisor(
-            _select_indexer_compress_ratio(metadata.compress_ratios)
-        )
+        if state is None:
+            state = metadata.indexer_state()
         return IndexerParams(
             num_contexts=metadata.num_contexts,
             num_generations=metadata.num_generations,
             num_ctx_tokens=metadata.num_ctx_tokens,
             head_dim=head_dim,
             quant_block_size=metadata.indexer_quant_block_size,
-            tokens_per_block=metadata._tokens_per_block,
-            compress_ratio=compress_ratio,
+            tokens_per_block=state.tokens_per_block,
+            compress_ratio=state.compress_ratio_divisor,
             request_ids=metadata.request_ids,
             num_past_tokens=metadata.kv_cache_params.num_cached_tokens_per_seq,
             seq_lens=metadata.seq_lens,
@@ -959,7 +1117,9 @@ class Indexer(nn.Module):
 
     @staticmethod
     def recompute_slot_mappings(
-        metadata: DSAtrtllmAttentionMetadata, indexer_params: Optional[IndexerParams] = None
+        metadata: DSAtrtllmAttentionMetadata,
+        indexer_params: Optional[IndexerParams] = None,
+        state: Optional[IndexerRatioStateBase] = None,
     ):
         """Recompute slot_mapping_fp8/scale from current block offsets.
 
@@ -968,10 +1128,13 @@ class Indexer(nn.Module):
         isolation after a caller has swapped the active KV cache manager and
         block-offset buffers, such as during draft KV-cache replay.
         """
+        if state is None:
+            state = metadata.indexer_state()
         if indexer_params is None:
-            indexer_params = Indexer.build_indexer_params(metadata)
+            indexer_params = Indexer.build_indexer_params(metadata, state)
             if indexer_params is None:
                 return
+        host_block_table = metadata.host_indexer_block_table(state.compress_ratio)
 
         batch_size = indexer_params.batch_size
         tokens_per_block = indexer_params.tokens_per_block
@@ -995,14 +1158,14 @@ class Indexer(nn.Module):
         # Block indices/pos for all kv tokens in the batch
         block_indices_in_seq = global_positions // tokens_per_block
 
-        max_blocks = metadata.host_indexer_k_cache_block_offsets.shape[1]
+        max_blocks = host_block_table.shape[1]
         assert (block_indices_in_seq < max_blocks).all(), (
             f"Block index out of bounds: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
         )
 
         fp8_flat_indices, scale_flat_indices = _compute_slot_mappings(
             global_positions,
-            metadata.host_indexer_k_cache_block_offsets,
+            host_block_table,
             req_indices,
             head_dim,
             tokens_per_block,
@@ -1010,29 +1173,32 @@ class Indexer(nn.Module):
             data_bytes_per_token=data_bytes_per_token,
         )
 
-        metadata.host_slot_mapping_fp8[:total_new_kv_tokens] = fp8_flat_indices
-        metadata.host_slot_mapping_scale[:total_new_kv_tokens] = scale_flat_indices
+        state.host_slot_mapping_fp8[:total_new_kv_tokens] = fp8_flat_indices
+        state.host_slot_mapping_scale[:total_new_kv_tokens] = scale_flat_indices
 
-        metadata.slot_mapping_fp8[:total_new_kv_tokens].copy_(
-            metadata.host_slot_mapping_fp8[:total_new_kv_tokens], non_blocking=True
+        state.slot_mapping_fp8[:total_new_kv_tokens].copy_(
+            state.host_slot_mapping_fp8[:total_new_kv_tokens], non_blocking=True
         )
-        metadata.slot_mapping_scale[:total_new_kv_tokens].copy_(
-            metadata.host_slot_mapping_scale[:total_new_kv_tokens], non_blocking=True
+        state.slot_mapping_scale[:total_new_kv_tokens].copy_(
+            state.host_slot_mapping_scale[:total_new_kv_tokens], non_blocking=True
         )
 
     @staticmethod
     def recompute_context_kv_gather_mappings(
         metadata: DSAtrtllmAttentionMetadata,
         indexer_params: Optional[IndexerParams] = None,
+        state: Optional[IndexerRatioStateBase] = None,
     ) -> None:
         """Recompute context KV-cache gather mappings for the active cache manager."""
+        if state is None:
+            state = metadata.indexer_state()
         if not metadata.enable_context_mla_with_cached_kv:
-            metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
-            metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
+            state.slot_mapping_fp8_fullkv = state.slot_mapping_fp8
+            state.slot_mapping_scale_fullkv = state.slot_mapping_scale
             return
 
         if indexer_params is None:
-            indexer_params = Indexer.build_indexer_params(metadata)
+            indexer_params = Indexer.build_indexer_params(metadata, state)
             if indexer_params is None:
                 return
 
@@ -1046,8 +1212,8 @@ class Indexer(nn.Module):
         if metadata.skip_indexer_for_ctx_reqs:
             # The dense short-context path does not gather from the indexer K
             # cache, so full-KV mappings would be allocated but never consumed.
-            metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
-            metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
+            state.slot_mapping_fp8_fullkv = state.slot_mapping_fp8
+            state.slot_mapping_scale_fullkv = state.slot_mapping_scale
             return
 
         cached_kv_tokens = indexer_params.cached_kv_tokens[:num_contexts]
@@ -1055,8 +1221,8 @@ class Indexer(nn.Module):
             # Without compression or cached tokens, the regular mappings cover
             # every context KV token in the same order and remain equivalent
             # when on_update_kv_lens() refreshes them in place.
-            metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
-            metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
+            state.slot_mapping_fp8_fullkv = state.slot_mapping_fp8
+            state.slot_mapping_scale_fullkv = state.slot_mapping_scale
             return
 
         total_kv_per_request = indexer_params.kv_lens[:num_contexts]
@@ -1064,8 +1230,8 @@ class Indexer(nn.Module):
         if total_kv_len == 0:
             # No chunk can gather indexer KV, so avoid zero-length allocation
             # and H2D work for short compressed contexts.
-            metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
-            metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
+            state.slot_mapping_fp8_fullkv = state.slot_mapping_fp8
+            state.slot_mapping_scale_fullkv = state.slot_mapping_scale
             return
 
         host_slot_mapping_fp8_fullkv = torch.empty(
@@ -1087,7 +1253,7 @@ class Indexer(nn.Module):
 
         fp8_flat_indices, scale_flat_indices = _compute_slot_mappings(
             kv_positions,
-            metadata.host_indexer_k_cache_block_offsets,
+            metadata.host_indexer_block_table(state.compress_ratio),
             req_indices,
             indexer_params.head_dim,
             indexer_params.tokens_per_block,
@@ -1097,12 +1263,14 @@ class Indexer(nn.Module):
 
         host_slot_mapping_fp8_fullkv.copy_(fp8_flat_indices)
         host_slot_mapping_scale_fullkv.copy_(scale_flat_indices)
-        metadata.slot_mapping_fp8_fullkv = host_slot_mapping_fp8_fullkv.cuda(non_blocking=True)
-        metadata.slot_mapping_scale_fullkv = host_slot_mapping_scale_fullkv.cuda(non_blocking=True)
+        state.slot_mapping_fp8_fullkv = host_slot_mapping_fp8_fullkv.cuda(non_blocking=True)
+        state.slot_mapping_scale_fullkv = host_slot_mapping_scale_fullkv.cuda(non_blocking=True)
 
     @staticmethod
     def prepare_for_update_k_cache(
-        metadata: DSAtrtllmAttentionMetadata, indexer_params: IndexerParams
+        metadata: DSAtrtllmAttentionMetadata,
+        indexer_params: IndexerParams,
+        state: IndexerRatioStateBase,
     ):
         """
         Prepare indexer for the update_k_cache stage.
@@ -1110,11 +1278,13 @@ class Indexer(nn.Module):
         Compute slot_mapping for all requests (both context and generation)
         This maps each token to its flat cache position for vectorized KV cache updates
         """
-        Indexer.recompute_slot_mappings(metadata, indexer_params)
+        Indexer.recompute_slot_mappings(metadata, indexer_params, state)
 
     @staticmethod
     def prepare_for_chunked_prefill(
-        metadata: DSAtrtllmAttentionMetadata, indexer_params: IndexerParams
+        metadata: DSAtrtllmAttentionMetadata,
+        indexer_params: IndexerParams,
+        state: IndexerRatioStateBase,
     ):
         """
         Prepare indexer for the chunked prefill.
@@ -1132,10 +1302,11 @@ class Indexer(nn.Module):
                 (i, 0, seq_lens[i].item(), seq_lens[:i].sum().item() if i > 0 else 0)
                 for i in range(num_contexts)
             ]
-            metadata.indexer_prefill_chunks = [
+            state.indexer_prefill_chunks = [
                 Indexer.prepare_one_prefill_chunk(
                     metadata,
                     chunk_specs,
+                    state,
                 )
             ]
         else:
@@ -1157,47 +1328,51 @@ class Indexer(nn.Module):
             )
 
             if len(chunk_groups) > 1 or metadata.enable_context_mla_with_cached_kv:
-                metadata.indexer_prefill_chunks = [
+                state.indexer_prefill_chunks = [
                     Indexer.prepare_one_prefill_chunk(
                         metadata,
                         chunk_specs,
+                        state,
                     )
                     for chunk_specs in chunk_groups
                 ]
             else:
-                metadata.indexer_prefill_chunks = None
+                state.indexer_prefill_chunks = None
 
         # Chunked prefill and KV-cache reuse require gather mappings that cover
         # all cached and newly appended indexer tokens.
-        Indexer.recompute_context_kv_gather_mappings(metadata, indexer_params)
+        Indexer.recompute_context_kv_gather_mappings(metadata, indexer_params, state)
 
     @staticmethod
-    def prepare_scheduler_metadata(metadata: DSAtrtllmAttentionMetadata):
+    def prepare_scheduler_metadata(
+        metadata: DSAtrtllmAttentionMetadata, state: IndexerRatioStateBase
+    ):
         """
         Prepare scheduler metadata for the DeepGEMM decode MQA kernel.
         """
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         gen_seq_lens = metadata.get_indexer_kv_lens(
-            metadata.kv_lens_cuda_runtime[num_contexts : num_contexts + num_generations]
+            metadata.kv_lens_cuda_runtime[num_contexts : num_contexts + num_generations],
+            state.compress_ratio,
         )
-        metadata.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
+        state.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
         if not metadata.use_expanded_buffers_for_mtp:
-            next_n_cap = metadata.kv_lens_cuda_2d.shape[1]
-            metadata.kv_lens_cuda_2d[:num_generations, :next_n_cap].copy_(
+            next_n_cap = state.kv_lens_cuda_2d.shape[1]
+            state.kv_lens_cuda_2d[:num_generations, :next_n_cap].copy_(
                 gen_seq_lens.unsqueeze(-1).expand(-1, next_n_cap)
             )
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
                 gen_seq_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, metadata.num_sms
             )
-            metadata.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
+            state.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
             if metadata.max_draft_tokens > 0:
                 scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
-                    metadata.kv_lens_cuda_2d[:num_generations, :next_n_cap],
+                    state.kv_lens_cuda_2d[:num_generations, :next_n_cap],
                     _DG_SCHEDULE_BLOCK_KV,
                     metadata.num_sms,
                 )
-                metadata.scheduler_metadata_buffer_full_next_n.copy_(
+                state.scheduler_metadata_buffer_full_next_n.copy_(
                     scheduler_metadata_buffer_full_next_n, non_blocking=True
                 )
         else:
@@ -1228,53 +1403,57 @@ class Indexer(nn.Module):
         # This can happen when the metadata is being used with a draft KV cache manager
         # during MTP speculative decoding, which uses a regular KVCacheManager instead
         # of DSACacheManager.
-        indexer_params = Indexer.build_indexer_params(metadata)
-        if indexer_params is None:
-            return
-
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
         seq_lens = metadata.seq_lens
-        compress_ratio = _effective_compress_ratio_divisor(
-            _select_indexer_compress_ratio(metadata.compress_ratios)
-        )
-        # Store compressed KV token count for context requests
-        metadata.num_ctx_kv_tokens = indexer_params.new_kv_tokens[:num_contexts].sum().item()
 
-        # Prepare for update_k_cache
-        Indexer.prepare_for_update_k_cache(metadata, indexer_params)
+        # One pass per INDEXER_COMPRESS ratio. Every quantity built below is in
+        # that ratio's compressed KV space, so a model whose indexers span two
+        # ratios (DeepSeek-V4.1) gets two independent sets and neither group of
+        # layers reads the other's token counts. Single-ratio models run this
+        # loop once against a state that *is* the metadata, so nothing changes.
+        for state in metadata._indexer_ratio_states.values():
+            indexer_params = Indexer.build_indexer_params(metadata, state)
+            if indexer_params is None:
+                return
+            compress_ratio = state.compress_ratio_divisor
+            # Store compressed KV token count for context requests
+            state.num_ctx_kv_tokens = indexer_params.new_kv_tokens[:num_contexts].sum().item()
 
-        # Prepare for prefill phase if there are context requests
-        if num_contexts > 0:
-            # Compute attention window bounds for each query token in batched sequences
-            # cu_seqlen_ks[i]: start index in global KV for query token i
-            # cu_seqlen_ke[i]: end index (exclusive) in global KV for query token i
-            host_seq_lens = seq_lens[:num_contexts]
-            host_num_past_tokens = indexer_params._num_past_tokens_tensor[:num_contexts]
-            host_kv_lens = indexer_params.kv_lens[:num_contexts]
-            host_cu_seqlen_ks, host_cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
-                host_seq_lens,
-                num_contexts,
-                num_ctx_tokens,
-                host_num_past_tokens,
-                host_kv_lens,
-                compress_ratio,
-            )
+            # Prepare for update_k_cache
+            Indexer.prepare_for_update_k_cache(metadata, indexer_params, state)
 
-            metadata.cu_seqlen_ks[:num_ctx_tokens].copy_(
-                maybe_pin_memory(host_cu_seqlen_ks), non_blocking=True
-            )
-            metadata.cu_seqlen_ke[:num_ctx_tokens].copy_(
-                maybe_pin_memory(host_cu_seqlen_ke), non_blocking=True
-            )
-            Indexer.prepare_for_chunked_prefill(metadata, indexer_params)
+            # Prepare for prefill phase if there are context requests
+            if num_contexts > 0:
+                # Compute attention window bounds for each query token in batched sequences
+                # cu_seqlen_ks[i]: start index in global KV for query token i
+                # cu_seqlen_ke[i]: end index (exclusive) in global KV for query token i
+                host_seq_lens = seq_lens[:num_contexts]
+                host_num_past_tokens = indexer_params._num_past_tokens_tensor[:num_contexts]
+                host_kv_lens = indexer_params.kv_lens[:num_contexts]
+                host_cu_seqlen_ks, host_cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
+                    host_seq_lens,
+                    num_contexts,
+                    num_ctx_tokens,
+                    host_num_past_tokens,
+                    host_kv_lens,
+                    compress_ratio,
+                )
 
-        # Prepare for decode phase if there are generation requests
-        if num_generations > 0:
-            # Prepare schedule metadata for fp8_paged_mqa_logits
-            # This is a preprocessing step that computes scheduling information for the kernel
-            Indexer.prepare_scheduler_metadata(metadata)
+                state.cu_seqlen_ks[:num_ctx_tokens].copy_(
+                    maybe_pin_memory(host_cu_seqlen_ks), non_blocking=True
+                )
+                state.cu_seqlen_ke[:num_ctx_tokens].copy_(
+                    maybe_pin_memory(host_cu_seqlen_ke), non_blocking=True
+                )
+                Indexer.prepare_for_chunked_prefill(metadata, indexer_params, state)
+
+            # Prepare for decode phase if there are generation requests
+            if num_generations > 0:
+                # Prepare schedule metadata for fp8_paged_mqa_logits
+                # This is a preprocessing step that computes scheduling information for the kernel
+                Indexer.prepare_scheduler_metadata(metadata, state)
 
     def _update_k_cache(
         self, k_fp8: torch.Tensor, k_scale: torch.Tensor, metadata: DSAtrtllmAttentionMetadata
@@ -1287,7 +1466,8 @@ class Indexer(nn.Module):
             k_fp8: FP8 quantized k tensor, shape [total_tokens, head_dim]
             k_scale: Scaling factors, shape [total_tokens, head_dim // quant_block_size]
         """
-        if metadata.kv_cache_manager is None or metadata.slot_mapping_fp8 is None:
+        state = metadata.indexer_state(self.compress_ratio)
+        if metadata.kv_cache_manager is None or state.slot_mapping_fp8 is None:
             return
 
         k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
@@ -1304,8 +1484,8 @@ class Indexer(nn.Module):
             k_fp8,
             k_scale,
             k_cache,
-            metadata.slot_mapping_fp8,
-            metadata.slot_mapping_scale,
+            state.slot_mapping_fp8,
+            state.slot_mapping_scale,
             num_tokens,
         )
 
@@ -1328,7 +1508,8 @@ class Indexer(nn.Module):
             k_fp8: FP8 quantized k tensor, shape [num_k_tokens, head_dim]
             k_scale: Scaling factors, shape [num_k_tokens, 1]
         """
-        assert metadata.slot_mapping_fp8_fullkv is not None, (
+        state = metadata.indexer_state(self.compress_ratio)
+        assert state.slot_mapping_fp8_fullkv is not None, (
             "_gather_k_cache_for_chunk requires extended slot mappings (only available with cached tokens)"
         )
 
@@ -1343,8 +1524,8 @@ class Indexer(nn.Module):
         k_token_end = chunk.k_token_end
         num_k_tokens = k_token_end - k_token_start
 
-        slot_mapping_fp8_chunk = metadata.slot_mapping_fp8_fullkv[k_token_start:k_token_end]
-        slot_mapping_scale_chunk = metadata.slot_mapping_scale_fullkv[k_token_start:k_token_end]
+        slot_mapping_fp8_chunk = state.slot_mapping_fp8_fullkv[k_token_start:k_token_end]
+        slot_mapping_scale_chunk = state.slot_mapping_scale_fullkv[k_token_start:k_token_end]
 
         # Vectorized gather using pre-computed slot mappings
         # Gather FP8 data
@@ -1370,6 +1551,16 @@ class Indexer(nn.Module):
         k_scale = k_scale_bytes.view(torch.float32).view(num_k_tokens, 1)
 
         return k_fp8, k_scale
+
+    def _decode_indexer_block_table(self, metadata) -> torch.Tensor:
+        """The paged index-key table this indexer's decode top-k reads.
+
+        A hook rather than a direct field read because DeepSeek-V4.1 has one
+        INDEXER_COMPRESS pool per compression ratio, so "the indexer K cache" is
+        no longer a single table; see ``DeepseekV4Indexer``. Native DSA and V4
+        have exactly one, which is this field.
+        """
+        return metadata.indexer_k_cache_block_offsets
 
     def _call_mqa_logits(
         self,
@@ -1450,6 +1641,104 @@ class Indexer(nn.Module):
             max_seq_len,
         )
 
+    def _publish_candidate_blocks(
+        self,
+        metadata: DSAtrtllmAttentionMetadata,
+        logits: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        global_row_start: int,
+    ) -> None:
+        """Level one for one tile, written into this layer's published carrier.
+
+        Allocated on first use rather than in ``prepare()``: the row count is
+        ``metadata.num_tokens``, the carrier is per-forward scratch, and a lazily
+        allocated tensor cannot outlive the dict entry that ``prepare()`` clears.
+        """
+        from ..deepseek_v4.candidate_prefilter import CandidatePublication, select_candidate_blocks
+
+        keep = self.candidate_topk_blocks
+        published = metadata.v41_candidate_blocks.get(self.layer_idx)
+        if published is None:
+            # -1 is `apply_candidate_blocks`'s own padding value, so an unwritten
+            # row is *self-consistent* rather than garbage -- it just keeps nothing.
+            # That is still a wrong answer, which is what `_check_candidate_rows`
+            # exists to catch.
+            published = CandidatePublication(
+                blocks=torch.full(
+                    (metadata.num_tokens, keep), -1, dtype=torch.int32, device=logits.device
+                ),
+                compress_ratio=self._candidate_ratio,
+            )
+            metadata.v41_candidate_blocks[self.layer_idx] = published
+        blocks = published.blocks
+        ids = select_candidate_blocks(logits, row_starts, row_ends, keep, self.candidate_block_size)
+        n_rows, n_ids = ids.shape
+        # `select_candidate_blocks` returns `min(topk_blocks, num_blocks)` columns,
+        # so a short tile comes back narrower than the carrier. Left-align and let
+        # the tail keep its -1 padding, which is the same convention the function's
+        # own within-row padding uses.
+        blocks[global_row_start : global_row_start + n_rows, :n_ids] = ids
+        if n_ids < keep:
+            blocks[global_row_start : global_row_start + n_rows, n_ids:] = -1
+        published.rows += n_rows
+
+    def _apply_candidate_blocks(
+        self,
+        metadata: DSAtrtllmAttentionMetadata,
+        logits: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        global_row_start: int,
+    ) -> torch.Tensor:
+        """Level two for one tile, in place on ``logits``."""
+        from ..deepseek_v4.candidate_prefilter import apply_candidate_blocks
+
+        source = int(self.candidate_source_layer_id)
+        published = metadata.v41_candidate_blocks.get(source)
+        assert published is not None, (
+            f"layer {self.layer_idx} consumes layer {source}'s candidate blocks, but "
+            "that layer has not published any in this forward pass"
+        )
+        assert published.compress_ratio == self._candidate_ratio, (
+            f"layer {self.layer_idx} (compress_ratio {self._candidate_ratio}) cannot use "
+            f"layer {source}'s candidate blocks (compress_ratio {published.compress_ratio}): "
+            "level one's block ids are row-local to the producer's cu_seqlen_ks, so the two "
+            "column spaces differ"
+        )
+        blocks = published.blocks
+        n_rows = logits.shape[0]
+        metadata.v41_candidate_rows_consumed[self.layer_idx] = (
+            metadata.v41_candidate_rows_consumed.get(self.layer_idx, 0) + n_rows
+        )
+        return apply_candidate_blocks(
+            logits,
+            blocks[global_row_start : global_row_start + n_rows, :],
+            row_starts,
+            row_ends,
+            self.candidate_block_size,
+            out=logits,
+        )
+
+    def _check_candidate_rows(self, metadata: DSAtrtllmAttentionMetadata) -> None:
+        """Every row this layer masked must be a row the producer wrote."""
+        if not self.consumes_candidates:
+            return
+        source = int(self.candidate_source_layer_id)
+        publication = metadata.v41_candidate_blocks.get(source)
+        published = publication.rows if publication is not None else 0
+        consumed = metadata.v41_candidate_rows_consumed.get(self.layer_idx, 0)
+        # `consumed > 0` is not redundant: two counters that are always zero
+        # satisfy an equality assertion forever, and a wired consumer that masked
+        # nothing means the producer never ran.
+        assert consumed > 0 and consumed == published, (
+            f"layer {self.layer_idx} masked {consumed} rows with layer {source}'s "
+            f"candidate blocks but that layer published {published}. The two "
+            "disagree about chunking, q-split, or the phase split, which means some "
+            "masked rows were never written -- and an unwritten row is all -1, i.e. "
+            "keep nothing, i.e. a silently arbitrary top-k."
+        )
+
     def sparse_attn_indexer(
         self,
         metadata: DSAtrtllmAttentionMetadata,
@@ -1478,6 +1767,12 @@ class Indexer(nn.Module):
             "Unexpected quant_block_size "
             f"{metadata.kv_cache_manager.quant_block_size if metadata.kv_cache_manager else 'N/A'}"
         )
+        # Everything below that counts compressed KV rows -- the gather mappings,
+        # the causal window, the prefill chunk list, the decode schedule -- comes
+        # from this layer's own compress ratio. A model with two indexer ratios
+        # (V4.1) has two sets; a single-ratio model resolves to the metadata's own
+        # attributes.
+        state = metadata.indexer_state(self.compress_ratio)
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
@@ -1517,7 +1812,7 @@ class Indexer(nn.Module):
 
         if has_prefill and not metadata.skip_indexer_for_ctx_reqs:
             # Use chunked prefill to reduce memory footprint
-            if metadata.indexer_prefill_chunks is not None:
+            if state.indexer_prefill_chunks is not None:
                 sparse_metadata_params = metadata.sparse_metadata_params
                 q_split_threshold = (
                     sparse_metadata_params.q_split_threshold
@@ -1542,7 +1837,7 @@ class Indexer(nn.Module):
                 # into one int32 to match FP8's float32 scale width.
                 gather_head_dim = self.head_dim // 2 if self.use_fp4 else self.head_dim
 
-                for chunk in metadata.indexer_prefill_chunks:
+                for chunk in state.indexer_prefill_chunks:
                     # Skip chunks with no compressed KV tokens (e.g., warmup
                     # sequences shorter than compress_ratio produce zero KV).
                     if chunk.k_token_start >= chunk.k_token_end:
@@ -1551,8 +1846,8 @@ class Indexer(nn.Module):
                     num_k_tokens = chunk.k_token_end - chunk.k_token_start
                     chunk_k_fp8, chunk_k_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
                         k_cache_4d,
-                        metadata.slot_mapping_fp8_fullkv,
-                        metadata.slot_mapping_scale_fullkv,
+                        state.slot_mapping_fp8_fullkv,
+                        state.slot_mapping_scale_fullkv,
                         chunk.k_token_start,
                         num_k_tokens,
                         gather_head_dim,
@@ -1600,6 +1895,28 @@ class Indexer(nn.Module):
                             tile_q_scale,
                             clean_logits=False,
                         )
+                        # `g0` is already the global query row, so the carrier is
+                        # addressed with no new arithmetic. The publish sits before
+                        # the `apply_q_split` allgather below and is deliberately
+                        # not itself allgathered: the consumer q-splits with the
+                        # same arithmetic, so it needs exactly the rows this rank
+                        # computed.
+                        if self.is_candidate_source:
+                            self._publish_candidate_blocks(
+                                metadata,
+                                logits,
+                                chunk.cu_seqlen_ks[c0:c1],
+                                chunk.cu_seqlen_ke[c0:c1],
+                                g0,
+                            )
+                        elif self.consumes_candidates:
+                            logits = self._apply_candidate_blocks(
+                                metadata,
+                                logits,
+                                chunk.cu_seqlen_ks[c0:c1],
+                                chunk.cu_seqlen_ke[c0:c1],
+                                g0,
+                            )
                         self.top_k(
                             logits,
                             topk_indices_buffer[g0:g1, :],
@@ -1619,14 +1936,18 @@ class Indexer(nn.Module):
                             dim=0,
                             sizes=q_sizes,
                         )
-            elif metadata.num_ctx_kv_tokens == 0:
-                # No compressed KV tokens — fill with -1 (no valid indices)
+            elif state.num_ctx_kv_tokens == 0:
+                # No compressed KV tokens for *this ratio* — fill with -1 (no
+                # valid indices). Reading the primary ratio's count here would
+                # let a pooled layer whose contexts rounded down to zero rows
+                # fall through to the kernel below and hand it a zero-row K
+                # tensor, which the FP4 MQA-logits TMA descriptor rejects.
                 topk_indices_buffer[:num_ctx_tokens, :].fill_(-1)
             else:
                 # Fallback: single-pass indexer prefill (TODO: remove this once chunked prefill is fully tested)
-                num_ctx_kv_tokens = metadata.num_ctx_kv_tokens
-                cu_seqlen_ks = metadata.cu_seqlen_ks[:num_ctx_tokens]
-                cu_seqlen_ke = metadata.cu_seqlen_ke[:num_ctx_tokens]
+                num_ctx_kv_tokens = state.num_ctx_kv_tokens
+                cu_seqlen_ks = state.cu_seqlen_ks[:num_ctx_tokens]
+                cu_seqlen_ke = state.cu_seqlen_ke[:num_ctx_tokens]
 
                 ctx_q_scale = q_scale[:num_ctx_tokens, ...] if self.use_fp4 else None
                 logits = self._call_mqa_logits(
@@ -1639,6 +1960,12 @@ class Indexer(nn.Module):
                     ctx_q_scale,
                     clean_logits=False,
                 )
+                if self.is_candidate_source:
+                    self._publish_candidate_blocks(metadata, logits, cu_seqlen_ks, cu_seqlen_ke, 0)
+                elif self.consumes_candidates:
+                    logits = self._apply_candidate_blocks(
+                        metadata, logits, cu_seqlen_ks, cu_seqlen_ke, 0
+                    )
                 self.top_k(
                     logits,
                     topk_indices_buffer[:num_ctx_tokens, :],
@@ -1702,8 +2029,8 @@ class Indexer(nn.Module):
                 # 2D context_lens slice from the pre-allocated buffer; matches
                 # q_decode's (batch, next_n) layout required by the new
                 # DeepGEMM paged MQA logits API.
-                context_lens = metadata.kv_lens_cuda_2d[:num_generations, :next_n].contiguous()
-                block_table = metadata.indexer_k_cache_block_offsets[
+                context_lens = state.kv_lens_cuda_2d[:num_generations, :next_n].contiguous()
+                block_table = self._decode_indexer_block_table(metadata)[
                     num_contexts : num_contexts + num_generations
                 ]
                 # The 2D-context_lens metadata kernel encodes next_n into the
@@ -1714,9 +2041,9 @@ class Indexer(nn.Module):
                 # uses its own schedule buffer (built with num_next_n_atoms=1
                 # via a (num_gen, 1) input shape) and overrides this below.
                 if next_n == 1:
-                    scheduler_metadata_buffer = metadata.scheduler_metadata_buffer
+                    scheduler_metadata_buffer = state.scheduler_metadata_buffer
                 else:
-                    scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_full_next_n
+                    scheduler_metadata_buffer = state.scheduler_metadata_buffer_full_next_n
             else:
                 q_decode = q_decode.view(-1, 1, *q_fp8.shape[1:])
                 num_tokens = q_decode.shape[0]
@@ -1732,7 +2059,11 @@ class Indexer(nn.Module):
             # with prepared decode metadata.
             # [num_blocks, tokens_per_block, 1, head_dim + scale_size]
             k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
-            indexer_max_seq_len = metadata.get_indexer_max_seq_len()
+            # The kernel's page-walk bound is in *this ratio's* compressed row
+            # space, so it must be divided by this layer's ratio, not the
+            # model-wide primary one: a pooled layer given the unpooled bound
+            # would walk past the end of its own page table.
+            indexer_max_seq_len = metadata.get_indexer_max_seq_len(self.compress_ratio)
 
             if self.use_cute_dsl_paged_mqa_logits:
                 # DSL kernel design: 1 atom per q (atom = real next_n positions),
@@ -1745,7 +2076,7 @@ class Indexer(nn.Module):
                 # the same KV length on this path (kv_lens_cuda_2d broadcasts),
                 # so passing the 1D contiguous kv_lens slice for context_lens
                 # avoids materializing a 2D contiguous tensor per call.
-                dsl_context_lens = metadata.gen_indexer_kv_lens_cuda_runtime
+                dsl_context_lens = state.gen_indexer_kv_lens_cuda_runtime
                 assert dsl_context_lens is not None
                 # Wave-aware atom-split: the picker in `_pick_dsl_expand` caches
                 # (factor, atom) on metadata with invariant
@@ -1792,7 +2123,7 @@ class Indexer(nn.Module):
                     )
                     dsl_q = q_decode.view(torch.uint8)
                     dsl_block_table = block_table
-                    dsl_schedule_meta = metadata.scheduler_metadata_buffer
+                    dsl_schedule_meta = state.scheduler_metadata_buffer
                     if dsl_atom_split:
                         factor = metadata.dsl_expand_factor
                         eff_next_n = metadata.dsl_atom
@@ -1823,7 +2154,7 @@ class Indexer(nn.Module):
                     dsl_q = q_decode
                     fp8_ctx_lens = dsl_context_lens
                     fp8_block_table = block_table
-                    fp8_schedule_meta = metadata.scheduler_metadata_buffer
+                    fp8_schedule_meta = state.scheduler_metadata_buffer
                     if dsl_atom_split:
                         factor = metadata.dsl_expand_factor
                         atom = metadata.dsl_atom
@@ -1870,7 +2201,7 @@ class Indexer(nn.Module):
             gen_kv_lens_cuda = metadata.kv_lens_cuda_runtime[
                 num_contexts : num_contexts + num_generations
             ]
-            scan_lengths = metadata.gen_indexer_kv_lens_cuda_runtime
+            scan_lengths = state.gen_indexer_kv_lens_cuda_runtime
             assert scan_lengths is not None
 
             gvr_ext_kwargs = (
@@ -1883,6 +2214,38 @@ class Indexer(nn.Module):
             )
             assert metadata.radix_aux_indices is not None
             assert metadata.radix_aux_logits is not None
+            if self.is_candidate_source or self.consumes_candidates:
+                # Neither bound exists at this site, unlike the two prefill ones.
+                # `row_starts` is zeros: the reference's decode branch is
+                # `compress_lens = end_pos // ratio` with an implicit ks=0, and
+                # `logits_decode` is a dense [rows, indexer_max_seq_len] tile
+                # anchored at the sequence's first compressed row.
+                #
+                # `row_ends` is `scan_lengths`, NOT `gen_kv_lens_cuda`. The former
+                # is the score-column count and `logits_decode`'s width is
+                # `indexer_max_seq_len`, which is compressed-row space; the latter
+                # is the logical token count and over-counts by the ratio. They are
+                # equal at ratio 1, which is the band the release's candidate
+                # source sits in -- so choosing wrongly here would pass every V4.1
+                # test and break only on a checkpoint whose candidate source
+                # pooled.
+                #
+                # `scan_lengths` is [num_generations]; the rows are
+                # num_generations * next_n. All next_n positions of a request share
+                # this KV length on this path (see the kv_lens_cuda_2d note above),
+                # so repeat_interleave is the expansion, not a per-position ladder.
+                cand_row_ends = (
+                    scan_lengths if next_n == 1 else scan_lengths.repeat_interleave(next_n)
+                )
+                cand_row_starts = torch.zeros_like(cand_row_ends)
+                if self.is_candidate_source:
+                    self._publish_candidate_blocks(
+                        metadata, logits_decode, cand_row_starts, cand_row_ends, token_offset
+                    )
+                else:
+                    logits_decode = self._apply_candidate_blocks(
+                        metadata, logits_decode, cand_row_starts, cand_row_ends, token_offset
+                    )
             self.top_k(
                 logits_decode,
                 topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
@@ -1942,6 +2305,7 @@ class Indexer(nn.Module):
                     shared_topk_indices[
                         row_start : row_start + rows.shape[0], : rows.shape[1]
                     ].copy_(rows)
+        self._check_candidate_rows(metadata)
         return topk_indices_buffer
 
     def _mtp_last_accepted_rows(

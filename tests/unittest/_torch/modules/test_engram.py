@@ -586,3 +586,158 @@ class TestEngramWithHashProvider:
         )
 
         assert module.hash_mapping is None
+
+
+def _ptrs(hash_cache):
+    return {layer_id: t.data_ptr() for layer_id, t in hash_cache.items()}
+
+
+def _checksums(hash_cache):
+    # Position-weighted, so a permutation of the same hash values does not read as
+    # "unchanged" -- reordering is one of the ways a refreshed buffer can differ from a
+    # stale one.
+    out = {}
+    for layer_id, t in hash_cache.items():
+        flat = t.reshape(-1).to(torch.int64)
+        w = torch.arange(1, flat.numel() + 1, device=flat.device, dtype=torch.int64)
+        out[layer_id] = int((flat * w).sum().item())
+    return out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestEngramHashProviderCudaGraphRefresh:
+    """The captured graph reads these buffers; only the eager path writes them."""
+
+    SEQ_LEN = 32
+
+    @pytest.fixture
+    def provider(self):
+        return EngramHashProvider(_make_engram_config())
+
+    def _tokens(self, seed, seq_len=None):
+        """Device token ids.
+
+        Note for anything that calls this inside a capture region: it must not be. The
+        ``.cuda()`` is an unpinned host-to-device copy, which CUDA graph capture rejects
+        outright ("Cannot copy between CPU and CUDA tensors during CUDA graph capture
+        unless the CPU tensor is pinned"). Allocate before entering the region -- that is
+        also what the real call path does, since the runner's static input buffers are
+        filled outside the graph.
+        """
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        return torch.randint(0, 50257, (seq_len or self.SEQ_LEN,), generator=g).cuda()
+
+    @staticmethod
+    def _capture(fn):
+        """Run ``fn`` inside a real capture region and return its result.
+
+        Two details are load-bearing and were both wrong in the first draft of this file:
+
+        * ``fn`` must not allocate host tensors or copy from the host -- see ``_tokens``.
+        * the region must actually be *capturing* from the callee's point of view. The
+          assertion below makes a non-capturing region fail with that sentence rather than
+          with a confusing pointer mismatch two lines later.
+
+        A dummy device op keeps the graph non-empty. Without it PyTorch warns "The CUDA
+        Graph is empty", which is true here (``compute_hashes`` short-circuits and records
+        nothing) but is noise that hides a real mis-capture behind an expected warning.
+        """
+        sink = torch.zeros(1, device="cuda")
+        warm = torch.cuda.Stream()
+        warm.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warm):
+            sink.add_(1)
+        torch.cuda.current_stream().wait_stream(warm)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            assert torch.cuda.is_current_stream_capturing(), (
+                "the region is not capturing, so nothing below is a statement about "
+                "capture behaviour"
+            )
+            sink.add_(1)
+            return fn()
+
+    def test_capture_returns_the_cached_tensors(self, provider):
+        """Under capture, ``compute_hashes`` hands back the *same storage*, not new values.
+
+        This is the documented behaviour and the reason the fix is needed, so it is pinned
+        rather than assumed: the graph records these addresses, and after capture nothing on
+        the replay path writes to them.
+        """
+        first = provider.compute_hashes(self._tokens(0))
+        before = _ptrs(first)
+
+        other = self._tokens(1)
+        during = self._capture(lambda: provider.compute_hashes(other))
+        assert _ptrs(during) == before, (
+            "compute_hashes allocated new tensors while capturing; the graph would then "
+            "read storage nothing keeps current"
+        )
+
+    def test_refresh_writes_new_values_into_the_captured_addresses(self, provider):
+        """The fix: same pointers, different values.
+
+        FAILS on the unpatched tree -- ``refresh_captured_hashes`` does not exist there.
+        """
+        first = provider.compute_hashes(self._tokens(0))
+        before_ptrs, before_ck = _ptrs(first), _checksums(first)
+
+        refreshed = provider.refresh_captured_hashes(self._tokens(1))
+
+        assert _ptrs(refreshed) == before_ptrs, (
+            "the refresh allocated new tensors, so the captured graph is still reading the "
+            "warmup pass's hashes"
+        )
+        after_ck = _checksums(refreshed)
+        assert after_ck != before_ck, (
+            "the refresh left the buffers byte-identical on different tokens, which means it "
+            "did not recompute anything"
+        )
+
+    def test_refresh_rejects_a_shape_no_graph_captured(self, provider):
+        """A different shape means the write missed the addresses the graph reads.
+
+        The store would happily create a new entry and the caller would see a plausible
+        return value while the graph kept replaying stale hashes -- a silent wrong answer,
+        which is the exact failure mode the guard exists to convert into a crash.
+
+        FAILS on the unpatched tree -- no such method, hence no guard.
+        """
+        provider.compute_hashes(self._tokens(0))
+        with pytest.raises(RuntimeError, match="no captured graph is reading"):
+            provider.refresh_captured_hashes(self._tokens(1, seq_len=self.SEQ_LEN + 1))
+
+    def test_refresh_refuses_to_run_while_capturing(self, provider):
+        """It is the replay-path counterpart of the capture short-circuit, not a bypass.
+
+        FAILS on the unpatched tree -- no such method.
+        """
+        provider.compute_hashes(self._tokens(0))
+        # Outside the region: an in-region `.cuda()` raises a *different* RuntimeError
+        # ("unless the CPU tensor is pinned"), which `match=` would then reject -- the test
+        # would fail for a reason that has nothing to do with the guard it is pinning.
+        other = self._tokens(1)
+        with pytest.raises(RuntimeError, match="must not be called while the stream is"):
+            self._capture(lambda: provider.refresh_captured_hashes(other))
+
+    def test_compute_hashes_issues_no_host_sync(self, provider):
+        """A refresh on the replay stream must not stall on the host.
+
+        The moduli used to be read out of device tensors with ``.item()`` once per
+        (layer, n-gram, head): 48 host syncs per forward on V4.1-Flash, inside the hot loop.
+        They are static, so they belong in ``__init__``.
+
+        FAILS on the unpatched tree -- that is what this test is for.
+        """
+        # Warm the lazy device move and the first store entry outside the assertion, so the
+        # test reports on the hash loop rather than on one-time setup.
+        provider.compute_hashes(self._tokens(0))
+        tokens = self._tokens(1)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            provider.compute_hashes(tokens)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")

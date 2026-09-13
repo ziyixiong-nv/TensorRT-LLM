@@ -125,6 +125,17 @@ l0_b200:
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
+  # ------------- DeepSeek-V4.1 unit tests ---------------
+  # The suites that read the release checkpoint are `skipif`-guarded on its path existing, so
+  # they skip rather than fail where it is absent; the rest of each file still runs. The
+  # tokenizer suite is CPU-only and lives on l0_cpu instead. The attention-side V4.1 tests
+  # (candidate prefilter, indexer/Hadamard coupling, fused q-norm kernel) need no entry --
+  # the `unittest/_torch/attention` directory entry above already collects them.
+  - unittest/_torch/modeling/test_deepseek_v41_config.py
+  - unittest/_torch/modeling/test_modeling_deepseekv41.py
+  - unittest/_torch/modeling/test_modeling_deepseekv41_forward.py
+  - unittest/_torch/modeling/test_deepseek_v41_requant.py
+  - unittest/_torch/modules/test_mhc_lagged.py
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py

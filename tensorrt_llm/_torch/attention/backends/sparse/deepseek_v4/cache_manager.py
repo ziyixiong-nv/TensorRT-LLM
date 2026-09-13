@@ -51,16 +51,28 @@ from .params import (
     DEEPSEEK_V4_NON_SLIDING_ATTENTION,
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DEEPSEEK_V4_SPARSE_RATIO,
+    DEEPSEEK_V4_VARIANT,
+    DEEPSEEK_V41_VARIANT,
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
+    has_compressor_state,
+    is_compress_layer,
     is_overlap_compressor,
+    is_sparse_layer,
+    owns_compressed_kv,
+    pool_factor,
+    source_layer_for,
 )
 
 
 def get_attn_dim(
-    head_dim: int, index_head_dim: int, compress_ratio: int, attn_type: DeepseekV4AttentionType
+    head_dim: int,
+    index_head_dim: int,
+    compress_ratio: int,
+    attn_type: DeepseekV4AttentionType,
+    variant: str = DEEPSEEK_V4_VARIANT,
 ) -> int:
-    state_factor = 2 if is_overlap_compressor(compress_ratio) else 1
+    state_factor = 2 if is_overlap_compressor(compress_ratio, variant) else 1
     if attn_type == DeepseekV4AttentionType.SWA:
         return head_dim
     if attn_type == DeepseekV4AttentionType.COMPRESS:
@@ -86,8 +98,9 @@ def get_token_bytes(
     has_fp8_kv_cache: bool,
     indexer_k_dtype: str = "fp8",
     use_fp8_ds_mla: bool = False,
+    variant: str = DEEPSEEK_V4_VARIANT,
 ) -> int:
-    if not compress_ratio_has_attention(compress_ratio, attn_type):
+    if not compress_ratio_has_attention(compress_ratio, attn_type, variant):
         raise ValueError(
             f"Layer with compress ratio {compress_ratio} does not have attention type {attn_type}"
         )
@@ -105,7 +118,7 @@ def get_token_bytes(
             )
         return footer_scale_kv.TOKEN_BYTES
 
-    attn_dim = get_attn_dim(head_dim, index_head_dim, compress_ratio, attn_type)
+    attn_dim = get_attn_dim(head_dim, index_head_dim, compress_ratio, attn_type, variant)
 
     dtype_bytes = 1 if has_fp8_kv_cache else 2
     # (indexer) compressor kv and score always use float32
@@ -139,11 +152,12 @@ def _estimate_non_sliding_attn_size_per_token(
     has_fp8_kv_cache,
     indexer_k_dtype: str = "fp8",
     use_fp8_ds_mla: bool = False,
+    variant: str = DEEPSEEK_V4_VARIANT,
 ) -> int:
     total_bytes = 0
     for compress_ratio in compress_ratios:
         for attn_type in DEEPSEEK_V4_NON_SLIDING_ATTENTION:
-            if compress_ratio_has_attention(compress_ratio, attn_type):
+            if compress_ratio_has_attention(compress_ratio, attn_type, variant):
                 total_bytes += _get_attn_bytes_per_token(
                     head_dim,
                     index_head_dim,
@@ -152,6 +166,7 @@ def _estimate_non_sliding_attn_size_per_token(
                     has_fp8_kv_cache,
                     indexer_k_dtype=indexer_k_dtype,
                     use_fp8_ds_mla=use_fp8_ds_mla,
+                    variant=variant,
                 )
     return total_bytes
 
@@ -168,6 +183,7 @@ def _estimate_swa_cache_size(
     scratch: bool,
     indexer_k_dtype: str = "fp8",
     use_fp8_ds_mla: bool = False,
+    variant: str = DEEPSEEK_V4_VARIANT,
 ) -> Tuple[int, int]:
     tokens_per_block = int(tokens_per_block)
     size_per_token = 0
@@ -175,14 +191,14 @@ def _estimate_swa_cache_size(
     scratch_keys = set()
     for compress_ratio in compress_ratios:
         for attn_type in DEEPSEEK_V4_SLIDING_ATTENTION:
-            if not compress_ratio_has_attention(compress_ratio, attn_type):
+            if not compress_ratio_has_attention(compress_ratio, attn_type, variant):
                 continue
             if attn_type == DeepseekV4AttentionType.SWA:
                 if swa_window_size is None:
                     continue
                 window_size = swa_window_size
             else:
-                state_factor = 2 if is_overlap_compressor(compress_ratio) else 1
+                state_factor = 2 if is_overlap_compressor(compress_ratio, variant) else 1
                 window_size = state_factor * compress_ratio
             if window_size <= 0:
                 continue
@@ -197,6 +213,7 @@ def _estimate_swa_cache_size(
                 has_fp8_kv_cache,
                 indexer_k_dtype=indexer_k_dtype,
                 use_fp8_ds_mla=use_fp8_ds_mla,
+                variant=variant,
             )
             if not context:
                 size_per_request += window_tokens * token_bytes
@@ -220,6 +237,7 @@ def _get_attn_bytes_per_token(
     has_fp8_kv_cache: bool,
     indexer_k_dtype: str = "fp8",
     use_fp8_ds_mla: bool = False,
+    variant: str = DEEPSEEK_V4_VARIANT,
 ) -> int:
     token_bytes = get_token_bytes(
         head_dim,
@@ -229,9 +247,10 @@ def _get_attn_bytes_per_token(
         has_fp8_kv_cache,
         indexer_k_dtype=indexer_k_dtype,
         use_fp8_ds_mla=use_fp8_ds_mla,
+        variant=variant,
     )
     if attn_type in [DeepseekV4AttentionType.COMPRESS, DeepseekV4AttentionType.INDEXER_COMPRESS]:
-        token_bytes //= compress_ratio
+        token_bytes //= pool_factor(compress_ratio)
     return token_bytes
 
 
@@ -244,6 +263,43 @@ def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
 
 class DeepseekV4CacheManager(KVCacheManagerV2):
     _supports_reuse_match_backoff = False
+
+    # Partial-block reuse is unsound for this manager, and it was measured to be, not
+    # reasoned to be. One fixed prompt, greedy, four arms one process each: block
+    # reuse off, block reuse on, and a cold default process all emit byte-identical
+    # ids, while the 2nd call in a reuse-on process diverges at decode step 2 and
+    # produces a different -- still fluent, still on-topic -- paragraph. Turning only
+    # `enable_partial_reuse` off restores exact agreement, so it is the whole factor;
+    # neither general block reuse nor request-to-request state leakage survives that
+    # control. (`_supports_reuse_match_backoff` above is unrelated: it governs the
+    # draft/spec-decode backoff window, and was checked and ruled out first.)
+    #
+    # The structural reason is visible in `compressed_block_sizes` a few lines below:
+    # for the COMPRESS / COMPRESSOR / INDEXER roles the block size is *not*
+    # `tokens_per_block`, while `AttentionLayerConfig` carries no per-layer token
+    # granularity for the reuse radix tree to match against. So the tree matches at one
+    # global granularity over pools that are not addressed at it, and a prefix stopping
+    # mid-block hands the new sequence rows covering tokens it does not own. The rows
+    # are well-formed, so nothing raises.
+    #
+    # How far the measurement pins that down: a second arm whose warm-up generated one
+    # token instead of 64 -- so the same 18-token prompt but a much shorter populated
+    # region -- diverges to the *same* ids as the 64-token warm-up. The corruption is
+    # therefore a function of the matched prompt prefix alone, not of how much the
+    # earlier request went on to write past it. That is consistent with the above but
+    # narrower than it: which specific rows are wrong is not established here, only
+    # that partial matching over these pools produces them. Do not read the paragraph
+    # above as a verified row-level account.
+    #
+    # Full-block reuse stays enabled: a whole-block prefix lands on a row boundary
+    # for every ratio in `compressed_block_sizes`, which is what makes it sound.
+    _supports_partial_reuse = False
+
+    # Which generation's `compress_ratios` encoding this manager was built for.
+    # A class attribute rather than an instance-only one so the sizing helpers stay
+    # reachable on the bare `object.__new__` instances the sizing tests construct,
+    # and so V4 remains the default for any caller that predates the distinction.
+    _variant: str = DEEPSEEK_V4_VARIANT
 
     # This tensor is for compatibility with AttentionOp, it only contains swa attention.
     # kv_cache_pool_pointers contains one virtual attention-op pool per local
@@ -327,6 +383,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             )
 
         self.index_head_dim = sparse_attn_config.index_head_dim
+        # Which generation's `compress_ratios` encoding this config uses. See
+        # `params.py` — the same integer means different things in V4 and V4.1,
+        # so every ratio predicate needs it.
+        self._variant = getattr(sparse_attn_config, "variant", DEEPSEEK_V4_VARIANT)
+        # Which layers actually write a compressed cache. Absent (V4) means every
+        # long-range layer does, so `owns_compressed_kv` degrades to
+        # `is_compress_layer` and nothing here changes shape.
+        self._kv_source_layer_ids = getattr(sparse_attn_config, "kv_source_layer_ids", None)
         self._compress_ratios = sparse_attn_config.compress_ratios
         # When MTP is enabled, enlarge the sliding window sizes by
         # max_draft_len so that rewinding rejected draft tokens can still
@@ -345,7 +409,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self._compress_ratios = self._compress_ratios + [self._compress_ratios[-1]] * (
                 self._max_draft_len - 1
             )
-        self.compressed_block_sizes = [tokens_per_block // ratio for ratio in self._compress_ratios]
+        self.compressed_block_sizes = [
+            tokens_per_block // pool_factor(ratio) for ratio in self._compress_ratios
+        ]
 
         self._init_indexer_dtype(sparse_attn_config)
 
@@ -383,22 +449,23 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             PageIndexMode.PER_LAYER,
         )
 
+        # One COMPRESS pool per distinct compress ratio that actually has a
+        # compressed branch. All layers sharing a ratio share a pool (asserted by
+        # `_assert_layer_pool_scale`), so the first PP-local layer with each ratio
+        # is representative. Driven off `compress_ratio_has_attention` rather than
+        # a hard-coded {4, 128}: V4.1's ratios are {0, 1, 2}, and its ratio-1
+        # layers own a full-length compressed cache that the V4 encoding has no
+        # equivalent for.
         self.compress_pool_ptrs = {}
-        # Find first PP layer with each compress ratio for pool pointer lookup.
         pp_compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
-        if 4 in pp_compress_ratios:  # indexer compressor
-            first_layer_with_4 = self.pp_layers[pp_compress_ratios.index(4)]
-            self.compress_pool_ptrs[4] = self.impl.get_mem_pool_base_address(
-                self._layer_attn_to_layer_id[first_layer_with_4, DeepseekV4AttentionType.COMPRESS],
-                DeepseekV4AttentionType.COMPRESS.role,
-                PageIndexMode.SHARED,
-            )
-        if 128 in pp_compress_ratios:  # compressor
-            first_layer_with_128 = self.pp_layers[pp_compress_ratios.index(128)]
-            self.compress_pool_ptrs[128] = self.impl.get_mem_pool_base_address(
-                self._layer_attn_to_layer_id[
-                    first_layer_with_128, DeepseekV4AttentionType.COMPRESS
-                ],
+        for compress_ratio in sorted(set(pp_compress_ratios)):
+            if not compress_ratio_has_attention(
+                compress_ratio, DeepseekV4AttentionType.COMPRESS, self._variant
+            ):
+                continue
+            first_layer = self.pp_layers[pp_compress_ratios.index(compress_ratio)]
+            self.compress_pool_ptrs[compress_ratio] = self.impl.get_mem_pool_base_address(
+                self._layer_attn_to_layer_id[first_layer, DeepseekV4AttentionType.COMPRESS],
                 DeepseekV4AttentionType.COMPRESS.role,
                 PageIndexMode.SHARED,
             )
@@ -440,7 +507,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             block_size = self.compressed_block_sizes[layer_idx]
 
         attn_dim = get_attn_dim(
-            self.head_dim, self.index_head_dim, self._compress_ratios[layer_idx], attn_type
+            self.head_dim,
+            self.index_head_dim,
+            self._compress_ratios[layer_idx],
+            attn_type,
+            self._variant,
         )
         footer_scale = self.use_fp8_ds_mla and attn_type in (
             DeepseekV4AttentionType.SWA,
@@ -492,7 +563,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
             DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
         ):
-            state_factor = 2 if is_overlap_compressor(compress_ratio) else 1
+            state_factor = 2 if is_overlap_compressor(compress_ratio, self._variant) else 1
             base_window_size = state_factor * compress_ratio
         else:
             return None
@@ -546,7 +617,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 device="cpu",
             )
             for compress_ratio in set(self._compress_ratios)
-            if compress_ratio_has_attention(compress_ratio, DeepseekV4AttentionType.COMPRESS)
+            if compress_ratio_has_attention(
+                compress_ratio, DeepseekV4AttentionType.COMPRESS, self._variant
+            )
         }
 
         # layer offsets per layer and attn, shape [num_local_layers, len(DEEPSEEK_V4_SLIDING_ATTENTION)].
@@ -576,49 +649,55 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             dtype=torch.int32,
             device="cpu",
         )
-        self._csa_compress_pool_id = None
-        self._csa_compress_scale = None
-        self._csa_indexer_compress_pool_id = None
-        self._csa_indexer_compress_scale = None
-        self._hca_compress_pool_id = None
-        self._hca_compress_scale = None
+        # (pool_id, scale) of the shared COMPRESS / INDEXER_COMPRESS pool, keyed by
+        # compress ratio. V4 fills ratio 4 (both roles) and ratio 128 (COMPRESS
+        # only, since ratio-128 layers are not indexed); V4.1 fills ratios 1 and 2
+        # with both. All layers sharing a ratio share a pool, so the last write per
+        # ratio is the same value as the first — `_assert_layer_pool_scale` is what
+        # guarantees that.
+        self._compress_pool_meta: Dict[int, Tuple[int, int]] = {}
+        self._indexer_compress_pool_meta: Dict[int, Tuple[int, int]] = {}
 
         for layer_idx in self.pp_layers:
             compress_ratio = self._compress_ratios[layer_idx]
-            if compress_ratio == 4:
+            if compress_ratio_has_attention(
+                compress_ratio, DeepseekV4AttentionType.COMPRESS, self._variant
+            ):
                 compress_layer_id = self._layer_attn_to_layer_id[
                     layer_idx, DeepseekV4AttentionType.COMPRESS
                 ]
                 compress_converter = self.impl.get_page_index_converter(
                     compress_layer_id, DeepseekV4AttentionType.COMPRESS.role
                 )
-                self._csa_compress_pool_id = self.layer_to_pool_mapping_dict[compress_layer_id]
-                self._csa_compress_scale = int(compress_converter.scale)
+                self._compress_pool_meta[compress_ratio] = (
+                    self.layer_to_pool_mapping_dict[compress_layer_id],
+                    int(compress_converter.scale),
+                )
+            if compress_ratio_has_attention(
+                compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESS, self._variant
+            ):
                 indexer_layer_id = self._layer_attn_to_layer_id[
                     layer_idx, DeepseekV4AttentionType.INDEXER_COMPRESS
                 ]
                 indexer_converter = self.impl.get_page_index_converter(
                     indexer_layer_id, DeepseekV4AttentionType.INDEXER_COMPRESS.role
                 )
-                self._csa_indexer_compress_pool_id = self.layer_to_pool_mapping_dict[
-                    indexer_layer_id
-                ]
-                self._csa_indexer_compress_scale = int(indexer_converter.scale)
-            elif compress_ratio == 128:
-                compress_layer_id = self._layer_attn_to_layer_id[
-                    layer_idx, DeepseekV4AttentionType.COMPRESS
-                ]
-                compress_converter = self.impl.get_page_index_converter(
-                    compress_layer_id, DeepseekV4AttentionType.COMPRESS.role
+                self._indexer_compress_pool_meta[compress_ratio] = (
+                    self.layer_to_pool_mapping_dict[indexer_layer_id],
+                    int(indexer_converter.scale),
                 )
-                self._hca_compress_pool_id = self.layer_to_pool_mapping_dict[compress_layer_id]
-                self._hca_compress_scale = int(compress_converter.scale)
 
             local_layer_idx = self.layer_offsets[layer_idx]
             for attn_type in DEEPSEEK_V4_SLIDING_ATTENTION:
-                if not compress_ratio_has_attention(self._compress_ratios[layer_idx], attn_type):
+                # Presence in the map is the ground truth for "this layer has this
+                # role", and strictly narrower than the ratio predicate: under
+                # V4.1's cross-layer sharing a dependent long-range layer has the
+                # ratio of a compressor but runs none, so it has no COMPRESSOR_*
+                # buffers to describe. Asking the map instead of re-deriving from
+                # the ratio keeps this loop correct for free as ownership evolves.
+                layer_id = self._layer_attn_to_layer_id.get((layer_idx, attn_type))
+                if layer_id is None:
                     continue
-                layer_id = self._layer_attn_to_layer_id[layer_idx, attn_type]
                 pool_id = self.layer_to_pool_mapping_dict[layer_id]
                 converter = self.impl.get_page_index_converter(layer_id, attn_type.role)
                 self._layer_attn_pool_ids[local_layer_idx, attn_type.value] = pool_id
@@ -780,6 +859,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             has_fp8_kv_cache,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            variant=self._variant,
         )
         (
             context_swa_size_per_token,
@@ -795,6 +875,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=self.enable_swa_scratch_reuse,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            variant=self._variant,
         )
         (
             generation_swa_size_per_token,
@@ -810,6 +891,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=False,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            variant=self._variant,
         )
         max_context_tokens = (
             self._max_num_tokens if self._max_num_tokens is not None else max_tokens
@@ -835,6 +917,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             has_fp8_kv_cache,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            variant=self._variant,
         )
         context_swa_size_per_token, _ = _estimate_swa_cache_size(
             self.head_dim,
@@ -847,6 +930,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=self.enable_swa_scratch_reuse,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            variant=self._variant,
         )
         (
             generation_swa_size_per_token,
@@ -862,6 +946,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=False,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            variant=self._variant,
         )
         padding = self._get_extra_quota_padding()
         size_per_batch = self.max_batch_size * generation_swa_size_per_request + padding
@@ -916,52 +1001,31 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             )
             layers.append(layer_config)
 
-        # create the layer config for DeepSeek-V4
-        for layer in self.pp_layers:
-            compress_ratio = self._compress_ratios[layer]
-            if compress_ratio == 1:
-                _add_layer(
-                    layer,
-                    [DeepseekV4AttentionType.SWA],
-                    self._get_window_size(compress_ratio, DeepseekV4AttentionType.SWA),
-                )
-            elif compress_ratio == DEEPSEEK_V4_SPARSE_RATIO:
-                _add_layer(
-                    layer,
-                    [DeepseekV4AttentionType.SWA],
-                    self._get_window_size(compress_ratio, DeepseekV4AttentionType.SWA),
-                )
-                _add_layer(
-                    layer,
-                    [
-                        DeepseekV4AttentionType.COMPRESS,
-                        DeepseekV4AttentionType.INDEXER_COMPRESS,
-                    ],
-                    None,
-                )
-                _add_layer(
-                    layer,
-                    [
-                        DeepseekV4AttentionType.COMPRESSOR_KV,
-                        DeepseekV4AttentionType.COMPRESSOR_SCORE,
-                        DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
-                        DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
-                    ],
-                    self._get_window_size(compress_ratio, DeepseekV4AttentionType.COMPRESSOR_KV),
-                )
-            elif compress_ratio == 128:
-                _add_layer(
-                    layer,
-                    [
-                        DeepseekV4AttentionType.SWA,
-                        DeepseekV4AttentionType.COMPRESSOR_KV,
-                        DeepseekV4AttentionType.COMPRESSOR_SCORE,
-                    ],
-                    self._get_window_size(compress_ratio, DeepseekV4AttentionType.SWA),
-                )
-                _add_layer(layer, [DeepseekV4AttentionType.COMPRESS], None)
-            else:
-                raise ValueError(f"Unsupported DeepSeek-V4 compress ratio {compress_ratio}.")
+        def _alias_layer(
+            layer_idx: int,
+            attention_types: List[DeepseekV4AttentionType],
+            source_layer_idx: int,
+        ) -> None:
+            """Point ``layer_idx`` at the buffers ``source_layer_idx`` allocated.
+
+            No ``AttentionLayerConfig`` is appended, so nothing extra is reserved:
+            the dependent layer resolves to the source's ``LayerId`` and therefore
+            to the source's pages. Everything downstream goes through
+            ``_layer_attn_to_layer_id`` -- ``get_buffers``, the pool-meta lookup,
+            the block tables -- so a dependent needs no special case anywhere else.
+
+            The reverse map is deliberately *not* extended: it names which layer a
+            pool belongs to for the lifecycle log, and the answer is the owner.
+            """
+            for attn_type in attention_types:
+                layer_attn_to_layer_id[layer_idx, attn_type] = layer_attn_to_layer_id[
+                    source_layer_idx, attn_type
+                ]
+
+        if self._variant == DEEPSEEK_V41_VARIANT:
+            self._add_v41_cache_layers(_add_layer, _alias_layer)
+        else:
+            self._add_v4_cache_layers(_add_layer)
 
         # the mapping from layer index and attention type to layer id
         self._layer_attn_to_layer_id = layer_attn_to_layer_id
@@ -973,6 +1037,161 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             config,
             layers=layers,
         )
+
+    def _add_v4_cache_layers(self, add_layer) -> None:
+        """Assign cache roles for the V4 ``{1, 4, 128}`` compress-ratio encoding."""
+        for layer in self.pp_layers:
+            compress_ratio = self._compress_ratios[layer]
+            if compress_ratio == 1:
+                add_layer(
+                    layer,
+                    [DeepseekV4AttentionType.SWA],
+                    self._get_window_size(compress_ratio, DeepseekV4AttentionType.SWA),
+                )
+            elif compress_ratio == DEEPSEEK_V4_SPARSE_RATIO:
+                add_layer(
+                    layer,
+                    [DeepseekV4AttentionType.SWA],
+                    self._get_window_size(compress_ratio, DeepseekV4AttentionType.SWA),
+                )
+                add_layer(
+                    layer,
+                    [
+                        DeepseekV4AttentionType.COMPRESS,
+                        DeepseekV4AttentionType.INDEXER_COMPRESS,
+                    ],
+                    None,
+                )
+                add_layer(
+                    layer,
+                    [
+                        DeepseekV4AttentionType.COMPRESSOR_KV,
+                        DeepseekV4AttentionType.COMPRESSOR_SCORE,
+                        DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
+                        DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
+                    ],
+                    self._get_window_size(compress_ratio, DeepseekV4AttentionType.COMPRESSOR_KV),
+                )
+            elif compress_ratio == 128:
+                add_layer(
+                    layer,
+                    [
+                        DeepseekV4AttentionType.SWA,
+                        DeepseekV4AttentionType.COMPRESSOR_KV,
+                        DeepseekV4AttentionType.COMPRESSOR_SCORE,
+                    ],
+                    self._get_window_size(compress_ratio, DeepseekV4AttentionType.SWA),
+                )
+                add_layer(layer, [DeepseekV4AttentionType.COMPRESS], None)
+            else:
+                raise ValueError(f"Unsupported DeepSeek-V4 compress ratio {compress_ratio}.")
+
+    def _add_v41_cache_layers(self, add_layer, alias_layer) -> None:
+        """Assign cache roles for the V4.1 ``{0, 1, 2}`` compress-ratio encoding.
+
+        Three shapes, driven by the reference ``Attention``/``Compressor``
+        (``<checkpoint>/inference/model.py``):
+
+        * ``0`` — no compressed branch (``if self.compress_ratio:`` at model.py:775
+          is false), so SWA only. This is the role V4 spells ``1``.
+        * ``1`` — a long-range branch whose "pooling" is the identity: the
+          compressor is just ``self.norm(self.wkv(x))`` (model.py:461) over a
+          full-length compressed cache. Indexed, but with no cross-step pooling
+          accumulator, hence no ``COMPRESSOR_*`` buffers.
+        * ``2`` — the same plus genuine 2-token pooling with a learned fp32 gate,
+          which does need the accumulator.
+
+        Every long-range layer is indexed, so ``INDEXER_COMPRESS`` always
+        accompanies ``COMPRESS``. Neither ``INDEXER_COMPRESSOR_*`` role appears:
+        V4.1's ``Indexer`` owns no compressor of its own (model.py:496-525), it
+        derives its keys from the main compressor's latent.
+
+        Cross-layer sharing is what makes the compressed side affordable. Only the
+        four ``kv_source_layer_ids`` run a ``Compressor`` and write a compressed
+        cache (``model.py:657``); the 34 long-range layers after them read the
+        nearest preceding source's, which the reference expresses by having a
+        source overwrite the ``shared_attn`` globals its dependents then read
+        (``model.py:749``). So a dependent allocates nothing and is *aliased* onto
+        its source's ``LayerId``. Allocating per layer instead and broadcasting the
+        latent into 34 copies would cost the full compressed footprint 9.5x over
+        plus a copy per layer per step, to store 34 duplicates of the same bytes.
+
+        The index-key cache follows the *same* four layers, not the eight index
+        sources: ``owns_k`` is ``layer_id in kv_source_layers``
+        (``model.py:499``), because index keys are a reprojection of the
+        compressor's latent and only a layer that produced a latent can project
+        one. The eight ``index_source_layer_ids`` own the top-k *computation*
+        (queries and ``weights_proj``), which is a module, not a cache -- see
+        ``owns_index_topk`` versus ``owns_compressed_kv`` in ``params.py``. Hence
+        ``INDEXER_COMPRESS`` is allocated with ``COMPRESS``, on the KV sources.
+
+        Aliasing is safe here only because every sharing group is
+        ratio-uniform -- kv source 2 owns layers 2-7 and 8 owns 9-13 at ratio 2,
+        20 owns 21-39 at ratio 1 -- so a dependent never resolves into a pool
+        built for a different pooling factor. ``_assert_layer_pool_scale`` is what
+        keeps that from silently regressing.
+        """
+        for layer in self.pp_layers:
+            compress_ratio = self._compress_ratios[layer]
+            if compress_ratio < 0 or compress_ratio > 2:
+                raise ValueError(
+                    f"Unsupported DeepSeek-V4.1 compress ratio {compress_ratio} on layer "
+                    f"{layer}; expected 0 (SWA only), 1 (unpooled long-range) or 2 (pooled)."
+                )
+            add_layer(
+                layer,
+                [DeepseekV4AttentionType.SWA],
+                self._get_window_size(compress_ratio, DeepseekV4AttentionType.SWA),
+            )
+            if not is_compress_layer(compress_ratio, self._variant):
+                continue
+            assert is_sparse_layer(compress_ratio, self._variant), (
+                "every V4.1 long-range layer must be indexed"
+            )
+            compressed_roles = [
+                DeepseekV4AttentionType.COMPRESS,
+                DeepseekV4AttentionType.INDEXER_COMPRESS,
+            ]
+            if owns_compressed_kv(layer, compress_ratio, self._kv_source_layer_ids, self._variant):
+                add_layer(layer, compressed_roles, None)
+            else:
+                source = source_layer_for(layer, self._kv_source_layer_ids)
+                assert source is not None, (
+                    f"layer {layer} has a compressed branch but no KV source at or "
+                    f"before it in {list(self._kv_source_layer_ids or [])}, so nothing "
+                    "would ever write the cache it reads."
+                )
+                assert self._compress_ratios[source] == compress_ratio, (
+                    f"layer {layer} (ratio {compress_ratio}) would alias onto layer "
+                    f"{source} (ratio {self._compress_ratios[source]}); a sharing "
+                    "group must be ratio-uniform or the pooled positions do not line up."
+                )
+                # Aliasing is a pointer into a pool this rank allocated, so it
+                # cannot cross a pipeline stage. V4.1's groups are wide (kv source
+                # 20 owns layers 21-39), so a PP split can land inside one; that
+                # needs the source's compressed cache sent across the stage
+                # boundary, which is a separate feature. Fail here rather than
+                # deeper, where the symptom would be a bare KeyError.
+                assert source in self.pp_layers, (
+                    f"layer {layer} shares layer {source}'s compressed KV cache, but "
+                    f"{source} is on another pipeline stage. DeepSeek-V4.1 cross-layer "
+                    "sharing does not span PP stages: choose a PP split that keeps each "
+                    f"kv_source_layer_ids group {list(self._kv_source_layer_ids or [])} "
+                    "within one stage."
+                )
+                alias_layer(layer, compressed_roles, source)
+                # A dependent runs no compressor, so it needs no pooling
+                # accumulator either -- skip the COMPRESSOR_* block below.
+                continue
+            if has_compressor_state(compress_ratio, self._variant):
+                add_layer(
+                    layer,
+                    [
+                        DeepseekV4AttentionType.COMPRESSOR_KV,
+                        DeepseekV4AttentionType.COMPRESSOR_SCORE,
+                    ],
+                    self._get_window_size(compress_ratio, DeepseekV4AttentionType.COMPRESSOR_KV),
+                )
 
     def _init_indexer_dtype(self, sparse_attn_config: DeepSeekV4SparseAttentionConfig) -> None:
         # Indexer compressor cache layout. Two modes are supported:
@@ -1021,11 +1240,17 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         attn_ratio_to_pool_id = defaultdict[DeepseekV4AttentionType, dict[int, int]](lambda: {})
         attn_ratio_to_scale = defaultdict[DeepseekV4AttentionType, dict[int, int]](lambda: {})
 
+        # Presence in the map, not the ratio predicate, decides which (layer, role)
+        # pairs exist. The two agree under V4, but under V4.1's cross-layer sharing
+        # a dependent long-range layer carries a compressor's ratio while running no
+        # compressor, so the predicate would claim COMPRESSOR_* roles it never
+        # allocated. Asking the map is also strictly the right question here: this
+        # check is about the pools that were actually built.
         comb = [
             (attn_type, layer_idx)
             for attn_type in DeepseekV4AttentionType
             for layer_idx in self.pp_layers
-            if compress_ratio_has_attention(self._compress_ratios[layer_idx], attn_type)
+            if (layer_idx, attn_type) in self._layer_attn_to_layer_id
         ]
         for attn_type, layer_idx in comb:
             compress_ratio = self._compress_ratios[layer_idx]
@@ -1094,6 +1319,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             has_fp8_kv_cache,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            variant=self._variant,
         )
 
         block_size = self.tokens_per_block
@@ -1116,6 +1342,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             has_fp8_kv_cache,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            variant=self._variant,
         )
 
     def get_max_resource_count(self) -> int:
@@ -1160,6 +1387,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             has_fp8_kv_cache,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            variant=self._variant,
         )
         swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
             self.head_dim,
@@ -1172,6 +1400,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=self.enable_swa_scratch_reuse,
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
+            variant=self._variant,
         )
         return int(
             total_tokens * (non_sliding_attn_size_per_token + swa_size_per_token)
@@ -1379,23 +1608,27 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         assert beam_width == 1, "DSV4 only supports beam width 1 now"
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         staging = self._host_compress_block_tables_staging[compress_ratio]
-        if compress_ratio == 4:
-            pool_id = self._csa_compress_pool_id
-            scale = self._csa_compress_scale
-        elif compress_ratio == 128:
-            pool_id = self._hca_compress_pool_id
-            scale = self._hca_compress_scale
-        else:
+        meta = self._compress_pool_meta.get(compress_ratio)
+        if meta is None:
             raise ValueError(
-                f"Unsupported compress ratio {compress_ratio} for copy_batch_compress_block_tables"
+                f"Unsupported compress ratio {compress_ratio} for "
+                f"copy_batch_compress_block_tables; this manager has COMPRESS pools for "
+                f"{sorted(self._compress_pool_meta)}"
             )
-
-        if pool_id is None or scale is None:
-            raise RuntimeError(
-                f"Missing COMPRESS pool metadata for compress ratio {compress_ratio}"
-            )
+        pool_id, scale = meta
         staging[:num_seqs] = self._compute_shared_block_table(pool_id, scale, copy_idx)
         dst_tensor[:num_seqs].copy_(staging[:num_seqs], non_blocking=True)
+
+    @property
+    def indexer_compress_ratios(self) -> List[int]:
+        """Compress ratios that have an INDEXER_COMPRESS pool on this rank, ascending.
+
+        One entry for V4 (only its ratio-4 layers are indexed) and two for V4.1
+        (every long-range layer is indexed, at ratio 1 or 2). The metadata needs
+        this to size one page table per pool: the pools have different page
+        scales, so a single table cannot address both.
+        """
+        return sorted(self._indexer_compress_pool_meta)
 
     @nvtx_range_debug("dsv4_copy_batch_indexer_compress_block_tables")
     def copy_batch_indexer_compress_block_tables(
@@ -1405,14 +1638,34 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         beam_width: int,
         num_contexts: int,
         num_seqs: int,
+        compress_ratio: Optional[int] = None,
     ) -> None:
-        """Build the shared INDEXER_COMPRESS compatibility block table."""
+        """Build the shared INDEXER_COMPRESS compatibility block table.
+
+        ``compress_ratio=None`` means "the one indexer pool this model has", which
+        is always the case for V4: only its ratio-4 layers are indexed. V4.1 indexes
+        every long-range layer, so it has one indexer pool per distinct ratio and
+        callers must say which. Refusing to guess is deliberate — silently returning
+        the ratio-1 table for a ratio-2 layer would scatter indexer keys into the
+        wrong pages and read as an accuracy bug rather than a wiring bug.
+        """
         assert beam_width == 1, "DSV4 only supports beam width 1 now"
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
-        pool_id = self._csa_indexer_compress_pool_id
-        scale = self._csa_indexer_compress_scale
-        if pool_id is None or scale is None:
-            raise RuntimeError("Missing INDEXER_COMPRESS pool metadata")
+        if compress_ratio is None:
+            if len(self._indexer_compress_pool_meta) != 1:
+                raise RuntimeError(
+                    "compress_ratio is required when the model has "
+                    f"{len(self._indexer_compress_pool_meta)} INDEXER_COMPRESS pools "
+                    f"(ratios {sorted(self._indexer_compress_pool_meta)})"
+                )
+            (compress_ratio,) = self._indexer_compress_pool_meta
+        meta = self._indexer_compress_pool_meta.get(compress_ratio)
+        if meta is None:
+            raise RuntimeError(
+                f"Missing INDEXER_COMPRESS pool metadata for compress ratio "
+                f"{compress_ratio}; this manager has {sorted(self._indexer_compress_pool_meta)}"
+            )
+        pool_id, scale = meta
         host_block_table[:num_seqs] = self._compute_shared_block_table(pool_id, scale, copy_idx)
 
     @staticmethod
@@ -1430,6 +1683,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         else:
             has_fp8_kv_cache = False
         indexer_k_dtype = model_config.sparse_attention_config.indexer_k_dtype
+        variant = getattr(model_config.sparse_attention_config, "variant", DEEPSEEK_V4_VARIANT)
         kv_cache_config = kwargs.get("kv_cache_config")
         use_fp8_ds_mla = (
             kv_cache_config is not None
@@ -1442,6 +1696,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             has_fp8_kv_cache,
             indexer_k_dtype=indexer_k_dtype,
             use_fp8_ds_mla=use_fp8_ds_mla,
+            variant=variant,
         )
         swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
             head_dim,
@@ -1454,6 +1709,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             scratch=False,
             indexer_k_dtype=indexer_k_dtype,
             use_fp8_ds_mla=use_fp8_ds_mla,
+            variant=variant,
         )
         max_batch_size = int(kwargs.get("max_batch_size") or 0)
         return (

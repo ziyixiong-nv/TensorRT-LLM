@@ -13,18 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tensorrt_llm._torch.modules.engram.engram import (
-    Engram,
-    EngramConfig,
-    EngramHashProvider,
-    MultiHeadEmbedding,
-    ShardedFp8MultiHeadEmbedding,
-)
+from .tokenizer import DeepseekV41Tokenizer, encode_messages
 
-__all__ = [
-    "Engram",
-    "EngramConfig",
-    "EngramHashProvider",
-    "MultiHeadEmbedding",
-    "ShardedFp8MultiHeadEmbedding",
-]
+__all__ = ["DeepseekV41Tokenizer", "encode_messages"]

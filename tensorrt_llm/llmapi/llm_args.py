@@ -1310,11 +1310,38 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         description=
         "Whether to skip the MQA and Top-K in the indexer for short sequences.")
 
+    variant: Literal["v4", "v41"] = Field(
+        default="v4",
+        description="Which DeepSeek-V4 generation's `compress_ratios` encoding "
+        "this config uses. `v4` ratios are role sentinels drawn from {0, 4, "
+        "128} and 0 is normalized to 1 (a ratio-1 layer does not exist in V4, "
+        "so the rewrite is free). `v41` ratios are genuine pooling factors "
+        "drawn from {0, 1, 2}: 0 means sliding-window only, 1 means an "
+        "unpooled long-range branch, and 2 means two tokens pooled per "
+        "compressed entry. Normalizing 0 to 1 there would make SWA-only "
+        "layers indistinguishable from long-range layers, so it is skipped.")
+
     compress_ratios: List[int] = Field(
         default_factory=lambda: [1, 1, 4, 128, 4, 128, 4],
         description="The compress ratios of each layer. DeepSeek-V4 uses 0 "
         "for uncompressed/SWA-only layers; the LLM API config normalizes "
-        "0 to 1, while checkpoint-facing semantics remain unchanged.")
+        "0 to 1, while checkpoint-facing semantics remain unchanged. Under "
+        "`variant='v41'` the list is kept exactly as the checkpoint stores it.")
+
+    kv_source_layer_ids: Optional[List[int]] = Field(
+        default=None,
+        description="V4.1 only: the layers that compress their own KV. Every "
+        "other long-range layer reads the compressed KV — and the indexer keys "
+        "derived from it — published by the nearest preceding source. `None` "
+        "means every long-range layer owns its own compressed cache, which is "
+        "V4's behaviour.")
+
+    index_source_layer_ids: Optional[List[int]] = Field(
+        default=None,
+        description="V4.1 only: the layers that run their own indexer top-k. "
+        "Layers in between reuse the selection their source published. These "
+        "are a superset of `kv_source_layer_ids`: the extra layers contribute "
+        "queries against keys produced upstream and own no `indexer.wk`.")
     window_size: int = Field(
         default=128,
         description="The sliding window size in tokens for SWA layers.")
@@ -1331,11 +1358,17 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
 
     @field_validator("compress_ratios")
     @classmethod
-    def normalize_compress_ratios(cls, compress_ratios):
+    def normalize_compress_ratios(cls, compress_ratios, info):
         if not compress_ratios:
             raise ValueError("compress_ratios must not be empty.")
         if any(ratio < 0 for ratio in compress_ratios):
             raise ValueError("compress_ratios must be non-negative.")
+        # `variant` is declared above `compress_ratios`, so pydantic has already
+        # validated it and it is present in `info.data`. Fall back to "v4" when
+        # it is absent (a `variant` validation error, in which case pydantic is
+        # already going to raise).
+        if info.data.get("variant", "v4") == "v41":
+            return list(compress_ratios)
         return [1 if ratio == 0 else ratio for ratio in compress_ratios]
 
     def supports_backend(self, backend: str) -> bool:
@@ -1375,6 +1408,32 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             indexer_k_dtype=self.indexer_k_dtype,
             compress_ratios=self.compress_ratios,
             window_size=self.window_size,
+            variant=self.variant,
+            kv_source_layer_ids=self.kv_source_layer_ids,
+            index_source_layer_ids=self.index_source_layer_ids,
+            # The compressor's and indexer's RMSNorms use the model's own eps
+            # (``args.norm_eps`` at every reference call site). Read straight off
+            # the checkpoint config rather than through ``_value``: this is not a
+            # user-facing knob, so the sparse config carries no field to override
+            # it with. The 1e-6 default is V4's value; V4.1 ships 1e-20, and
+            # hardcoding either one silently mis-normalizes the other generation.
+            # ``getattr(None, name, default)`` already yields ``default``, so no
+            # ``pretrained_config is not None`` arm is needed on any of the four.
+            rms_norm_eps=getattr(pretrained_config, "rms_norm_eps", 1e-6),
+            # Same treatment as ``rms_norm_eps`` directly above, and for the same
+            # reason. V4.1's composite config forwards public names to
+            # ``text_config``, which is where all three actually live, so no
+            # ``text_config`` hop is needed here. A V4 config has none of them and
+            # gets the defaults, which leave both prefilter levels off.
+            candidate_source_layer_id=getattr(pretrained_config,
+                                              "candidate_source_layer_id",
+                                              None),
+            # The ``or 0`` keeps an explicit ``null`` in the checkpoint from
+            # reaching ``int()``; ``getattr``'s own default only covers absence.
+            candidate_topk_blocks=int(
+                getattr(pretrained_config, "candidate_topk_blocks", 0) or 0),
+            candidate_block_size=int(
+                getattr(pretrained_config, "candidate_block_size", 0) or 0),
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1404,6 +1463,9 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             q_split_threshold=self.q_split_threshold,
             compress_ratios=self.compress_ratios,
             window_size=self.window_size,
+            variant=self.variant,
+            kv_source_layer_ids=self.kv_source_layer_ids,
+            index_source_layer_ids=self.index_source_layer_ids,
         )
 
 

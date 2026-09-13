@@ -24,6 +24,7 @@ from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
 from ..params import SparseBackendForwardArgs
 from .flash_mla import DeepSeekV4FlashMLA
+from .params import DEEPSEEK_V4_VARIANT, DEEPSEEK_V41_VARIANT, is_sparse_layer
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.mla import MLA
@@ -36,7 +37,13 @@ _q_b_proj_cute_dsl_import_ok: Optional[bool] = None
 
 
 def _has_dsv4_indexer(self) -> bool:
-    return self.layer_idx is not None and self.sparse_params.compress_ratios[self.layer_idx] == 4
+    if self.layer_idx is None:
+        return False
+    # `compress_ratios` is a role sentinel whose meaning depends on the model
+    # generation: V4 indexes only its ratio-4 layers, V4.1 indexes every
+    # long-range layer (ratio 1 or 2). See `params.is_sparse_layer`.
+    variant = getattr(self.sparse_params, "variant", DEEPSEEK_V4_VARIANT)
+    return is_sparse_layer(self.sparse_params.compress_ratios[self.layer_idx], variant)
 
 
 def _get_validated_sm_version() -> int:
@@ -65,11 +72,21 @@ def initialize_sparse_attn(self) -> None:
     self.compressor = getattr(self.mqa, "compressor", None)
 
     self.n_local_groups = self.num_groups // tp_size
-    self.q_b_layernorm = RMSNorm(
-        hidden_size=self.qk_head_dim,
-        eps=self.rms_norm_eps,
-        dtype=self.dtype,
-        has_weights=False,
+    # V4 renormalizes each head of the query after q_b_proj, with no learned gain;
+    # V4.1 does not (see ``DeepseekV4Attention.q_b_norm_enabled``). Absence is
+    # spelled as ``None`` rather than a companion boolean so that any path which
+    # still reaches for ``variance_epsilon`` raises instead of silently
+    # normalizing -- a half-applied switch here is a fluent-but-wrong model, which
+    # is the hardest kind of bug to notice.
+    self.q_b_layernorm = (
+        RMSNorm(
+            hidden_size=self.qk_head_dim,
+            eps=self.rms_norm_eps,
+            dtype=self.dtype,
+            has_weights=False,
+        )
+        if getattr(self, "q_b_norm_enabled", True)
+        else None
     )
     self.kv_a_layernorm = RMSNorm(
         hidden_size=self.kv_lora_rank + self.qk_rope_head_dim,
@@ -104,11 +121,31 @@ def initialize_sparse_attn(self) -> None:
     )
 
     self.has_dsv4_indexer = _has_dsv4_indexer(self)
+    self.is_dsv41 = (
+        getattr(self.sparse_params, "variant", DEEPSEEK_V4_VARIANT) == DEEPSEEK_V41_VARIANT
+    )
+    # Which layer's top-k this layer uses. V4.1 splits the selection off from the
+    # layer that consumes it: only `index_source_layer_ids` run an `Indexer`, and
+    # the ~30 indexed layers in between reuse what their source published
+    # (`shared_attn.topk_idxs`, model.py:722-737). Equal to `layer_idx` on a
+    # source, and None on V4, where every indexed layer selects for itself.
+    self.index_source_layer_idx = getattr(self.mqa, "index_source_layer_idx", None)
+    if self.is_dsv41 and self.has_dsv4_indexer and self.indexer is None:
+        assert self.index_source_layer_idx is not None, (
+            f"layer {self.layer_idx} is indexed but builds no Indexer, so it must "
+            "name the index source whose top-k it reuses"
+        )
+    # The streams exist to overlap the `Indexer`'s own kernels, so they are gated
+    # on *owning* one rather than on being index-selected. The two coincide in V4
+    # (every indexed layer runs its own indexer) but not in V4.1, where an
+    # indexed layer that is not in `index_source_layer_ids` reads a top-k some
+    # earlier layer published and builds no `Indexer` at all -- the assert below
+    # is what that layer used to trip.
     self.indexer_stream = (
-        self.aux_stream_dict.get(AuxStreamType.MlaIndexer) if self.has_dsv4_indexer else None
+        self.aux_stream_dict.get(AuxStreamType.MlaIndexer) if self.indexer is not None else None
     )
     self.indexer_aux_stream = (
-        self.aux_stream_dict.get(AuxStreamType.MlaIndexerAux) if self.has_dsv4_indexer else None
+        self.aux_stream_dict.get(AuxStreamType.MlaIndexerAux) if self.indexer is not None else None
     )
     # Not gated on has_dsv4_indexer: HCA layers have no indexer but still pre-launch
     # the compressor on this stream, which is the case the pre-launch exists for.
@@ -428,6 +465,15 @@ def _is_fused_q_fp8_quant_enabled(
     if os.environ.get("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "0") == "1":
         return False
     if self.qk_head_dim != 512 or self.kv_lora_rank != 448:
+        return False
+    # `deepseek_v4_q_norm_fused_fp8` folds norm + RoPE + FP8 quant into one kernel
+    # and always normalizes, so a model without the per-head Q norm (V4.1) cannot
+    # use it. Falling back costs the whole fused prologue, since
+    # `_is_fused_prologue_active` couples the Q and KV folds by correctness.
+    # Restoring it for V4.1 means threading a "skip the norm" flag down to the
+    # kernel, which is a C++ change and a rebuild -- worth doing, but not at the
+    # price of shipping a wrong query.
+    if self.q_b_layernorm is None:
         return False
     # fp8_ds_mla (FlashInfer sparse MLA) does not use the fused Q FP8 path.
     if self.kv_cache_dtype == "fp8_ds_mla":
@@ -946,7 +992,31 @@ def forward_sparse_attn(
         and do_multi_stream()
         and self.indexer is not None
         and self.indexer_stream is not None
+        # V4.1's index keys are a reprojection of *this* layer's compressed latent
+        # (model.py:544), so its indexer cannot run beside the compressor that
+        # produces it. The compressor still pre-launches on its own stream and the
+        # indexer joins on `dsv4_compressor_event`; only the two-stream race is off.
+        and self.indexer.supports_overlapped_prepare
     )
+    # V4.1 hands the compressed latent from the compressor to the indexer as an
+    # activation. Only a kv source has both modules, which is exactly the layer
+    # where `owns_index_keys` is set.
+    _v41_latent_handoff = (
+        self.is_dsv41
+        and self.indexer is not None
+        and self.compressor is not None
+        and self.indexer.owns_index_keys
+    )
+
+    def _run_compressor():
+        """Compress this layer's KV, keeping the pooled rows only if V4.1 needs them.
+
+        Every other generation's consumer reads the cache the compressor just
+        wrote, so holding the intermediate alive for the rest of the prologue
+        would be pure footprint.
+        """
+        kv_comp, _ = self.compressor(hidden_states, attn_metadata)
+        return kv_comp if _v41_latent_handoff else None
 
     # The compressor depends only on hidden states and metadata, so start it before
     # KV projection. Q work later shares this stream and its completion event.
@@ -957,11 +1027,15 @@ def forward_sparse_attn(
     _prelaunch_compressor = _use_indexer_overlap or (
         _v4_extra_overlap and do_multi_stream() and self.compressor_stream is not None
     )
+    # The compressor's pooled, pre-norm output. Kept only because V4.1's indexer
+    # needs the normalized-but-unrotated latent derived from it; the fused
+    # postprocess treats it as read-only, so reading it after the fact is safe.
+    _kv_comp = None
     if _prelaunch_compressor:
         self.dsv4_compressor_start_event.record()
         with torch.cuda.stream(self.compressor_stream):
             self.dsv4_compressor_start_event.wait()
-            self.compressor(hidden_states, attn_metadata)
+            _kv_comp = _run_compressor()
             if not _use_indexer_overlap:
                 self.dsv4_compressor_event.record()
 
@@ -1066,6 +1140,8 @@ def forward_sparse_attn(
 
     def _q_b_layernorm(q: torch.Tensor) -> torch.Tensor:
         assert q.dim() == 2 and q.shape[1] == self.num_heads_tp * self.qk_head_dim
+        if self.q_b_layernorm is None:
+            return q  # V4.1: no per-head query norm, q_b_proj's output goes straight to RoPE
         return torch.ops.trtllm.deepseek_v4_q_norm(
             q,
             self.num_heads_tp,
@@ -1106,16 +1182,23 @@ def forward_sparse_attn(
         return _q_b_layernorm(q_proj)
 
     def _compressor_branch():
-        self.compressor(hidden_states, attn_metadata)
-        return None
+        return _run_compressor()
 
     def _indexer_branch():
+        latent = None
+        if _v41_latent_handoff:
+            assert _kv_comp is not None, (
+                f"layer {self.layer_idx} owns V4.1 index keys, so its compressor must "
+                "have run before its indexer"
+            )
+            latent = self.compressor.latent_pre_rope(_kv_comp)
         return self.indexer(
             qr,
             hidden_states,
             attn_metadata,
             position_ids,
             pre_aux=_indexer_pre_aux,
+            latent=latent,
         )
 
     topk_indices = None
@@ -1158,22 +1241,39 @@ def forward_sparse_attn(
             # _compressor_branch here as well would execute the compressor twice.
             q = _q_branch()
             self.dsv4_compressor_event.wait()
+            # Allocated on compressor_stream, read here (V4.1's latent reprojection).
+            if _kv_comp is not None:
+                _kv_comp.record_stream(torch.cuda.current_stream())
         else:
-            q, _ = maybe_execute_in_parallel(
+            q, _kv_comp = maybe_execute_in_parallel(
                 _q_branch,
                 _compressor_branch,
                 self.ln_events[0],
                 self.ln_events[1],
                 self.aux_stream,
             )
+            if _kv_comp is not None:
+                _kv_comp.record_stream(torch.cuda.current_stream())
     else:
         q = _q_branch()
         if self.compressor is not None:
-            self.compressor(hidden_states, attn_metadata)
+            _kv_comp = _run_compressor()
 
     if self.indexer is not None:
         if not indexer_ran:
             topk_indices = _indexer_branch()
+        if self.is_dsv41:
+            # Publish for the indexed layers downstream that run no indexer of
+            # their own (model.py:737).
+            attn_metadata.v41_topk_indices[self.layer_idx] = topk_indices
+    elif self.is_dsv41 and self.has_dsv4_indexer:
+        source = self.index_source_layer_idx
+        published = attn_metadata.v41_topk_indices.get(source)
+        assert published is not None, (
+            f"layer {self.layer_idx} reuses layer {source}'s top-k, but that layer "
+            "has not published one in this forward pass"
+        )
+        topk_indices = published
 
     assert q.shape[0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
 
@@ -1204,7 +1304,6 @@ def forward_sparse_attn(
             topk_indices=topk_indices_ctx,
             enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
         )
-
     if num_generations > 0:
         q_gen = q[num_ctx_tokens:, ...]
         topk_indices_gen = (
