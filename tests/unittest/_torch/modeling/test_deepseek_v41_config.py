@@ -356,13 +356,71 @@ def test_dspark_config():
 
 
 def test_kv_bytes_per_token_matches_hand_derivation():
-    """890 B/token: 3 ratio-2 sources at 178 B + 1 ratio-1 source at 356 B."""
+    """The default (allocatable) layout: 3 ratio-2 sources at 578 B + 1 at 1156 B."""
     cfg = release_text_config()
-    assert cfg.bytes_per_compressed_entry() == pytest.approx(356.0)
-    assert cfg.kv_bytes_per_token() == pytest.approx(890.0)
+    # bf16 latent (512 lanes x 2 B) + fp8 indexer key (128 B + one fp32 scale).
+    assert cfg.bytes_per_compressed_entry() == pytest.approx(1156.0)
+    assert cfg.kv_bytes_per_token() == pytest.approx(2890.0)
     # Sanity: a V4-style 128:1 pooling assumption would under-provision by ~64x
     # on the pooled band, which is exactly the capacity trap to avoid.
-    assert cfg.kv_bytes_per_token() > 10 * (4 * 356.0 / 128)
+    assert cfg.kv_bytes_per_token() > 10 * (4 * 1156.0 / 128)
+
+
+def test_bytes_per_compressed_entry_covers_every_kv_layout():
+    """Each layout is quoted at the width the allocator lays out, fp4 included."""
+    cfg = release_text_config()
+    # fp8 halves the latent; the indexer row is unchanged.
+    assert cfg.bytes_per_compressed_entry("fp8") == pytest.approx(512.0 + 132.0)
+    # mxfp4 indexer keys: 64 B of e2m1 plus four e8m0 scales.
+    assert cfg.bytes_per_compressed_entry("fp8", "fp4") == pytest.approx(512.0 + 68.0)
+    # The tech report's §2.4.4 target, which the allocator does not implement.
+    assert cfg.bytes_per_compressed_entry("fp4", "fp4") == pytest.approx(356.0)
+    assert cfg.kv_bytes_per_token("fp4", "fp4") == pytest.approx(890.0)
+    # Quoting fp4 against a bf16 deployment under-provisions by 3.6x -- the
+    # reason fp4 is not the default.
+    assert cfg.kv_bytes_per_token() / cfg.kv_bytes_per_token("fp4", "fp4") > 3.0
+    for bad, kwargs in (("bf4", {}), ("bf16", {"indexer_k_dtype": "bf16"})):
+        with pytest.raises(ValueError, match="Unsupported"):
+            cfg.bytes_per_compressed_entry(bad, **kwargs)
+
+
+def test_bytes_per_compressed_entry_agrees_with_the_allocator():
+    """The sizing helper and the paged allocator must not drift apart.
+
+    ``bytes_per_compressed_entry`` exists for capacity planning, so a figure it
+    quotes that the allocator would never produce is worse than no figure: it
+    silently mis-sizes the cache. Cross-check every layout both sides know.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
+        get_token_bytes,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
+        DEEPSEEK_V41_VARIANT,
+        DeepseekV4AttentionType,
+    )
+
+    cfg = release_text_config()
+    for kv_dtype, indexer_k_dtype in (
+        ("bf16", "fp8"),
+        ("fp8", "fp8"),
+        ("fp8", "fp4"),
+        ("fp8_ds_mla", "fp8"),
+    ):
+        common = dict(
+            head_dim=cfg.head_dim,
+            index_head_dim=cfg.index_head_dim,
+            compress_ratio=1,
+            has_fp8_kv_cache=kv_dtype != "bf16",
+            indexer_k_dtype=indexer_k_dtype,
+            use_fp8_ds_mla=kv_dtype == "fp8_ds_mla",
+            variant=DEEPSEEK_V41_VARIANT,
+        )
+        allocator = get_token_bytes(
+            attn_type=DeepseekV4AttentionType.COMPRESS, **common
+        ) + get_token_bytes(attn_type=DeepseekV4AttentionType.INDEXER_COMPRESS, **common)
+        assert cfg.bytes_per_compressed_entry(kv_dtype, indexer_k_dtype) == pytest.approx(
+            allocator
+        ), f"{kv_dtype}/{indexer_k_dtype} sizing disagrees with the allocator"
 
 
 def test_descriptor_rejects_inconsistent_source_lists():

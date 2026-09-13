@@ -554,6 +554,24 @@ _DTYPE_ALIASES = {
     "F32": "float32",
 }
 
+# Cache bytes per *lane* of a compressed KV entry, including the per-block scales
+# that share the row. Keyed by the layout name
+# ``DeepseekV41TextConfig.bytes_per_compressed_entry`` takes; the packed
+# ``fp8_ds_mla`` footer layout has no per-lane rate and is handled there.
+_LATENT_BYTES_PER_LANE = {
+    "bf16": 2.0,
+    "fp8": 1.0,
+    # Tech report §2.4.4: e2m1 data plus one e4m3 scale per 16-lane block, i.e.
+    # NVFP4 without the second-level global scale. Not allocatable yet.
+    "fp4": 0.5 + 1.0 / 16.0,
+}
+_INDEX_K_BYTES_PER_LANE = {
+    # e4m3 data plus one fp32 scale per 128-lane block.
+    "fp8": 1.0 + 4.0 / 128.0,
+    # mxfp4: e2m1 data plus one e8m0 scale per 32-lane block.
+    "fp4": 0.5 + 1.0 / 32.0,
+}
+
 
 def _normalize_dtype(name: str) -> str:
     """Map a safetensors / torch / ``str(torch.dtype)`` spelling to one vocabulary."""
@@ -1044,7 +1062,11 @@ class DeepseekV41TextConfig(PretrainedConfig):
         out.write_text(json.dumps(self.layer_plan_dump(), indent=2))
         return out
 
-    def bytes_per_compressed_entry(self) -> float:
+    def bytes_per_compressed_entry(
+        self,
+        kv_dtype: str = "bf16",
+        indexer_k_dtype: str = "fp8",
+    ) -> float:
         """Bytes one KV-source layer stores per *emitted* latent.
 
         Two tensors are cached per emitted position, under deliberately different
@@ -1052,22 +1074,63 @@ class DeepseekV41TextConfig(PretrainedConfig):
         area; the third, the 128-slot window KV, is fp8 and sized per sequence
         rather than per token, so it is not part of this figure):
 
-        * the compressed KV latent — the **whole** ``head_dim``-wide latent as
-          fp4 values at 0.5 B each plus one **e4m3** scale per 16-element block.
+        * the compressed KV latent, sized over the **whole** ``head_dim`` width.
           ``head_dim`` and not ``kv_lora_rank``: the cache stores the rotated
           rope lanes alongside the un-rotated ones, and ``kv_lora_rank`` is only
           the un-rotated part (see :attr:`kv_lora_rank`), so sizing from it
           would under-provision every compressed entry by 64 lanes;
-        * the indexer key — ``index_head_dim`` fp4 values plus one **e8m0** scale
-          per 32-element block.
+        * the indexer key, sized over ``index_head_dim`` with its per-block
+          scales folded into the same row (which is how the allocator lays it
+          out — see ``cache_manager.get_token_bytes``).
 
-        For the release that is ``(256 + 32) + (64 + 4) = 356`` B.
+        Both widths are quantization-dependent, so both are parameters rather
+        than constants. ``kv_dtype`` accepts the layouts the compressed-KV
+        allocator can actually produce today (``"bf16"``, ``"fp8"``,
+        ``"fp8_ds_mla"``) plus ``"fp4"``, which is the layout §2.4.4 of the tech
+        report specifies — e2m1 with one e4m3 scale per 16 lanes — and which
+        ``cache_manager`` does **not** implement yet (it asserts BF16 or FP8).
+        ``"fp4"`` is therefore quoted as a target for capacity planning and is
+        deliberately not the default: sizing a real deployment from it
+        under-provisions the cache by 3.6x against the BF16 default.
+
+        For the release (``head_dim=512``, ``index_head_dim=128``) the defaults
+        give ``1024 + 132 = 1156`` B; the report's fp4/fp4 target would be
+        ``(256 + 32) + (64 + 4) = 356`` B.
         """
-        latent_bytes = self.head_dim * 0.5 + self.head_dim / 16.0
-        index_k_bytes = self.index_head_dim * 0.5 + self.index_head_dim / 32.0
+        if kv_dtype == "fp8_ds_mla":
+            # A packed layout with its scales in a per-row footer, so it has no
+            # per-lane rate to quote; take the width the kernels are built for.
+            from ..attention.backends.sparse.deepseek_v4 import footer_scale_kv
+
+            if self.head_dim != footer_scale_kv.DIM_NOPE + footer_scale_kv.DIM_ROPE:
+                raise ValueError(
+                    f"footer-scale KV is built for head_dim "
+                    f"{footer_scale_kv.DIM_NOPE + footer_scale_kv.DIM_ROPE}, "
+                    f"not {self.head_dim}"
+                )
+            latent_bytes = float(footer_scale_kv.TOKEN_BYTES)
+        else:
+            try:
+                latent_bytes = self.head_dim * _LATENT_BYTES_PER_LANE[kv_dtype]
+            except KeyError:
+                raise ValueError(
+                    f"Unsupported kv_dtype {kv_dtype!r}; expected one of "
+                    f"{sorted((*_LATENT_BYTES_PER_LANE, 'fp8_ds_mla'))}."
+                ) from None
+        try:
+            index_k_bytes = self.index_head_dim * _INDEX_K_BYTES_PER_LANE[indexer_k_dtype]
+        except KeyError:
+            raise ValueError(
+                f"Unsupported indexer_k_dtype {indexer_k_dtype!r}; expected one of "
+                f"{sorted(_INDEX_K_BYTES_PER_LANE)}."
+            ) from None
         return latent_bytes + index_k_bytes
 
-    def kv_bytes_per_token(self) -> float:
+    def kv_bytes_per_token(
+        self,
+        kv_dtype: str = "bf16",
+        indexer_k_dtype: str = "fp8",
+    ) -> float:
         """Compressed-KV cost per token, summed over the KV **source** layers.
 
         Only ``kv_source_layer_ids`` own a compressed cache, and their pooling
@@ -1077,11 +1140,13 @@ class DeepseekV41TextConfig(PretrainedConfig):
         heuristic tuned against V4 under-provisions V4.1 by close to two orders of
         magnitude on those layers.
 
-        For the release this is ``3 * 178 + 356 = 890`` B/token: three ratio-2
-        source layers (2, 8, 14) emitting every other position, plus the one
-        ratio-1 source layer (20) emitting at every position.
+        The dtype arguments are forwarded to
+        :meth:`bytes_per_compressed_entry`; for the defaults this is
+        ``3 * 578 + 1156 = 2890`` B/token — three ratio-2 source layers (2, 8,
+        14) emitting every other position, plus the one ratio-1 source layer
+        (20) emitting at every position.
         """
-        per_entry = self.bytes_per_compressed_entry()
+        per_entry = self.bytes_per_compressed_entry(kv_dtype, indexer_k_dtype)
         return sum(per_entry / d.pool_factor for d in self.layer_descriptors if d.is_kv_source)
 
 
