@@ -58,7 +58,7 @@ need no code:
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -72,6 +72,13 @@ from ..attention.backends.sparse.deepseek_v4.candidate_prefilter import (
     candidate_prefilter_is_on,
     inert_up_to_positions,
 )
+from ..attention.backends.sparse.deepseek_v4.decoder_replay import (
+    enter_decoder_replay,
+    exit_decoder_replay,
+    gather_replayed_rows,
+    plan_decoder_replay,
+    scatter_replayed_rows,
+)
 from ..attention.backends.sparse.deepseek_v4.params import (
     has_compressor_state,
     is_compress_layer,
@@ -80,6 +87,7 @@ from ..attention.backends.sparse.deepseek_v4.params import (
 from ..configs.deepseek_v41 import (
     DeepseekV41QuantLayout,
     assert_weight_layout,
+    decoder_bounded_replay_enabled,
     dense_fp8_requant_enabled,
     engram_cpu_offload_enabled,
     quant_role_for_weight_key,
@@ -101,6 +109,9 @@ from .modeling_deepseekv4 import (
     weight_dequant,
 )
 from .modeling_utils import register_auto_model
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # ---------------------------------------------------------------------------
 # 1. Per-layer RoPE
@@ -622,6 +633,119 @@ class DeepseekV41Model(DeepseekV4Model):
 
     decoder_layer_cls = DeepseekV41DecoderLayer
     uses_hc_head = False
+
+    def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
+        super().__init__(model_config, *args, **kwargs)
+        self._decoder_replay_observed = False
+        self.decoder_replay_split, self.decoder_replay_window = self._resolve_replay_policy(
+            model_config
+        )
+
+    def _resolve_replay_policy(
+        self, model_config: ModelConfig[PretrainedConfig]
+    ) -> Tuple[Optional[int], int]:
+        """``(first replayed layer, window)``, or ``(None, 0)`` if the model cannot replay.
+
+        The split is derived rather than fixed at ``L/2``, because the invariant
+        that makes §3.2.2 legal is not "half the layers" -- it is *no compressor at
+        or after the split*. ``max(kv_source_layer_ids) + 1`` is the earliest layer
+        that satisfies it, and on the released checkpoint that lands at 21 (sources
+        ``[2, 8, 14, 20]``), one past the ``L/2 = 20`` the report names. Reading the
+        list means a checkpoint that moves a source moves the split with it instead
+        of silently replaying a layer that publishes truncated compressed KV.
+
+        Two structural refusals, both checked once here rather than per forward:
+
+        * **No sparse config.** Without ``kv_source_layer_ids`` there is no evidence
+          any suffix is compressor-free, and assuming it is the corruption case.
+        * **An Engram layer at or after the split.** Engram embeddings are
+          precomputed for all ``N`` rows on a side stream before the loop, so a
+          replayed Engram layer would need its cache re-indexed *and* its event
+          waited on at the boundary. The released checkpoint puts Engram on layers
+          1 and 14, both well inside the encoder half, so that code would be
+          unreachable and untested -- refusing is honest where handling it is not.
+        """
+        if not decoder_bounded_replay_enabled():
+            return None, 0
+        sparse_config = model_config.sparse_attention_config
+        kv_sources = getattr(sparse_config, "kv_source_layer_ids", None) or ()
+        if not kv_sources:
+            logger.warning(
+                "DeepSeek-V4.1 decoder bounded replay was requested but this model has "
+                "no kv_source_layer_ids, so no suffix of the stack is known to be free "
+                "of compressors. Running the ordinary single-pass prefill."
+            )
+            return None, 0
+        split = int(max(kv_sources)) + 1
+        late_engram = [idx for idx in getattr(self, "engram_layer_ids", ()) or () if idx >= split]
+        if late_engram:
+            logger.warning(
+                f"DeepSeek-V4.1 decoder bounded replay was requested but Engram layers "
+                f"{late_engram} are at or after the replay split {split}; their "
+                "embeddings are precomputed for the full prompt on a side stream and "
+                "the replay boundary does not re-index them. Running the ordinary "
+                "single-pass prefill."
+            )
+            return None, 0
+        window = int(sparse_config.window_size)
+        logger.info(
+            f"DeepSeek-V4.1 decoder bounded replay enabled: layers {split}-"
+            f"{self.num_hidden_layers - 1} replay over a {window}-token window "
+            f"(kv sources {sorted(int(s) for s in kv_sources)})."
+        )
+        return split, window
+
+    def _plan_bounded_replay(self, attn_metadata, all_token_states_required: bool):
+        """Replay the decoder half over the last ``n_win`` rows, when that is legal.
+
+        ``all_token_states_required`` is the caller's answer to "does anything
+        downstream read a hidden state that is not the last of its sequence" --
+        context logits, in practice. The replayed pass produces no such rows, so a
+        caller that needs them gets the ordinary single pass.
+        """
+        if self.decoder_replay_split is None or all_token_states_required:
+            return None, None
+        plan = plan_decoder_replay(attn_metadata, self.decoder_replay_window)
+        if plan is None:
+            return None, None
+        if not self._decoder_replay_observed:
+            # Once per process, on the first batch that actually replays. The
+            # construction-time line above says the policy resolved; this one says a
+            # forward took it, which is the only thing an A/B can assert on -- a run
+            # whose every batch is refused looks identical to a run with the feature
+            # off, and that is exactly the failure that turns an A/B into an A/A.
+            self._decoder_replay_observed = True
+            logger.info(
+                f"DeepSeek-V4.1 decoder bounded replay engaged: "
+                f"{plan.num_replay_tokens} of {plan.num_encoder_tokens} rows re-run "
+                f"from layer {self.decoder_replay_split}."
+            )
+        return self.decoder_replay_split, plan
+
+    def _enter_bounded_replay(self, plan, attn_metadata, position_ids, input_ids, hc_state):
+        """Narrow the per-token state to the replayed rows and rebuild the metadata.
+
+        Three carriers cross this boundary, and they are exactly the arguments the
+        remaining layers take per token: ``position_ids`` (RoPE), ``input_ids``
+        (which ``forward_MoE`` forwards to the MoE for balancing) and the mHC
+        stream. The stream is always ``resolved`` here -- V4.1 forces
+        ``enable_fused_hc = False``, so ``post_mix`` / ``comb_mix`` / ``x_prev`` are
+        all None and only ``residual`` and the lagged ``pre_mix`` carry state.
+        """
+        enter_decoder_replay(attn_metadata, plan)
+        return (
+            gather_replayed_rows(position_ids, plan),
+            gather_replayed_rows(input_ids, plan),
+            HCState.resolved(
+                gather_replayed_rows(hc_state.residual, plan),
+                pre_mix=gather_replayed_rows(hc_state.pre_mix, plan),
+            ),
+        )
+
+    def _exit_bounded_replay(self, plan, attn_metadata, hidden_states):
+        """Restore the encoder shape on both the metadata and the output."""
+        exit_decoder_replay(attn_metadata, plan)
+        return scatter_replayed_rows(hidden_states, plan)
 
     def _init_hc_state(self, hidden_states: torch.Tensor) -> HCState:
         """Seed the lagged ``pre`` with the reference's one-hot.
@@ -1745,3 +1869,38 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             )
         _assert_candidate_prefilter_inert(model_config)
         super().__init__(model_config)
+
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        """V4's defaults, minus window-KV reuse when bounded replay is switched on.
+
+        The two are the same policy read in opposite directions, so they cannot
+        both hold: V4's ``enable_swa_scratch_reuse=True`` spends memory keeping
+        sliding-window KV readable by a later request, and §3.2.2's replayed window
+        KV is approximate for every token but the last and must therefore never be
+        read by one. Flipping the default here rather than asking the deployment to
+        set both is what makes the switch a single decision; ``plan_decoder_replay``
+        still reads the constructed manager, so a manager that kept reuse anyway
+        wins and replay is refused instead of corrupting a prefix.
+        """
+        defaults = super().get_model_defaults(llm_args)
+        if decoder_bounded_replay_enabled():
+            defaults.setdefault("kv_cache_config", {})["enable_swa_scratch_reuse"] = False
+        return defaults
+
+    def forward(
+        self,
+        *args,
+        return_context_logits: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Tell the model body whether anything downstream reads non-final rows.
+
+        ``return_context_logits`` cannot simply be inspected inside the body:
+        ``SpecDecOneEngineForCausalLM.forward`` takes it as a named parameter and
+        consumes it itself, so it never appears in the ``**kwargs`` forwarded to
+        ``self.model``. Hence a separate key, and hence it is *derived* here rather
+        than read from the metadata -- the body must not have to guess.
+        """
+        kwargs["all_token_states_required"] = bool(return_context_logits)
+        return super().forward(*args, return_context_logits=return_context_logits, **kwargs)

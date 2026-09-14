@@ -2672,7 +2672,19 @@ class DeepseekV4Model(DecoderModel):
         # a standalone hc_post; a resolved state feeds hc_head directly.
         hc_state = self._init_hc_state(hidden_states)
 
+        replay_at, replay_plan = self._plan_bounded_replay(
+            attn_metadata,
+            # Conservative default: a caller that does not say assumes it wants
+            # every row's hidden state, which rules bounded replay out.
+            bool(kwargs.get("all_token_states_required", True)),
+        )
+
         for idx, decoder_layer in enumerate(self.layers[: self.num_hidden_layers]):
+            if idx == replay_at:
+                position_ids, input_ids, hc_state = self._enter_bounded_replay(
+                    replay_plan, attn_metadata, position_ids, input_ids, hc_state
+                )
+
             engram_embeddings = None
             if engram_embeddings_cache is not None and idx in engram_embeddings_cache:
                 # Sync: ensure the engram stream has finished precompute for this layer
@@ -2693,7 +2705,49 @@ class DeepseekV4Model(DecoderModel):
             )
 
         hidden_states = self._finalize_hc_state(hc_state)
+        if replay_plan is not None:
+            hidden_states = self._exit_bounded_replay(replay_plan, attn_metadata, hidden_states)
         return hidden_states
+
+    # ------------------------------------------------------------------
+    # Bounded-replay boundary hooks
+    # ------------------------------------------------------------------
+    # DeepSeek-V4.1 §3.2.2 re-runs the decoder half of the stack over only the
+    # last ``n_win`` tokens of each prompt. The three hooks below are where that
+    # second pass begins and ends; V4 itself never takes one, so its cost here is
+    # one integer compare per layer.
+    #
+    # They live on the base class rather than in a V4.1 ``forward`` override for
+    # the same reason as the mHC hooks below: overriding ``forward`` would copy
+    # ~90 lines of engram precompute, PP branching and loop that are identical
+    # between the two generations and would then drift apart.
+
+    def _plan_bounded_replay(self, attn_metadata, all_token_states_required: bool):
+        """``(split, plan)`` if this batch replays a suffix of the stack, else ``(None, None)``.
+
+        V4 always answers ``(None, None)``: every one of its layers owns a
+        compressor, so no suffix of the stack can be re-run over a short window --
+        a truncated pass would publish truncated compressed KV, which is the one
+        thing the scheme may not do. V4.1 concentrates all compression in its
+        encoder half, which is what makes the suffix replayable at all.
+        """
+        return None, None
+
+    def _enter_bounded_replay(self, plan, attn_metadata, position_ids, input_ids, hc_state):
+        """Re-index the per-token state the replayed layers will read.
+
+        Never called on V4, because :meth:`_plan_bounded_replay` never returns a
+        split. Returns the three per-token carriers narrowed to the replayed rows.
+        """
+        raise NotImplementedError
+
+    def _exit_bounded_replay(self, plan, attn_metadata, hidden_states):
+        """Restore encoder-pass shape after a replayed suffix.
+
+        Never called on V4. Returns ``hidden_states`` back at the encoder pass's
+        row count, because everything downstream indexes it in that space.
+        """
+        raise NotImplementedError
 
     # ------------------------------------------------------------------
     # mHC stream boundary hooks

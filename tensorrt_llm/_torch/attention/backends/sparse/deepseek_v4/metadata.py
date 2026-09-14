@@ -88,6 +88,14 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # integer means different things in V4 and V4.1 (see `params.py`), so every
         # ratio predicate below has to be told which.
         self.variant = getattr(sparse_metadata_params, "variant", DEEPSEEK_V4_VARIANT)
+        # Whether each query token's sliding window must be floored at the first
+        # position *this pass* wrote SWA KV for, instead of at position 0. Off for
+        # every ordinary forward; the decoder half of V4.1's bounded replay
+        # (§3.2.2) turns it on, because it re-runs only the last `n_win` tokens and
+        # so the SWA slots below that floor hold nothing it may read. A per-forward
+        # switch rather than a config field: the same metadata object serves the
+        # unfloored encoder pass and the floored decoder pass of one forward.
+        self.swa_window_floored_to_pass = False
         window_size = self.window_size
         assert window_size == 128, (
             f"Dual-pool sparse MLA requires window_size == 128, which equals to the"
@@ -496,8 +504,15 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 num_seqs=self.num_seqs,
             )
 
-    def prepare_for_deepseek_v4_indices(self, token_positions=None):
-        """Prepare SWA/compressed local indices and sparse_mla_topk_lens."""
+    def prepare_for_deepseek_v4_indices(self, token_positions=None, pass_base_positions=None):
+        """Prepare SWA/compressed local indices and sparse_mla_topk_lens.
+
+        ``pass_base_positions`` is the per-token first position this pass holds KV
+        for, i.e. ``cached_token_lens[req]`` broadcast over that request's tokens.
+        Both callers already compute it as an intermediate of ``token_positions``,
+        so it is threaded through rather than rederived; it is only *used* when
+        :attr:`swa_window_floored_to_pass` is set.
+        """
         window_size = self.window_size
         device = self.swa_local_indices_cuda.device
 
@@ -513,10 +528,17 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             token_idx = torch.arange(num_tokens, dtype=torch.int32, device=device)
             req_idx = torch.searchsorted(cu_seq_lens[1:].to(torch.int32), token_idx, right=True)
             offsets = token_idx - cu_seq_lens[req_idx].to(torch.int32)
-            token_positions = cached_tokens[req_idx].to(torch.int32) + offsets
+            pass_base_positions = cached_tokens[req_idx].to(torch.int32)
+            token_positions = pass_base_positions + offsets
 
         if self.use_fp8_ds_mla:
             self.token_positions_cuda[: token_positions.shape[0]] = token_positions
+
+        swa_floor = pass_base_positions if self.swa_window_floored_to_pass else None
+        assert not (self.swa_window_floored_to_pass and swa_floor is None), (
+            "swa_window_floored_to_pass needs pass_base_positions; the caller that "
+            "supplied token_positions must supply the matching base positions too."
+        )
 
         self._prepare_deepseek_v4_indices_compiled(
             token_positions,
@@ -528,6 +550,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.compressed_local_indices_cuda,
             self.sparse_mla_topk_lens,
             self._ratio_specs,
+            swa_floor,
         )
 
     @staticmethod
@@ -542,8 +565,17 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         compressed_local_indices_buf: torch.Tensor,
         sparse_mla_topk_lens_bufs: Dict[int, torch.Tensor],
         ratio_specs: tuple,
+        swa_floor: Optional[torch.Tensor] = None,
     ):
-        """Build SWA indices, compressed indices, and topk_lens in one fused graph."""
+        """Build SWA indices, compressed indices, and topk_lens in one fused graph.
+
+        ``swa_floor`` is ``[num_tokens]`` (or None): the lowest position each token
+        may read from its sliding window. None is the ordinary case and leaves the
+        window at ``[max(0, i-W+1), i]``; a floor narrows it to
+        ``[max(floor, i-W+1), i]``, which is §3.2.2's truncated window. Passing
+        None rather than a zero tensor keeps the traced graph byte-identical to the
+        unfloored one, so the default path cannot regress.
+        """
         device = token_positions.device
         num_tokens = token_positions.shape[0]
 
@@ -551,6 +583,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         positions = token_positions.unsqueeze(1)  # [num_tokens, 1]
         swa_offsets = torch.arange(window_size, dtype=torch.int32, device=device)
         swa_start = (positions - window_size + 1).clamp(min=0)
+        if swa_floor is not None:
+            swa_start = torch.maximum(swa_start, swa_floor.unsqueeze(1))
         swa_indices = swa_start + swa_offsets
         swa_indices = torch.where(swa_indices > positions, -1, swa_indices).to(torch.int32)
         swa_local_indices_buf[:num_tokens] = swa_indices
@@ -586,9 +620,13 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # gets an *indexed* length over an unpooled cache rather than V4's
         # SWA-only length.
         kv_lens = token_positions + 1
+        # An SWA-only layer reports the *actual* valid count, so a floored window
+        # has to shorten it too -- the padded kinds below always spend a full
+        # window_size of slots and let the -1s in the index buffer do the masking.
+        swa_valid = kv_lens if swa_floor is None else kv_lens - swa_floor
         for compress_ratio, pool, kind in ratio_specs:
             if kind == 0:
-                total_count = kv_lens.clamp(max=window_size)
+                total_count = swa_valid.clamp(max=window_size)
             elif kind == 1:
                 total_count = window_size + (kv_lens // pool).clamp(max=sparse_mla_topk)
             else:
@@ -948,7 +986,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self._compress_ratios_sorted,
         )
 
-        token_positions = self._compute_token_positions(
+        token_positions, pass_base_positions = self._compute_token_positions(
             seq_lens,
             cached_tokens,
             batch_size,
@@ -957,7 +995,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.req_idx_per_token,
         )
 
-        self.prepare_for_deepseek_v4_indices(token_positions)
+        self.prepare_for_deepseek_v4_indices(token_positions, pass_base_positions)
 
     @staticmethod
     @maybe_compile(dynamic=True, options={"max-autotune": True})
@@ -996,8 +1034,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         num_tokens: int,
         cu_seq_lens_buf: torch.Tensor,
         req_idx_per_token_buf: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute cu_seq_lens and token_positions (eager)."""
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute cu_seq_lens, token_positions and per-token pass base (eager)."""
         device = seq_lens.device
 
         # cu_seq_lens
@@ -1012,7 +1050,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         token_idx = torch.arange(num_tokens, dtype=torch.int32, device=device)
         base_pos = cached_tokens[req_idx].to(torch.int32)
         offsets = token_idx - cu_seq_lens_buf[req_idx].to(torch.int32)
-        return base_pos + offsets
+        return base_pos + offsets, base_pos
 
     @staticmethod
     @maybe_compile(dynamic=True, options={"max-autotune": True})

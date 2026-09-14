@@ -523,6 +523,40 @@ def engram_cpu_offload_enabled() -> bool:
     return os.environ.get(_ENGRAM_CPU_OFFLOAD_ENV, "0") not in ("0", "", "false", "False")
 
 
+_DECODER_BOUNDED_REPLAY_ENV = "TRTLLM_V41_DECODER_BOUNDED_REPLAY"
+
+
+def decoder_bounded_replay_enabled() -> bool:
+    """Whether prefill re-runs the decoder half over only the last ``n_win`` tokens.
+
+    Tech report §3.2.2. V4.1's 20 decoder layers own no compressor -- all four
+    ``kv_source_layer_ids`` are at or below layer 20 -- so once the encoder half has
+    run over the whole prompt the global KV cache is complete, and the decoder half
+    only has to produce correct logits for the last token. Everything it needs for
+    that is either in that complete cache or inside a 128-position window, so it can
+    be replayed over 128 rows instead of ``N``, turning roughly half of prefill into
+    a fixed cost. See
+    ``attention/backends/sparse/deepseek_v4/decoder_replay.py`` for the mechanism
+    and for the five conditions under which a batch is refused.
+
+    Off by default, and this one is a *policy trade*, not a free win. The replayed
+    layers' sliding-window KV is approximate for every token but the last, which the
+    report handles by declaring it "used only for decoding, not for prefix caching".
+    TRT-LLM's V4 defaults go the other way: ``enable_swa_scratch_reuse=True`` spends
+    memory keeping window KV reusable across requests. Both cannot hold, so enabling
+    this also flips that default off (``DeepseekV41ForCausalLM.get_model_defaults``),
+    and ``plan_decoder_replay`` reads the resulting manager rather than the config so
+    a manager that kept reuse for its own reasons wins the argument and replay is
+    simply refused.
+
+    What that costs is measurable and workload-dependent: a deployment whose prompts
+    share long prefixes gets more from reuse than from halving the prefill it rarely
+    pays. A deployment with long unique prompts gets the opposite. That is why the
+    choice is a switch and not a default.
+    """
+    return os.environ.get(_DECODER_BOUNDED_REPLAY_ENV, "0") not in ("0", "", "false", "False")
+
+
 def layout_for_role(
     role: str,
     quantization_config: Optional[Dict[str, Any]] = None,
