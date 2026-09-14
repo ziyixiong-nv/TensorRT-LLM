@@ -51,6 +51,30 @@ TOKEN_BYTES = DATA_ROW_BYTES + FOOTER_ROW_BYTES
 PAGE_SIZE = 64  # matches footer_scale_kv, so both pools page identically
 PAGE_BYTES = PAGE_SIZE * TOKEN_BYTES
 
+
+def resolve_pool_layout(token_bytes: int):
+    """Return the module that owns a KV pool with ``token_bytes`` bytes per token.
+
+    With FP4 on the global cache and FP8 on the sliding-window cache, one process
+    holds pools in two layouts at once, and the pool's own row width is what tells
+    them apart -- 288 here, 584 in :mod:`footer_scale_kv`. Asking the pool means a
+    compressor writing either one needs no extra flag threaded down to it.
+    """
+    # Imported here rather than at module scope to keep this module a leaf: it is
+    # the one `compressor` reaches for, and `footer_scale_kv` pulls in `.kernels`
+    # and `.params`.
+    from . import footer_scale_kv, fp4_kv
+
+    if token_bytes == TOKEN_BYTES:
+        return fp4_kv
+    if token_bytes == footer_scale_kv.TOKEN_BYTES:
+        return footer_scale_kv
+    raise ValueError(
+        f"KV pool row of {token_bytes} bytes matches no known layout "
+        f"(fp4 {TOKEN_BYTES}, footer-scale fp8 {footer_scale_kv.TOKEN_BYTES})."
+    )
+
+
 # §2.4.4 omits NVFP4's second level; fp4_quantize still wants the argument.
 _GLOBAL_SCALE_ONE: dict[torch.device, torch.Tensor] = {}
 

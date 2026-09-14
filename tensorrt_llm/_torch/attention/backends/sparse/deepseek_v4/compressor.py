@@ -426,7 +426,7 @@ class Compressor(nn.Module):
         batch_size: int,
     ) -> None:
         """Apply RMSNorm/RoPE and scatter into the footer-scale cache."""
-        from . import footer_scale_kv
+        from . import fp4_kv
 
         total_tokens = kv_comp.shape[0]
         if total_tokens == 0:
@@ -472,7 +472,12 @@ class Compressor(nn.Module):
         loc = torch.where(in_range & (phys_block >= 0), slot, torch.full_like(slot, -1))
 
         pool = kv_cache.view(torch.uint8).reshape(kv_cache.shape[0], -1)
-        footer_scale_kv.quant_scatter(
+        # Which of the two footer-scale layouts this pool holds -- FP8 at 584 B/token
+        # or §2.4.4's FP4 at 288 -- is written on the pool itself, so a compressor
+        # feeding a long-range cache needs no extra flag to find out. `rows` is
+        # post-RoPE BF16 either way, which is what both scatters want.
+        layout = fp4_kv.resolve_pool_layout(pool.shape[1] // tokens_per_block)
+        layout.quant_scatter(
             pool, loc.to(torch.int32).contiguous(), rows, page_size=tokens_per_block
         )
 

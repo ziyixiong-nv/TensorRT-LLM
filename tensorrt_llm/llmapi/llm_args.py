@@ -1305,6 +1305,22 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         "`fp4` to reduce the per-token indexer K footprint on Blackwell+ "
         "(SM>=100). Set to `fp8` for the legacy FP8 indexer K cache path.",
     )
+    main_kv_dtype: Literal["auto", "fp4"] = Field(
+        default="auto",
+        status="prototype",
+        description=
+        "Data type used for the long-range (compressed) main KV cache. `auto` "
+        "keeps the cache at the dtype implied by `kv_cache_config.dtype`. `fp4` "
+        "stores it as E2M1 with one E4M3 scale per 16 channels -- NVFP4 without "
+        "the second-level global scale -- which is 288 bytes per entry instead of "
+        "584, a 2.03x capacity gain. The sliding-window KV cache is unaffected and "
+        "stays FP8. This is lossy: it trades accuracy for KV capacity, so it is "
+        "off by default and requires `kv_cache_config.dtype='fp8_ds_mla'`. Not yet "
+        "runnable on any device -- the layout and its sizing are in place, but "
+        "quantizing needs SM>=100 while the only attention path that can read an "
+        "FP4 pool beside an FP8 sliding-window pool is SM90's; setting it raises "
+        "`NotImplementedError` naming the missing piece.",
+    )
     skip_indexer_for_short_seqs: bool = Field(
         default=False,
         description=

@@ -105,6 +105,26 @@ def test_sizing_reproduces_the_reports_2x():
     assert round(fp4_kv.DIM_TOTAL * 2 / fp4, 2) == 3.56
 
 
+def test_fp4_main_kv_is_refused_and_says_why():
+    """The gap is bracketed by two facts; pin both so neither rots silently.
+
+    §2.4.4 needs one device that can write an FP4 pool *and* read it beside an
+    FP8 sliding-window pool. Writing is SM>=100 (the E2M1 conversion intrinsic);
+    reading two layouts is SM90 (only FlashMLA takes the pools as separate
+    tensors). The refusal must name whichever bound the current device hits, so
+    that when either moves the error stops matching and this test fails.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import cache_manager
+
+    if cache_manager.get_sm_version() >= cache_manager._FP4_MAIN_KV_WRITER_MIN_SM:
+        # Blackwell can quantize; what it lacks is a reader for two layouts.
+        expected = "shared dtype and stride"
+    else:
+        expected = "cvt.rn.satfinite.e2m1x2.f32"
+    with pytest.raises(NotImplementedError, match=expected):
+        cache_manager._assert_fp4_main_kv_has_a_reader()
+
+
 def _reference_dequant(rows_bf16: torch.Tensor) -> torch.Tensor:
     """Quantize with the same op, then dequantize straight from the dense buffers.
 

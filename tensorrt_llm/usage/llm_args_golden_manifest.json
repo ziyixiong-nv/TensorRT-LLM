@@ -1754,6 +1754,16 @@
       "path": "sparse_attention_config.kv_source_layer_ids"
     },
     {
+      "allowed_values": [
+        "auto",
+        "fp4"
+      ],
+      "annotation": "Literal['auto', 'fp4']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "sparse_attention_config.main_kv_dtype"
+    },
+    {
       "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
