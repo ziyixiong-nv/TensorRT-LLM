@@ -186,14 +186,14 @@ async def test_coordinator_select_retry_is_bounded():
     router = _delegating_router()
 
     session = mock.MagicMock()
-    session.post = mock.MagicMock(
-        side_effect=aiohttp.ClientOSError(32, "Broken pipe"))
+    session.post = mock.MagicMock(side_effect=aiohttp.ClientConnectorError(
+        mock.MagicMock(), ConnectionRefusedError(111, "Connection refused")))
     session.close = mock.AsyncMock()
     router._session = session
 
     with mock.patch("tensorrt_llm.serve.router.asyncio.sleep",
                     new_callable=mock.AsyncMock):
-        with pytest.raises(aiohttp.ClientOSError):
+        with pytest.raises(aiohttp.ClientConnectorError):
             await router._post_select({"role": "generation"})
 
     assert session.post.call_count == COORDINATOR_SELECT_MAX_ATTEMPTS

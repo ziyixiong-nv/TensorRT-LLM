@@ -42,6 +42,7 @@ from tensorrt_llm.serve.router_utils import (  # noqa: F401
 _MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
 COORDINATOR_SELECT_MAX_ATTEMPTS = 2
 COORDINATOR_SELECT_RETRY_DELAY_S = 0.05
+COORDINATOR_SELECT_MAX_RETRY_DELAY_S = 1.0
 COORDINATOR_FINISH_MAX_ATTEMPTS = 3
 COORDINATOR_FINISH_RETRY_DELAY_S = 0.1
 COORDINATOR_FINISH_TIMEOUT_S = 5.0
@@ -2064,9 +2065,20 @@ class CoordinatorDelegatingRouter(Router):
         it. Only connection errors retry: an error status from the coordinator
         is a real placement failure and must propagate, and a timeout means it
         is already overloaded, so retrying would only add load.
+
+        A connect that failed outright (no coordinator listening) gets
+        ``COORDINATOR_SELECT_MAX_ATTEMPTS``. Other connection errors retry with
+        backoff up to the request timeout: a connect() to a Unix socket whose
+        listen backlog is full fails with EAGAIN, which asyncio reports as a
+        success, so a busy coordinator shows up as a connection that broke
+        before the request was sent.
         """
         data = msgpack.packb(payload, use_bin_type=True)
-        for attempt in range(1, COORDINATOR_SELECT_MAX_ATTEMPTS + 1):
+        deadline = time.monotonic() + self._request_timeout_s
+        delay = COORDINATOR_SELECT_RETRY_DELAY_S
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 async with self.session.post(
                         f"{self._coordinator_url}/select",
@@ -2080,13 +2092,17 @@ class CoordinatorDelegatingRouter(Router):
                             f"{body.get('error', body)}")
                 return body
             except aiohttp.ClientConnectionError as e:
-                if attempt == COORDINATOR_SELECT_MAX_ATTEMPTS:
+                connect_failed = isinstance(e, aiohttp.ClientConnectorError)
+                if ((connect_failed
+                     and attempt >= COORDINATOR_SELECT_MAX_ATTEMPTS)
+                        or time.monotonic() >= deadline):
                     raise
-                logger.warning(
-                    f"CoordinatorDelegatingRouter select attempt {attempt} "
-                    f"failed: {e}; retrying")
-                await asyncio.sleep(COORDINATOR_SELECT_RETRY_DELAY_S *
-                                    (2**(attempt - 1)))
+                if attempt == 1:
+                    logger.warning(
+                        f"CoordinatorDelegatingRouter select attempt {attempt} "
+                        f"failed: {e}; retrying")
+                await asyncio.sleep(delay)
+                delay = min(2 * delay, COORDINATOR_SELECT_MAX_RETRY_DELAY_S)
 
     async def finish_request(self,
                              request: OpenAIRequest,

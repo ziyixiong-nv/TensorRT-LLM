@@ -33,7 +33,9 @@ conversation, kv_cache_aware) delegate to the coordinator via ``routing_key`` +
 
 import asyncio
 import json
+import os
 import socket
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -988,8 +990,88 @@ def test_coordinator_session_gives_up_idle_connections_before_the_server():
             patch.object(dc.aiohttp, "ClientSession"),
         ):
             dc.make_coordinator_session(url)
-        assert connector.call_args.kwargs["limit"] == 0
+        assert connector.call_args.kwargs["limit"] == dc.COORDINATOR_MAX_CONNECTIONS
         assert connector.call_args.kwargs["keepalive_timeout"] == dc.COORDINATOR_KEEPALIVE_TIMEOUT_S
+
+
+class _UdsCoordinatorThread:
+    """Serve a CoordinatorServer on a Unix socket from an event loop the test can stall."""
+
+    def __init__(self, config, uds, backlog):
+        self.url = f"unix:{uds}"
+        service = DisaggCoordinatorService(config, _client_factory)
+        self._server = uvicorn.Server(
+            uvicorn.Config(
+                CoordinatorServer(service).app, uds=uds, backlog=backlog, log_level="warning"
+            )
+        )
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def _serve(self):
+        try:
+            self._loop.run_until_complete(self._server.serve())
+        finally:
+            self._loop.close()
+
+    def stall(self, seconds):
+        """Block the coordinator's event loop, as a busy or paused coordinator does."""
+        self._loop.call_soon_threadsafe(time.sleep, seconds)
+
+    def __enter__(self):
+        self._thread.start()
+        for _ in range(100):
+            if self._server.started:
+                break
+            time.sleep(0.1)
+        assert self._server.started, "coordinator did not start"
+        return self
+
+    def __exit__(self, *a):
+        self._server.should_exit = True
+        self._thread.join(timeout=10)
+
+
+def test_select_burst_waits_out_a_stalled_coordinator():
+    """A /select burst that overflows the coordinator's listen backlog must not fail.
+
+    While the coordinator is busy, a fleet worker's new connections queue in the
+    Unix socket's listen backlog. Past it, connect() fails with EAGAIN, asyncio
+    reports the socket as connected, and the request fails with [Errno 107] --
+    a 500 on a live request. The worker has to wait the coordinator out instead.
+    """
+    backlog = 32  # scaled down from uvicorn's 2048 so a capped pool overflows it too
+    burst = 300
+    with _FakeWorker() as ctx0, _FakeWorker() as ctx1, _FakeWorker() as gen0:
+        config = _make_config(
+            [ctx0.url, ctx1.url],
+            [gen0.url],
+            "conversation",
+            "round_robin",
+            ctx_router_args={"new_conversation_min_match_blocks": 0},
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmp_dir,
+            _UdsCoordinatorThread(config, os.path.join(tmp_dir, "coord.sock"), backlog) as coord,
+        ):
+
+            async def drive():
+                remote = CoordinatorClient(coord.url, config, request_timeout_s=60)
+                await remote.start()
+                router = remote.ctx_router
+                requests = [_ctx_conv_request(f"conv-{i}", [i], i + 1) for i in range(burst)]
+                coord.stall(2.0)
+                results = await asyncio.gather(
+                    *(router.get_next_server(r) for r in requests), return_exceptions=True
+                )
+                for request, result in zip(requests, results):
+                    if not isinstance(result, BaseException):
+                        await router.finish_request(request)
+                await remote.stop()
+                return [r for r in results if isinstance(r, BaseException)]
+
+            failures = asyncio.run(drive())
+    assert not failures, f"{len(failures)} of {burst} selects failed, e.g. {failures[0]!r}"
 
 
 @pytest.mark.asyncio
